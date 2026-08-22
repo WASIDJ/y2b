@@ -112,6 +112,29 @@ func TestCompactDuplicateJobsKeepsOneVideoRecord(t *testing.T) {
 	}
 }
 
+func TestPurgeVideoFilesInDirRemovesAllVideoVariants(t *testing.T) {
+	dir := t.TempDir()
+	video := filepath.Join(dir, "merged.mp4")
+	chapter := filepath.Join(dir, "P01.mp4")
+	note := filepath.Join(dir, "description.txt")
+	for _, path := range []string{video, chapter, note} {
+		if err := os.WriteFile(path, []byte("data"), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if freed := purgeVideoFilesInDir(dir); freed != 8 {
+		t.Fatalf("unexpected freed bytes: %d", freed)
+	}
+	if _, err := os.Stat(note); err != nil {
+		t.Fatalf("non-video sidecar was removed: %v", err)
+	}
+	for _, path := range []string{video, chapter} {
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Fatalf("video file remains: %s", path)
+		}
+	}
+}
+
 func TestMagnetValidationAndDeadSeedClassification(t *testing.T) {
 	if !validTorrentOrMagnet("magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567") {
 		t.Fatal("expected valid magnet URI")

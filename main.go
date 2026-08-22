@@ -1287,7 +1287,7 @@ func (a *App) createYoutubeHandler(q youtubeReq) func(*Job) {
 				}
 
 				// Auto-Clean downloaded raw video files after successful Bilibili upload
-				freed := purgeVideoFiles(append(targetUploadFiles, videoFiles...)...)
+				freed := purgeVideoFilesInDir(d)
 				if freed > 0 {
 					totalLogs += fmt.Sprintf("\n[自动空间清理] B站投稿成功，已自动删除原视频文件，释放磁盘空间: %s\n", formatBytes(freed))
 					outMap["cleaned_disk"] = formatBytes(freed)
@@ -1311,6 +1311,47 @@ func purgeVideoFiles(files ...string) int64 {
 			freed += fi.Size()
 			_ = os.Remove(f)
 		}
+	}
+	return freed
+}
+
+func purgeVideoFilesInDir(dir string) int64 {
+	if strings.TrimSpace(dir) == "" {
+		return 0
+	}
+	var videos []string
+	_ = filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
+		if err != nil || info == nil || info.IsDir() {
+			return nil
+		}
+		switch strings.ToLower(filepath.Ext(info.Name())) {
+		case ".mp4", ".mkv", ".avi", ".webm", ".mp3", ".m4v", ".mov":
+			videos = append(videos, path)
+		}
+		return nil
+	})
+	return purgeVideoFiles(videos...)
+}
+
+func (a *App) cleanupCompletedJobMedia() int64 {
+	a.mu.RLock()
+	jobs := make([]*Job, 0, len(a.jobs))
+	for _, j := range a.jobs {
+		if j != nil && j.Status == "done" && j.Kind == "pipeline" {
+			copy := *j
+			jobs = append(jobs, &copy)
+		}
+	}
+	a.mu.RUnlock()
+	var freed int64
+	for _, j := range jobs {
+		var out struct {
+			Dir string `json:"dir"`
+		}
+		if b, err := json.Marshal(j.Output); err == nil {
+			_ = json.Unmarshal(b, &out)
+		}
+		freed += purgeVideoFilesInDir(out.Dir)
 	}
 	return freed
 }
@@ -1572,7 +1613,7 @@ func (a *App) createMagnetHandler(q magnetReq) func(*Job) {
 					a.recordAiTrans()
 				}
 
-				freed := purgeVideoFiles(videoFiles...)
+				freed := purgeVideoFilesInDir(d)
 				if freed > 0 {
 					totalLogs += fmt.Sprintf("\n[自动空间清理] B站投稿成功，已自动清除原视频文件，释放磁盘空间: %s\n", formatBytes(freed))
 					outMap["cleaned_disk"] = formatBytes(freed)
@@ -2393,7 +2434,7 @@ func (a *App) createPipelineHandler(q pipelineReq) func(*Job) {
 			}
 
 			// Auto-Clean downloaded raw video files after successful Bilibili upload
-			freed := purgeVideoFiles(targetUploadFiles...)
+			freed := purgeVideoFilesInDir(targetDir)
 			freedStr := ""
 			if freed > 0 {
 				freedStr = formatBytes(freed)
@@ -4375,6 +4416,9 @@ func main() {
 	a.loadJobs()
 	if removed := a.compactDuplicateJobs(); removed > 0 {
 		fmt.Printf("compacted %d duplicate terminal jobs\n", removed)
+	}
+	if freed := a.cleanupCompletedJobMedia(); freed > 0 {
+		fmt.Printf("cleaned %s from completed pipeline jobs\n", formatBytes(freed))
 	}
 	a.loadChannels()
 	a.loadStats()
