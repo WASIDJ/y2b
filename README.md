@@ -70,6 +70,13 @@ YouTube 字幕 → 保存 / 转换 SRT、BCC → 视频保留字幕 → Biliup o
 - 未知状态码：有限尝试后失败，不会无限循环
 - Biliup 外部进程默认 4 小时超时，可用 `Y2B_UPLOAD_TIMEOUT` 调整
 
+BT 防卡队列策略：
+
+- aria2 BT 任务默认总时限 30 分钟，可用 `Y2B_MAGNET_TIMEOUT` 调整
+- 下载/投稿等待槽位默认最多 2 小时，可用 `Y2B_QUEUE_WAIT_TIMEOUT` 调整
+- BT 无 Peer、无 Seed 或持续 0 速度的失败会标记为 `dead_seed`，不会无限重试
+- Magnet URI 必须包含 `xt` 信息哈希；失败重试前应等待种子冷却，避免重复占用队列
+
 ## 快速运行
 
 依赖：`yt-dlp`、`ffmpeg`、`aria2c` 和 `biliup`。

@@ -6,7 +6,30 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
+
+func TestAcquireSlotTimesOut(t *testing.T) {
+	slot := make(chan struct{}, 1)
+	slot <- struct{}{}
+	a := &App{cfg: Config{QueueWaitTimeout: 10 * time.Millisecond}}
+	err := a.acquireSlot(context.Background(), slot)
+	if err == nil || !strings.Contains(err.Error(), "队列等待超时") {
+		t.Fatalf("expected queue timeout, got %v", err)
+	}
+}
+
+func TestMagnetValidationAndDeadSeedClassification(t *testing.T) {
+	if !validTorrentOrMagnet("magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567") {
+		t.Fatal("expected valid magnet URI")
+	}
+	if validTorrentOrMagnet("magnet:?dn=missing-info-hash") {
+		t.Fatal("magnet without xt should be rejected")
+	}
+	if !isDeadSeedOutput("[ERROR] number of seeders: 0") {
+		t.Fatal("expected dead seed output to be classified")
+	}
+}
 
 func TestBiliRepairActionMatrix(t *testing.T) {
 	cases := map[int]biliRepairAction{

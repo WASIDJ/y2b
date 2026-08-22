@@ -38,22 +38,24 @@ import (
 var indexHTML string
 
 type Config struct {
-	Addr          string
-	DataDir       string
-	Cookies       string
-	BiliCookies   string
-	ChannelsFile  string
-	YTDLP         string
-	Aria2         string
-	Biliup        string
-	DeepSeekKey   string
-	DeepSeekModel string
-	DeepSeekURL   string
-	DefaultTags   string
-	AdminUser     string
-	AdminPass     string
-	SecretKey     string
-	UploadTimeout time.Duration
+	Addr             string
+	DataDir          string
+	Cookies          string
+	BiliCookies      string
+	ChannelsFile     string
+	YTDLP            string
+	Aria2            string
+	Biliup           string
+	DeepSeekKey      string
+	DeepSeekModel    string
+	DeepSeekURL      string
+	DefaultTags      string
+	AdminUser        string
+	AdminPass        string
+	SecretKey        string
+	UploadTimeout    time.Duration
+	QueueWaitTimeout time.Duration
+	MagnetTimeout    time.Duration
 }
 
 type MonitoredChannel struct {
@@ -167,24 +169,38 @@ func loadConfig() Config {
 			uploadTimeout = parsed
 		}
 	}
+	queueWaitTimeout := 2 * time.Hour
+	if raw := os.Getenv("Y2B_QUEUE_WAIT_TIMEOUT"); raw != "" {
+		if parsed, err := time.ParseDuration(raw); err == nil && parsed > 0 {
+			queueWaitTimeout = parsed
+		}
+	}
+	magnetTimeout := 30 * time.Minute
+	if raw := os.Getenv("Y2B_MAGNET_TIMEOUT"); raw != "" {
+		if parsed, err := time.ParseDuration(raw); err == nil && parsed > 0 {
+			magnetTimeout = parsed
+		}
+	}
 
 	return Config{
-		Addr:          env("Y2B_ADDR", "127.0.0.1:8765"),
-		DataDir:       env("Y2B_DATA", "/srv/y2b/data"),
-		Cookies:       env("Y2B_COOKIES", "/srv/y2b/cookies.json"),
-		BiliCookies:   env("Y2B_BILI_COOKIES", "/srv/y2b/cookies.json"),
-		ChannelsFile:  env("Y2B_CHANNELS", "/srv/y2b/channels.json"),
-		YTDLP:         env("Y2B_YTDLP", "/home/ubuntu/.local/bin/yt-dlp"),
-		Aria2:         env("Y2B_ARIA2", "/usr/bin/aria2c"),
-		Biliup:        env("Y2B_BILIUP", "/usr/local/bin/biliup"),
-		DeepSeekKey:   key,
-		DeepSeekModel: model,
-		DeepSeekURL:   apiURL,
-		DefaultTags:   env("Y2B_TAGS", "AI,Vibe Coding,编程,教程"),
-		AdminUser:     adminUser,
-		AdminPass:     adminPass,
-		SecretKey:     secretKey,
-		UploadTimeout: uploadTimeout,
+		Addr:             env("Y2B_ADDR", "127.0.0.1:8765"),
+		DataDir:          env("Y2B_DATA", "/srv/y2b/data"),
+		Cookies:          env("Y2B_COOKIES", "/srv/y2b/cookies.json"),
+		BiliCookies:      env("Y2B_BILI_COOKIES", "/srv/y2b/cookies.json"),
+		ChannelsFile:     env("Y2B_CHANNELS", "/srv/y2b/channels.json"),
+		YTDLP:            env("Y2B_YTDLP", "/home/ubuntu/.local/bin/yt-dlp"),
+		Aria2:            env("Y2B_ARIA2", "/usr/bin/aria2c"),
+		Biliup:           env("Y2B_BILIUP", "/usr/local/bin/biliup"),
+		DeepSeekKey:      key,
+		DeepSeekModel:    model,
+		DeepSeekURL:      apiURL,
+		DefaultTags:      env("Y2B_TAGS", "AI,Vibe Coding,编程,教程"),
+		AdminUser:        adminUser,
+		AdminPass:        adminPass,
+		SecretKey:        secretKey,
+		UploadTimeout:    uploadTimeout,
+		QueueWaitTimeout: queueWaitTimeout,
+		MagnetTimeout:    magnetTimeout,
 	}
 }
 
@@ -368,15 +384,16 @@ func startMemoryWatchdog() {
 }
 
 func (a *App) runWithSlot(j *Job, slot chan struct{}, fn func() (any, string, error)) {
-	select {
-	case slot <- struct{}{}:
-	case <-j.ctx.Done():
-		a.set(j, "canceled", "", nil, "")
+	if err := a.acquireSlot(j.ctx, slot); err != nil {
+		if errors.Is(err, context.Canceled) {
+			a.set(j, "canceled", "", nil, "")
+		} else {
+			a.set(j, "failed", err.Error(), nil, "")
+		}
 		return
 	}
 	defer func() {
 		<-slot
-		// Instant memory reclaim after stage finishes
 		runtime.GC()
 		debug.FreeOSMemory()
 	}()
@@ -408,6 +425,27 @@ func (a *App) runWithSlot(j *Job, slot chan struct{}, fn func() (any, string, er
 		a.set(j, "failed", err.Error(), out, logs)
 	} else {
 		a.set(j, "done", "", out, logs)
+	}
+}
+
+func (a *App) acquireSlot(ctx context.Context, slot chan struct{}) error {
+	if a.cfg.QueueWaitTimeout <= 0 {
+		select {
+		case slot <- struct{}{}:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	timer := time.NewTimer(a.cfg.QueueWaitTimeout)
+	defer timer.Stop()
+	select {
+	case slot <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return fmt.Errorf("队列等待超时（超过 %s）", a.cfg.QueueWaitTimeout)
 	}
 }
 
@@ -665,10 +703,8 @@ func (a *App) createYoutubeHandler(q youtubeReq) func(*Job) {
 
 			// Stage 1: Download stage (acquires downloadSlots)
 			func() {
-				select {
-				case a.downloadSlots <- struct{}{}:
-				case <-nj.ctx.Done():
-					downloadErr = context.Canceled
+				if err := a.acquireSlot(nj.ctx, a.downloadSlots); err != nil {
+					downloadErr = err
 					return
 				}
 				defer func() {
@@ -825,10 +861,8 @@ func (a *App) createYoutubeHandler(q youtubeReq) func(*Job) {
 				var uploadErr error
 
 				func() {
-					select {
-					case a.uploadSlots <- struct{}{}:
-					case <-nj.ctx.Done():
-						uploadErr = context.Canceled
+					if err := a.acquireSlot(nj.ctx, a.uploadSlots); err != nil {
+						uploadErr = err
 						return
 					}
 					defer func() {
@@ -917,7 +951,49 @@ type magnetReq struct {
 
 func validTorrentOrMagnet(s string) bool {
 	s = strings.TrimSpace(s)
-	return strings.HasPrefix(s, "magnet:") || strings.HasPrefix(s, "http://") || strings.HasPrefix(s, "https://")
+	lower := strings.ToLower(s)
+	if strings.HasPrefix(lower, "magnet:") {
+		u, err := url.Parse(s)
+		return err == nil && strings.EqualFold(u.Scheme, "magnet") && u.Query().Get("xt") != ""
+	}
+	return strings.HasPrefix(lower, "http://") || strings.HasPrefix(lower, "https://")
+}
+
+func isDeadSeedOutput(logs string) bool {
+	lower := strings.ToLower(logs)
+	markers := []string{
+		"no seed",
+		"no peer",
+		"download speed is 0",
+		"download speed of 0",
+		"bt-stop-timeout",
+		"number of seeders: 0",
+	}
+	for _, marker := range markers {
+		if strings.Contains(lower, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func (a *App) runMagnet(ctx context.Context, args []string) (string, error) {
+	if a.cfg.MagnetTimeout <= 0 {
+		return runCmd(ctx, a.cfg.Aria2, args)
+	}
+	magnetCtx, cancel := context.WithTimeout(ctx, a.cfg.MagnetTimeout)
+	defer cancel()
+	logs, err := runCmd(magnetCtx, a.cfg.Aria2, args)
+	if err == nil {
+		return logs, nil
+	}
+	if errors.Is(magnetCtx.Err(), context.DeadlineExceeded) {
+		return logs, fmt.Errorf("magnet_timeout: BT 下载超过 %s", a.cfg.MagnetTimeout)
+	}
+	if isDeadSeedOutput(logs) {
+		return logs, fmt.Errorf("dead_seed: 未发现可用做种或下载速度持续为 0")
+	}
+	return logs, err
 }
 
 func (a *App) magnet(w http.ResponseWriter, r *http.Request) {
@@ -956,10 +1032,8 @@ func (a *App) createMagnetHandler(q magnetReq) func(*Job) {
 
 			// Stage 1: Magnet Download (acquires downloadSlots)
 			func() {
-				select {
-				case a.downloadSlots <- struct{}{}:
-				case <-nj.ctx.Done():
-					downloadErr = context.Canceled
+				if err := a.acquireSlot(nj.ctx, a.downloadSlots); err != nil {
+					downloadErr = err
 					return
 				}
 				defer func() {
@@ -976,11 +1050,15 @@ func (a *App) createMagnetHandler(q magnetReq) func(*Job) {
 				a.set(nj, "running", "", nil, "")
 				a.setStep(nj, "磁力下载中")
 				btTrackers := "udp://tracker.opentrackr.org:1337/announce,udp://open.tracker.cl:1337/announce,udp://tracker.openbittorrent.com:6969/announce,http://tracker.openbittorrent.com:80/announce,udp://opentracker.i2p.rocks:6969/announce,udp://open.demonii.com:1337/announce"
-				magLogs, err := runCmd(nj.ctx, a.cfg.Aria2, []string{
+				magLogs, err := a.runMagnet(nj.ctx, []string{
 					"--dir=" + d,
 					"--seed-time=0",
 					"--file-allocation=none",
 					"--disk-cache=4M",
+					"--timeout=30",
+					"--connect-timeout=15",
+					"--bt-tracker-connect-timeout=15",
+					"--bt-tracker-timeout=20",
 					"--max-connection-per-server=2",
 					"--max-concurrent-downloads=1",
 					"--enable-dht=true",
@@ -1038,10 +1116,8 @@ func (a *App) createMagnetHandler(q magnetReq) func(*Job) {
 				var uploadErr error
 
 				func() {
-					select {
-					case a.uploadSlots <- struct{}{}:
-					case <-nj.ctx.Done():
-						uploadErr = context.Canceled
+					if err := a.acquireSlot(nj.ctx, a.uploadSlots); err != nil {
+						uploadErr = err
 						return
 					}
 					defer func() {
@@ -1538,10 +1614,8 @@ func (a *App) createPipelineHandler(q pipelineReq) func(*Job) {
 
 			// Stage 1: Download stage (acquires downloadSlots)
 			func() {
-				select {
-				case a.downloadSlots <- struct{}{}:
-				case <-nj.ctx.Done():
-					downloadErr = context.Canceled
+				if err := a.acquireSlot(nj.ctx, a.downloadSlots); err != nil {
+					downloadErr = err
 					return
 				}
 				defer func() {
@@ -1675,11 +1749,15 @@ func (a *App) createPipelineHandler(q pipelineReq) func(*Job) {
 					_ = os.MkdirAll(d, 0750)
 					targetDir = d
 					btTrackers := "udp://tracker.opentrackr.org:1337/announce,udp://open.tracker.cl:1337/announce,udp://tracker.openbittorrent.com:6969/announce,http://tracker.openbittorrent.com:80/announce,udp://opentracker.i2p.rocks:6969/announce,udp://open.demonii.com:1337/announce"
-					magLogs, err := runCmd(nj.ctx, a.cfg.Aria2, []string{
+					magLogs, err := a.runMagnet(nj.ctx, []string{
 						"--dir=" + d,
 						"--seed-time=0",
 						"--file-allocation=none",
 						"--disk-cache=4M",
+						"--timeout=30",
+						"--connect-timeout=15",
+						"--bt-tracker-connect-timeout=15",
+						"--bt-tracker-timeout=20",
 						"--max-connection-per-server=2",
 						"--max-concurrent-downloads=1",
 						"--enable-dht=true",
@@ -1739,10 +1817,8 @@ func (a *App) createPipelineHandler(q pipelineReq) func(*Job) {
 			var uploadErr error
 
 			func() {
-				select {
-				case a.uploadSlots <- struct{}{}:
-				case <-nj.ctx.Done():
-					uploadErr = context.Canceled
+				if err := a.acquireSlot(nj.ctx, a.uploadSlots); err != nil {
+					uploadErr = err
 					return
 				}
 				defer func() {
