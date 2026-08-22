@@ -2095,6 +2095,13 @@ textarea.form-control { min-height: 84px; resize: vertical; }
               </svg>
               <span>清理已结束</span>
             </button>
+            <button class="btn btn-primary btn-small" id="btnRetryAll" title="重新提交全部失败和已取消任务" disabled>
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M20 11a8.1 8.1 0 0 0-15.5-2M4 5v4h4"></path>
+                <path d="M4 13a8.1 8.1 0 0 0 15.5 2M20 19v-4h-4"></path>
+              </svg>
+              <span>一键重试 <b id="retryAllCount">0</b></span>
+            </button>
           </div>
         </div>
 
@@ -3027,6 +3034,16 @@ function renderJobs() {
     return true;
   });
 
+  // Keep work that is actually consuming a slot at the top. Queued jobs are
+  // intentionally last so the operator sees real activity before backlog.
+  const statusRank = { running: 0, failed: 1, canceled: 2, done: 3, queued: 4 };
+  filtered.sort((a, b) => {
+    const rankDiff = (statusRank[a.status] ?? 9) - (statusRank[b.status] ?? 9);
+    if (rankDiff !== 0) return rankDiff;
+    return new Date(b.created || 0) - new Date(a.created || 0);
+  });
+  updateRetryAllButton();
+
   if (!filtered.length) {
     const isFiltered = activeStatusFilter || activeKindFilter || searchQuery;
     tbody.innerHTML = `
@@ -3525,6 +3542,48 @@ async function actJob(id, action) {
   }
 }
 
+function retryableJobs() {
+  return rawJobs.filter(j => j.status === 'failed' || j.status === 'canceled');
+}
+
+function updateRetryAllButton() {
+  const button = $('#btnRetryAll');
+  const count = retryableJobs().length;
+  if (button) {
+    button.disabled = count === 0;
+    button.querySelector('span').innerHTML = `一键重试 <b id="retryAllCount">${count}</b>`;
+  }
+}
+
+async function retryAllJobs() {
+  const candidates = retryableJobs();
+  if (!candidates.length) {
+    toast('当前没有失败或已取消的任务', 'info');
+    return;
+  }
+  if (!confirm(`确定重新提交全部 ${candidates.length} 个失败/已取消任务吗？`)) return;
+
+  const button = $('#btnRetryAll');
+  if (button) {
+    button.disabled = true;
+    button.querySelector('span').textContent = '正在重试…';
+  }
+  let succeeded = 0;
+  let failed = 0;
+  for (const job of candidates) {
+    try {
+      const res = await apiFetch(`/api/jobs/${encodeURIComponent(job.id)}/retry`, { method: 'POST' });
+      if (!res.ok) throw new Error('retry failed');
+      succeeded++;
+    } catch (_) {
+      failed++;
+    }
+  }
+  await fetchJobs();
+  await fetchMediaPackages();
+  toast(`已重新提交 ${succeeded} 个任务${failed ? `，${failed} 个失败` : ''}`, failed ? 'error' : 'success');
+}
+
 async function clearAllFinished() {
   const finishedJobs = rawJobs.filter(j => ['done', 'failed', 'canceled'].includes(j.status));
   if (!finishedJobs.length) {
@@ -3939,6 +3998,7 @@ document.addEventListener('DOMContentLoaded', () => {
   $('#btnNewTask').addEventListener('click', () => openModal('youtube'));
   $('#modalClose').addEventListener('click', closeModal);
   $('#btnClearDone').addEventListener('click', clearAllFinished);
+  $('#btnRetryAll').addEventListener('click', retryAllJobs);
 
   $$('.filter-tab[data-status]').forEach(tab => {
     tab.addEventListener('click', () => {
