@@ -82,20 +82,34 @@ type MonitoredChannel struct {
 }
 
 type Job struct {
-	ID         string    `json:"id"`
-	Kind       string    `json:"kind"`   // "youtube", "magnet", "biliup", "pipeline"
-	Status     string    `json:"status"` // "queued", "running", "done", "failed", "canceled"
-	Step       string    `json:"step,omitempty"`
-	Error      string    `json:"error,omitempty"`
-	Created    time.Time `json:"created"`
-	Started    time.Time `json:"started,omitempty"`
-	Finished   time.Time `json:"finished,omitempty"`
-	Input      any       `json:"input,omitempty"`
-	Output     any       `json:"output,omitempty"`
-	Logs       string    `json:"logs,omitempty"`
+	ID         string       `json:"id"`
+	Kind       string       `json:"kind"`   // "youtube", "magnet", "biliup", "pipeline"
+	Status     string       `json:"status"` // "queued", "running", "done", "failed", "canceled"
+	Step       string       `json:"step,omitempty"`
+	Error      string       `json:"error,omitempty"`
+	Created    time.Time    `json:"created"`
+	Started    time.Time    `json:"started,omitempty"`
+	Finished   time.Time    `json:"finished,omitempty"`
+	Input      any          `json:"input,omitempty"`
+	Output     any          `json:"output,omitempty"`
+	Logs       string       `json:"logs,omitempty"`
+	Progress   *JobProgress `json:"progress,omitempty"`
 	ctx        context.Context
 	cancelFunc context.CancelFunc
 	retry      func(*Job)
+}
+
+// JobProgress is the small, tool-agnostic snapshot rendered by the queue UI.
+// Downloaders, ffmpeg and uploaders can therefore expose the same feedback.
+type JobProgress struct {
+	Percent    float64   `json:"percent,omitempty"`
+	Downloaded int64     `json:"downloaded_bytes,omitempty"`
+	Total      int64     `json:"total_bytes,omitempty"`
+	Speed      int64     `json:"speed_bytes,omitempty"`
+	ETASeconds int64     `json:"eta_seconds,omitempty"`
+	Current    string    `json:"current,omitempty"`
+	Detail     string    `json:"detail,omitempty"`
+	UpdatedAt  time.Time `json:"updated_at"`
 }
 
 type App struct {
@@ -235,17 +249,18 @@ func (a *App) saveJobs() {
 	defer a.mu.RUnlock()
 
 	type persistedJob struct {
-		ID       string    `json:"id"`
-		Kind     string    `json:"kind"`
-		Status   string    `json:"status"`
-		Step     string    `json:"step,omitempty"`
-		Error    string    `json:"error,omitempty"`
-		Created  time.Time `json:"created"`
-		Started  time.Time `json:"started,omitempty"`
-		Finished time.Time `json:"finished,omitempty"`
-		Input    any       `json:"input,omitempty"`
-		Output   any       `json:"output,omitempty"`
-		Logs     string    `json:"logs,omitempty"`
+		ID       string       `json:"id"`
+		Kind     string       `json:"kind"`
+		Status   string       `json:"status"`
+		Step     string       `json:"step,omitempty"`
+		Error    string       `json:"error,omitempty"`
+		Created  time.Time    `json:"created"`
+		Started  time.Time    `json:"started,omitempty"`
+		Finished time.Time    `json:"finished,omitempty"`
+		Input    any          `json:"input,omitempty"`
+		Output   any          `json:"output,omitempty"`
+		Logs     string       `json:"logs,omitempty"`
+		Progress *JobProgress `json:"progress,omitempty"`
 	}
 
 	list := make([]persistedJob, 0, len(a.order))
@@ -263,6 +278,7 @@ func (a *App) saveJobs() {
 				Input:    j.Input,
 				Output:   j.Output,
 				Logs:     j.Logs,
+				Progress: j.Progress,
 			})
 		}
 	}
@@ -323,8 +339,26 @@ func (a *App) add(kind string, input any) *Job {
 func (a *App) setStep(j *Job, step string) {
 	a.mu.Lock()
 	j.Step = step
+	if j.Progress == nil && j.Status == "running" {
+		j.Progress = &JobProgress{Detail: step, UpdatedAt: time.Now()}
+	} else if j.Progress != nil && j.Progress.Percent == 0 && j.Progress.Downloaded == 0 {
+		j.Progress.Detail = step
+	}
 	a.mu.Unlock()
 	a.saveJobs()
+}
+
+func (a *App) setProgress(j *Job, p JobProgress) {
+	if p.Percent < 0 {
+		p.Percent = 0
+	}
+	if p.Percent > 100 {
+		p.Percent = 100
+	}
+	p.UpdatedAt = time.Now()
+	a.mu.Lock()
+	j.Progress = &p
+	a.mu.Unlock()
 }
 
 func (a *App) set(j *Job, status, err string, out any, logs string) {
@@ -342,6 +376,9 @@ func (a *App) set(j *Job, status, err string, out any, logs string) {
 		j.Started = time.Now()
 		if j.Step == "" || j.Step == "排队中" {
 			j.Step = "执行中"
+		}
+		if j.Progress == nil {
+			j.Progress = &JobProgress{Detail: j.Step, UpdatedAt: time.Now()}
 		}
 	} else if status == "done" {
 		j.Finished = time.Now()
@@ -604,19 +641,144 @@ func decode(r *http.Request, v any) error {
 	return json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(v)
 }
 
-// Subprocess runner with live log capture
-func runCmd(ctx context.Context, bin string, args []string) (string, error) {
+// Subprocess runner with live log capture. onLine is called while the process
+// is running, which lets the queue expose progress before a long command ends.
+func runCmdProgress(ctx context.Context, bin string, args []string, onLine func(string)) (string, error) {
 	c := exec.CommandContext(ctx, bin, args...)
 	c.Env = os.Environ()
 	b := &limitedBuffer{max: 128 << 10}
-	c.Stdout = b
-	c.Stderr = b
-	err := c.Run()
+	stdout, err := c.StdoutPipe()
+	if err != nil {
+		return "", err
+	}
+	stderr, err := c.StderrPipe()
+	if err != nil {
+		return "", err
+	}
+	if err := c.Start(); err != nil {
+		return "", err
+	}
+	var wg sync.WaitGroup
+	read := func(r io.Reader) {
+		defer wg.Done()
+		scanner := bufio.NewScanner(r)
+		scanner.Buffer(make([]byte, 4096), 1024*1024)
+		for scanner.Scan() {
+			line := scanner.Text()
+			_, _ = b.Write([]byte(line + "\n"))
+			if onLine != nil {
+				onLine(line)
+			}
+		}
+	}
+	wg.Add(2)
+	go read(stdout)
+	go read(stderr)
+	err = c.Wait()
+	wg.Wait()
 	output := strings.TrimSpace(b.String())
 	if err != nil {
 		return output, fmt.Errorf("%s: %w: %s", bin, err, output)
 	}
 	return output, nil
+}
+
+func runCmd(ctx context.Context, bin string, args []string) (string, error) {
+	return runCmdProgress(ctx, bin, args, nil)
+}
+
+func parseSpeedBytes(raw string) int64 {
+	raw = strings.TrimSpace(strings.TrimSuffix(raw, "/s"))
+	if raw == "" || raw == "N/A" {
+		return 0
+	}
+	multiplier := float64(1)
+	for _, unit := range []struct {
+		suffix string
+		value  float64
+	}{{"GiB", 1 << 30}, {"MiB", 1 << 20}, {"KiB", 1 << 10}, {"GB", 1e9}, {"MB", 1e6}, {"KB", 1e3}, {"B", 1}} {
+		if strings.HasSuffix(raw, unit.suffix) {
+			raw = strings.TrimSpace(strings.TrimSuffix(raw, unit.suffix))
+			multiplier = unit.value
+			break
+		}
+	}
+	n, _ := strconv.ParseFloat(strings.TrimSpace(raw), 64)
+	return int64(n * multiplier)
+}
+
+func parseETASeconds(raw string) int64 {
+	raw = strings.TrimSpace(raw)
+	if raw == "" || raw == "NA" || raw == "Unknown" {
+		return 0
+	}
+	if n, err := strconv.ParseInt(raw, 10, 64); err == nil {
+		return n
+	}
+	if strings.HasSuffix(raw, "s") {
+		n, _ := strconv.ParseInt(strings.TrimSuffix(raw, "s"), 10, 64)
+		return n
+	}
+	if strings.HasSuffix(raw, "m") {
+		n, _ := strconv.ParseInt(strings.TrimSuffix(raw, "m"), 10, 64)
+		return n * 60
+	}
+	if strings.HasSuffix(raw, "h") {
+		n, _ := strconv.ParseInt(strings.TrimSuffix(raw, "h"), 10, 64)
+		return n * 3600
+	}
+	var total int64
+	for _, part := range strings.Split(raw, ":") {
+		n, err := strconv.ParseInt(strings.TrimSpace(part), 10, 64)
+		if err != nil {
+			return 0
+		}
+		total = total*60 + n
+	}
+	return total
+}
+
+var (
+	ytdlpProgressRE = regexp.MustCompile(`^download:\s*([^|]+)\|([^|]*)\|([^|]*)\|([^|]*)\|([^|]*)\|(.*)$`)
+	percentRE       = regexp.MustCompile(`([0-9]+(?:\.[0-9]+)?)%`)
+	ariaProgressRE  = regexp.MustCompile(`(?:^|\s)(\d+(?:\.\d+)?)%.*?DL:([^,\s]+(?:\s*[KMGT]i?B)?).*?ETA:([^\s,]+)`)
+	ffmpegTimeRE    = regexp.MustCompile(`(?:time|out_time)=([0-9:.]+)`)
+)
+
+func (a *App) progressLine(j *Job, phase, line string) {
+	p := JobProgress{Detail: phase}
+	if m := ytdlpProgressRE.FindStringSubmatch(strings.TrimSpace(line)); len(m) == 7 {
+		p.Percent, _ = strconv.ParseFloat(strings.TrimSpace(strings.TrimSuffix(m[1], "%")), 64)
+		p.Downloaded, _ = strconv.ParseInt(strings.TrimSpace(m[2]), 10, 64)
+		p.Total, _ = strconv.ParseInt(strings.TrimSpace(m[3]), 10, 64)
+		p.Speed = parseSpeedBytes(m[4])
+		p.ETASeconds = parseETASeconds(m[5])
+		p.Current = strings.TrimSpace(m[6])
+		if p.Total > 0 && p.Percent == 0 {
+			p.Percent = float64(p.Downloaded) * 100 / float64(p.Total)
+		}
+		a.setProgress(j, p)
+		return
+	}
+	if m := ariaProgressRE.FindStringSubmatch(line); len(m) == 4 {
+		p.Percent, _ = strconv.ParseFloat(m[1], 64)
+		p.Speed = parseSpeedBytes(m[2])
+		p.ETASeconds = parseETASeconds(m[3])
+		a.setProgress(j, p)
+		return
+	}
+	if m := percentRE.FindStringSubmatch(line); len(m) == 2 {
+		p.Percent, _ = strconv.ParseFloat(m[1], 64)
+	}
+	if m := ffmpegTimeRE.FindStringSubmatch(line); len(m) == 2 {
+		p.Current = "处理到 " + m[1]
+	}
+	if strings.HasPrefix(strings.TrimSpace(line), "[ffmpeg]") {
+		p.Current = strings.TrimSpace(line)
+	}
+	if p.Percent > 0 || p.Current != "" || strings.Contains(strings.ToLower(line), "speed=") {
+		a.setProgress(j, p)
+	}
 }
 
 type limitedBuffer struct {
@@ -739,6 +901,8 @@ func (a *App) createYoutubeHandler(q youtubeReq) func(*Job) {
 					"--concurrent-fragments", "1",
 					"--no-cache-dir",
 					"--no-plugin-dirs",
+					"--newline",
+					"--progress-template", "download:%(progress._percent_str)s|%(progress.downloaded_bytes)s|%(progress.total_bytes)s|%(progress.speed)s|%(progress.eta)s|%(info.title)s",
 					"--postprocessor-args", "ffmpeg:-threads 1",
 					"--extractor-args", "youtube:player_client=android,ios,web,tv_downgraded,default",
 				}
@@ -797,7 +961,7 @@ func (a *App) createYoutubeHandler(q youtubeReq) func(*Job) {
 					)
 				}
 
-				ytLogs, err := runCmd(nj.ctx, a.cfg.YTDLP, args)
+				ytLogs, err := runCmdProgress(nj.ctx, a.cfg.YTDLP, args, func(line string) { a.progressLine(nj, "YouTube 下载", line) })
 				totalLogs = ytLogs
 				downloadErr = err
 
@@ -824,7 +988,8 @@ func (a *App) createYoutubeHandler(q youtubeReq) func(*Job) {
 				convertVttToSrtAndBcc(d)
 				if q.BurnSubs && len(targetUploadFiles) > 0 {
 					a.setStep(nj, "正在压制中英硬字幕...")
-					burned, bLogs, _ := burnSubtitlesToVideos(nj.ctx, d, targetUploadFiles)
+					a.setProgress(nj, JobProgress{Detail: "ffmpeg 字幕压制"})
+					burned, bLogs, _ := burnSubtitlesToVideos(nj.ctx, d, targetUploadFiles, func(line string) { a.progressLine(nj, "ffmpeg 字幕压制", line) })
 					targetUploadFiles = burned
 					totalLogs += "\n[字幕压制日志]\n" + bLogs
 				}
@@ -880,6 +1045,7 @@ func (a *App) createYoutubeHandler(q youtubeReq) func(*Job) {
 					}
 
 					a.setStep(nj, "B站投稿中")
+					a.setProgress(nj, JobProgress{Detail: "B站上传"})
 					uploadOut, uploadLogs, uploadErr = a.executeBiliupUpload(nj.ctx, uploadReq{
 						Files:     targetUploadFiles,
 						File:      mainVideoFile,
@@ -888,6 +1054,7 @@ func (a *App) createYoutubeHandler(q youtubeReq) func(*Job) {
 						Tag:       q.Tags,
 						Parts:     true,
 						Source:    q.URL,
+						Progress:  func(line string) { a.progressLine(nj, "B站上传", line) },
 					})
 					totalLogs += "\n--- BILIUP UPLOAD LOGS ---\n" + uploadLogs
 				}()
@@ -995,12 +1162,20 @@ func isDeadSeedOutput(logs string) bool {
 }
 
 func (a *App) runMagnet(ctx context.Context, args []string) (string, error) {
+	return a.runMagnetProgress(ctx, args, nil)
+}
+
+func (a *App) runMagnetProgress(ctx context.Context, args []string, callbacks ...func(string)) (string, error) {
+	var onLine func(string)
+	if len(callbacks) > 0 {
+		onLine = callbacks[0]
+	}
 	if a.cfg.MagnetTimeout <= 0 {
-		return runCmd(ctx, a.cfg.Aria2, args)
+		return runCmdProgress(ctx, a.cfg.Aria2, args, onLine)
 	}
 	magnetCtx, cancel := context.WithTimeout(ctx, a.cfg.MagnetTimeout)
 	defer cancel()
-	logs, err := runCmd(magnetCtx, a.cfg.Aria2, args)
+	logs, err := runCmdProgress(magnetCtx, a.cfg.Aria2, args, onLine)
 	if err == nil {
 		return logs, nil
 	}
@@ -1068,7 +1243,7 @@ func (a *App) createMagnetHandler(q magnetReq) func(*Job) {
 				a.set(nj, "running", "", nil, "")
 				a.setStep(nj, "磁力下载中")
 				btTrackers := "udp://tracker.opentrackr.org:1337/announce,udp://open.tracker.cl:1337/announce,udp://tracker.openbittorrent.com:6969/announce,http://tracker.openbittorrent.com:80/announce,udp://opentracker.i2p.rocks:6969/announce,udp://open.demonii.com:1337/announce"
-				magLogs, err := a.runMagnet(nj.ctx, []string{
+				magLogs, err := a.runMagnetProgress(nj.ctx, []string{
 					"--dir=" + d,
 					"--continue=true",
 					"--allow-overwrite=false",
@@ -1091,7 +1266,7 @@ func (a *App) createMagnetHandler(q magnetReq) func(*Job) {
 					"--summary-interval=1",
 					"--bt-tracker=" + btTrackers,
 					m,
-				})
+				}, func(line string) { a.progressLine(nj, "BT 下载", line) })
 				totalLogs = magLogs
 				downloadErr = err
 
@@ -1156,6 +1331,7 @@ func (a *App) createMagnetHandler(q magnetReq) func(*Job) {
 					}
 
 					a.setStep(nj, "B站投稿中")
+					a.setProgress(nj, JobProgress{Detail: "B站上传"})
 					uploadOut, uploadLogs, uploadErr = a.executeBiliupUpload(nj.ctx, uploadReq{
 						File:      videoFile,
 						Files:     videoFiles,
@@ -1164,6 +1340,7 @@ func (a *App) createMagnetHandler(q magnetReq) func(*Job) {
 						Tag:       q.Tags,
 						Parts:     len(videoFiles) > 1,
 						Source:    m,
+						Progress:  func(line string) { a.progressLine(nj, "B站上传", line) },
 					})
 					totalLogs += "\n--- BILIUP UPLOAD LOGS ---\n" + uploadLogs
 				}()
@@ -1203,17 +1380,18 @@ func (a *App) createMagnetHandler(q magnetReq) func(*Job) {
 
 // Biliup Upload Request & Helpers
 type uploadReq struct {
-	File        string   `json:"file"`
-	Files       []string `json:"files"`
-	Title       string   `json:"title"`
-	Description string   `json:"description"`
-	Cover       string   `json:"cover"`
-	Tag         string   `json:"tag"`
-	Tid         string   `json:"tid"`
-	Limit       string   `json:"limit"`
-	Source      string   `json:"source"`
-	Translate   bool     `json:"translate"`
-	Parts       bool     `json:"parts"`
+	File        string       `json:"file"`
+	Files       []string     `json:"files"`
+	Title       string       `json:"title"`
+	Description string       `json:"description"`
+	Cover       string       `json:"cover"`
+	Tag         string       `json:"tag"`
+	Tid         string       `json:"tid"`
+	Limit       string       `json:"limit"`
+	Source      string       `json:"source"`
+	Translate   bool         `json:"translate"`
+	Parts       bool         `json:"parts"`
+	Progress    func(string) `json:"-"`
 }
 
 type BiliCodeResult struct {
@@ -1339,7 +1517,7 @@ func sanitizeBiliTags(tags string) string {
 	return strings.Join(cleaned, ",")
 }
 
-func (a *App) sanitizeBiliCover(ctx context.Context, coverPath string) string {
+func (a *App) sanitizeBiliCover(ctx context.Context, coverPath string, callbacks ...func(string)) string {
 	if coverPath == "" {
 		return ""
 	}
@@ -1359,7 +1537,11 @@ func (a *App) sanitizeBiliCover(ctx context.Context, coverPath string) string {
 		"-q:v", "2",
 		fixedCover,
 	}
-	if _, err := runCmd(ctx, "ffmpeg", args); err == nil {
+	var onLine func(string)
+	if len(callbacks) > 0 {
+		onLine = callbacks[0]
+	}
+	if _, err := runCmdProgress(ctx, "ffmpeg", args, onLine); err == nil {
 		if cfi, err := os.Stat(fixedCover); err == nil && cfi.Size() > 0 {
 			return fixedCover
 		}
@@ -1499,7 +1681,10 @@ func (a *App) executeBiliupUpload(ctx context.Context, q uploadReq) (map[string]
 	if cover == "" {
 		cover = adjacentCover(files[0])
 	}
-	cover = a.sanitizeBiliCover(ctx, cover)
+	if q.Progress != nil {
+		q.Progress("[ffmpeg] 正在优化投稿封面")
+	}
+	cover = a.sanitizeBiliCover(ctx, cover, q.Progress)
 
 	// Multi-endpoint submission with smart auto-healing
 	submitEndpoints := []string{"web", "b-cut-android", "app"}
@@ -1542,7 +1727,7 @@ func (a *App) executeBiliupUpload(ctx context.Context, q uploadReq) (map[string]
 		}
 		args = append(args, "--limit", limit, "--submit", ep, "--extra-fields", `{"open_subtitle":true}`)
 
-		epLogs, err := runCmd(ctx, a.cfg.Biliup, args)
+		epLogs, err := runCmdProgress(ctx, a.cfg.Biliup, args, q.Progress)
 		totalLogs += fmt.Sprintf("[%s 提交尝试 #%d]\n%s\n", ep, attempt, epLogs)
 
 		res := parseBiliupOutput(epLogs)
@@ -1668,6 +1853,8 @@ func (a *App) createUploadHandler(q uploadReq) func(*Job) {
 	return func(nj *Job) {
 		go a.runWithSlot(nj, a.uploadSlots, func() (any, string, error) {
 			a.setStep(nj, "B站投稿中")
+			a.setProgress(nj, JobProgress{Detail: "B站上传"})
+			q.Progress = func(line string) { a.progressLine(nj, "B站上传", line) }
 			out, logs, err := a.executeBiliupUpload(nj.ctx, q)
 			if err == nil {
 				// Direct uploads from the media library should have the same
@@ -1771,6 +1958,8 @@ func (a *App) createPipelineHandler(q pipelineReq) func(*Job) {
 						"--concurrent-fragments", "1",
 						"--no-cache-dir",
 						"--no-plugin-dirs",
+						"--newline",
+						"--progress-template", "download:%(progress._percent_str)s|%(progress.downloaded_bytes)s|%(progress.total_bytes)s|%(progress.speed)s|%(progress.eta)s|%(info.title)s",
 						"--postprocessor-args", "ffmpeg:-threads 1",
 						"--extractor-args", "youtube:player_client=android,ios,web,tv_downgraded,default",
 					}
@@ -1829,7 +2018,7 @@ func (a *App) createPipelineHandler(q pipelineReq) func(*Job) {
 						)
 					}
 
-					ytLogs, err := runCmd(nj.ctx, a.cfg.YTDLP, args)
+					ytLogs, err := runCmdProgress(nj.ctx, a.cfg.YTDLP, args, func(line string) { a.progressLine(nj, "YouTube 下载", line) })
 					totalLogs += "[YouTube Download Logs]\n" + ytLogs + "\n"
 					downloadErr = err
 					if downloadErr != nil {
@@ -1859,7 +2048,8 @@ func (a *App) createPipelineHandler(q pipelineReq) func(*Job) {
 					convertVttToSrtAndBcc(d)
 					if q.BurnSubs && len(targetUploadFiles) > 0 {
 						a.setStep(nj, "[1/3] 正在压制中英硬字幕...")
-						burned, bLogs, _ := burnSubtitlesToVideos(nj.ctx, d, targetUploadFiles)
+						a.setProgress(nj, JobProgress{Detail: "ffmpeg 字幕压制"})
+						burned, bLogs, _ := burnSubtitlesToVideos(nj.ctx, d, targetUploadFiles, func(line string) { a.progressLine(nj, "ffmpeg 字幕压制", line) })
 						targetUploadFiles = burned
 						totalLogs += "\n[字幕压制日志]\n" + bLogs
 					}
@@ -1869,7 +2059,7 @@ func (a *App) createPipelineHandler(q pipelineReq) func(*Job) {
 					_ = os.MkdirAll(d, 0750)
 					targetDir = d
 					btTrackers := "udp://tracker.opentrackr.org:1337/announce,udp://open.tracker.cl:1337/announce,udp://tracker.openbittorrent.com:6969/announce,http://tracker.openbittorrent.com:80/announce,udp://opentracker.i2p.rocks:6969/announce,udp://open.demonii.com:1337/announce"
-					magLogs, err := a.runMagnet(nj.ctx, []string{
+					magLogs, err := a.runMagnetProgress(nj.ctx, []string{
 						"--dir=" + d,
 						"--continue=true",
 						"--allow-overwrite=false",
@@ -1892,7 +2082,7 @@ func (a *App) createPipelineHandler(q pipelineReq) func(*Job) {
 						"--summary-interval=1",
 						"--bt-tracker=" + btTrackers,
 						q.URL,
-					})
+					}, func(line string) { a.progressLine(nj, "BT 下载", line) })
 					totalLogs += "[Magnet Download Logs]\n" + magLogs + "\n"
 					downloadErr = err
 					if downloadErr != nil {
@@ -1959,6 +2149,7 @@ func (a *App) createPipelineHandler(q pipelineReq) func(*Job) {
 
 				a.setStep(nj, "[2/3] AI 生成元数据与本地优化")
 				a.setStep(nj, "[3/3] B站自动化并发投稿")
+				a.setProgress(nj, JobProgress{Detail: "B站上传"})
 				uploadOut, uploadLogs, uploadErr = a.executeBiliupUpload(nj.ctx, uploadReq{
 					Files:     targetUploadFiles,
 					File:      mainVideoFile,
@@ -1967,6 +2158,7 @@ func (a *App) createPipelineHandler(q pipelineReq) func(*Job) {
 					Tag:       q.Tags,
 					Parts:     true,
 					Source:    q.URL,
+					Progress:  func(line string) { a.progressLine(nj, "B站上传", line) },
 				})
 				totalLogs += "\n[Biliup Upload Logs]\n" + uploadLogs
 			}()
@@ -3493,7 +3685,7 @@ func convertVttToSrtAndBcc(dir string) {
 	}
 }
 
-func burnSubtitlesToVideos(ctx context.Context, dir string, videoFiles []string) ([]string, string, error) {
+func burnSubtitlesToVideos(ctx context.Context, dir string, videoFiles []string, onLine func(string)) ([]string, string, error) {
 	var subFile string
 	for _, pattern := range []string{"*zh-Hans*.vtt", "*zh*.vtt", "*zh-Hans*.srt", "*zh*.srt", "*en*.vtt", "*en*.srt", "*.vtt", "*.srt"} {
 		matches, err := filepath.Glob(filepath.Join(dir, pattern))
@@ -3522,6 +3714,8 @@ func burnSubtitlesToVideos(ctx context.Context, dir string, videoFiles []string)
 
 		args := []string{
 			"-y",
+			"-progress", "pipe:2",
+			"-nostats",
 			"-i", vf,
 			"-vf", fmt.Sprintf("subtitles='%s':force_style='FontSize=18,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BorderStyle=1,Outline=1.5,Shadow=1,MarginV=25'", escapedSub),
 			"-c:v", "libx264",
@@ -3531,8 +3725,7 @@ func burnSubtitlesToVideos(ctx context.Context, dir string, videoFiles []string)
 			burnedFile,
 		}
 
-		cmd := exec.CommandContext(ctx, "ffmpeg", args...)
-		out, err := cmd.CombinedOutput()
+		out, err := runCmdProgress(ctx, "ffmpeg", args, onLine)
 		if err != nil {
 			logs += fmt.Sprintf("[硬字幕压制失败 P%d] %v: %s\n", idx+1, err, string(out))
 			outVideos = append(outVideos, vf)

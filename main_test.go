@@ -21,6 +21,35 @@ func TestAcquireSlotTimesOut(t *testing.T) {
 	}
 }
 
+func TestProgressParsing(t *testing.T) {
+	if got := parseSpeedBytes("1.5MiB/s"); got != int64(1.5*1024*1024) {
+		t.Fatalf("unexpected speed: %d", got)
+	}
+	if got := parseETASeconds("01:02"); got != 62 {
+		t.Fatalf("unexpected eta: %d", got)
+	}
+	a := &App{}
+	j := &Job{ID: "progress-test", Status: "running"}
+	a.progressLine(j, "YouTube 下载", "download: 42.5%|4250|10000|2MiB/s|12|demo")
+	if j.Progress == nil || j.Progress.Percent != 42.5 || j.Progress.Downloaded != 4250 || j.Progress.Total != 10000 || j.Progress.ETASeconds != 12 {
+		t.Fatalf("yt-dlp progress was not parsed: %+v", j.Progress)
+	}
+	a.progressLine(j, "BT 下载", "[#abc 42% 4MiB/10MiB(40%) CN:2 DL:2MiB ETA:12s]")
+	if j.Progress == nil || j.Progress.Percent != 42 {
+		t.Fatalf("aria2 progress was not parsed: %+v", j.Progress)
+	}
+}
+
+func TestRunCmdProgressStreamsLines(t *testing.T) {
+	var lines []string
+	logs, err := runCmdProgress(context.Background(), "/bin/sh", []string{"-c", "printf 'download: 12%%|12|100|1MiB/s|8|demo\\n'"}, func(line string) {
+		lines = append(lines, line)
+	})
+	if err != nil || len(lines) != 1 || !strings.Contains(logs, "download: 12%") {
+		t.Fatalf("streaming command output failed: lines=%v logs=%q err=%v", lines, logs, err)
+	}
+}
+
 func TestMagnetValidationAndDeadSeedClassification(t *testing.T) {
 	if !validTorrentOrMagnet("magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567") {
 		t.Fatal("expected valid magnet URI")
