@@ -52,7 +52,7 @@ func TestRunCmdProgressStreamsLines(t *testing.T) {
 
 func TestRetryReplacesTerminalRecord(t *testing.T) {
 	a := &App{
-		cfg:  Config{DataDir: t.TempDir()},
+		cfg:  Config{DataDir: filepath.Join(t.TempDir(), "not-created")},
 		jobs: map[string]*Job{},
 	}
 	old := &Job{ID: "old-job", Kind: "unknown", Status: "failed", Input: map[string]any{"url": "test"}}
@@ -68,6 +68,33 @@ func TestRetryReplacesTerminalRecord(t *testing.T) {
 	}
 	if len(a.jobs) != 1 || len(a.order) != 1 || a.jobs[old.ID] != nil || a.order[0] != retried.ID {
 		t.Fatalf("retry left a duplicate record: jobs=%d order=%v", len(a.jobs), a.order)
+	}
+}
+
+func TestRetryCollapsesDuplicateTerminalRecords(t *testing.T) {
+	a := &App{cfg: Config{DataDir: filepath.Join(t.TempDir(), "not-created")}, jobs: map[string]*Job{}}
+	input := map[string]any{"url": "same"}
+	first := &Job{ID: "first", Kind: "unknown", Status: "failed", Input: input}
+	second := &Job{ID: "second", Kind: "unknown", Status: "canceled", Input: input}
+	a.jobs[first.ID] = first
+	a.jobs[second.ID] = second
+	a.order = []string{first.ID, second.ID}
+
+	retried, err := a.retryJob(first.ID)
+	if err != nil {
+		t.Fatalf("retry failed: %v", err)
+	}
+	if len(a.jobs) != 1 || len(a.order) != 1 || a.jobs[retried.ID] == nil || retried.Status != "queued" {
+		t.Fatalf("duplicate terminal records were not collapsed: jobs=%d order=%v", len(a.jobs), a.order)
+	}
+}
+
+func TestShortVideoDisablesChapterSplitting(t *testing.T) {
+	bin, _ := writeMockBiliup(t, `echo '{"duration": 1799}'`)
+	a := &App{cfg: Config{YTDLP: bin}}
+	split, log := a.chapterSplitDecision(context.Background(), "https://www.youtube.com/watch?v=test", "", true)
+	if split || !strings.Contains(log, "小于 30 分钟") {
+		t.Fatalf("short video should not split chapters: split=%v log=%q", split, log)
 	}
 }
 

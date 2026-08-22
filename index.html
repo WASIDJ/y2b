@@ -3543,7 +3543,17 @@ async function actJob(id, action) {
 }
 
 function retryableJobs() {
-  return rawJobs.filter(j => j.status === 'failed' || j.status === 'canceled');
+  const unique = new Map();
+  rawJobs
+    .filter(j => j.status === 'failed' || j.status === 'canceled')
+    .forEach(j => {
+      let inputKey = '';
+      try { inputKey = JSON.stringify(j.input); } catch (_) { inputKey = String(j.input); }
+      // Retry one logical task once, even if old versions left many terminal
+      // records behind for the same input.
+      unique.set(`${j.kind}|${inputKey}`, j);
+    });
+  return [...unique.values()];
 }
 
 function updateRetryAllButton() {

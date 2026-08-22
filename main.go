@@ -625,6 +625,37 @@ func (a *App) retryJob(jobID string) (*Job, error) {
 		return nil, fmt.Errorf("only failed or canceled jobs can be retried (status=%s)", old.Status)
 	}
 
+	// A previous version created a new record for every retry. Collapse those
+	// terminal duplicates before retrying, and never start a second copy when
+	// the same input is already queued or running.
+	oldInput, _ := json.Marshal(old.Input)
+	activeDuplicate := (*Job)(nil)
+	removeIDs := make(map[string]bool)
+	for oid, candidate := range a.jobs {
+		if oid == jobID || candidate == nil || candidate.Kind != old.Kind {
+			continue
+		}
+		candidateInput, _ := json.Marshal(candidate.Input)
+		if !bytes.Equal(oldInput, candidateInput) {
+			continue
+		}
+		if candidate.Status == "queued" || candidate.Status == "running" {
+			activeDuplicate = candidate
+		} else if candidate.Status == "failed" || candidate.Status == "canceled" {
+			removeIDs[oid] = true
+		}
+	}
+	if activeDuplicate != nil {
+		removeIDs[jobID] = true
+		for oid := range removeIDs {
+			delete(a.jobs, oid)
+		}
+		a.removeJobIDsLocked(removeIDs)
+		a.mu.Unlock()
+		a.saveJobs()
+		return activeDuplicate, nil
+	}
+
 	// Replace the terminal record in-place from the queue's point of view.
 	// Creating a second record made every retry look like a duplicate task and
 	// caused "retry all" to double the visible queue. A fresh Job object keeps
@@ -646,12 +677,29 @@ func (a *App) retryJob(jobID string) (*Job, error) {
 			break
 		}
 	}
+	for oid := range removeIDs {
+		delete(a.jobs, oid)
+	}
+	a.removeJobIDsLocked(removeIDs)
 	delete(a.jobs, jobID)
 	a.jobs[j.ID] = j
 	a.mu.Unlock()
 	a.saveJobs()
 	a.dispatchJob(j)
 	return j, nil
+}
+
+func (a *App) removeJobIDsLocked(ids map[string]bool) {
+	if len(ids) == 0 {
+		return
+	}
+	filtered := a.order[:0]
+	for _, oid := range a.order {
+		if !ids[oid] {
+			filtered = append(filtered, oid)
+		}
+	}
+	a.order = filtered
 }
 
 func jsonResp(w http.ResponseWriter, code int, v any) {
@@ -672,41 +720,55 @@ func decode(r *http.Request, v any) error {
 func runCmdProgress(ctx context.Context, bin string, args []string, onLine func(string)) (string, error) {
 	c := exec.CommandContext(ctx, bin, args...)
 	c.Env = os.Environ()
-	b := &limitedBuffer{max: 128 << 10}
-	stdout, err := c.StdoutPipe()
-	if err != nil {
-		return "", err
-	}
-	stderr, err := c.StderrPipe()
-	if err != nil {
-		return "", err
-	}
-	if err := c.Start(); err != nil {
-		return "", err
-	}
-	var wg sync.WaitGroup
-	read := func(r io.Reader) {
-		defer wg.Done()
-		scanner := bufio.NewScanner(r)
-		scanner.Buffer(make([]byte, 4096), 1024*1024)
-		for scanner.Scan() {
-			line := scanner.Text()
-			_, _ = b.Write([]byte(line + "\n"))
-			if onLine != nil {
-				onLine(line)
-			}
-		}
-	}
-	wg.Add(2)
-	go read(stdout)
-	go read(stderr)
-	err = c.Wait()
-	wg.Wait()
-	output := strings.TrimSpace(b.String())
+	capture := &progressCapture{buffer: &limitedBuffer{max: 128 << 10}, onLine: onLine}
+	c.Stdout = capture
+	c.Stderr = capture
+	err := c.Run()
+	capture.flush()
+	output := strings.TrimSpace(capture.String())
 	if err != nil {
 		return output, fmt.Errorf("%s: %w: %s", bin, err, output)
 	}
 	return output, nil
+}
+
+type progressCapture struct {
+	mu      sync.Mutex
+	buffer  *limitedBuffer
+	pending string
+	onLine  func(string)
+}
+
+func (c *progressCapture) Write(p []byte) (int, error) {
+	c.mu.Lock()
+	_, _ = c.buffer.Write(p)
+	c.pending += string(p)
+	parts := strings.Split(c.pending, "\n")
+	c.pending = parts[len(parts)-1]
+	lines := append([]string(nil), parts[:len(parts)-1]...)
+	c.mu.Unlock()
+	if c.onLine != nil {
+		for _, line := range lines {
+			c.onLine(strings.TrimSuffix(line, "\r"))
+		}
+	}
+	return len(p), nil
+}
+
+func (c *progressCapture) flush() {
+	c.mu.Lock()
+	line := strings.TrimSuffix(c.pending, "\r")
+	c.pending = ""
+	c.mu.Unlock()
+	if line != "" && c.onLine != nil {
+		c.onLine(line)
+	}
+}
+
+func (c *progressCapture) String() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.buffer.String()
 }
 
 func runCmd(ctx context.Context, bin string, args []string) (string, error) {
@@ -868,6 +930,49 @@ func isPlaylistURL(s string) bool {
 	return q.Get("list") != "" || strings.Contains(u.Path, "/playlist")
 }
 
+func (a *App) chapterSplitDecision(ctx context.Context, rawURL, cookiePath string, requested bool) (bool, string) {
+	if !requested || isPlaylistURL(rawURL) {
+		return requested, ""
+	}
+	args := []string{
+		"--dump-single-json",
+		"--skip-download",
+		"--no-playlist",
+		"--no-warnings",
+		"--no-plugin-dirs",
+		rawURL,
+	}
+	if cookiePath != "" {
+		args = append(args[:len(args)-1], "--cookies", cookiePath, rawURL)
+	}
+	out, err := runCmd(ctx, a.cfg.YTDLP, args)
+	if err != nil {
+		return requested, "[分P策略] 无法读取视频时长，保留用户选择"
+	}
+	var meta struct {
+		Duration float64 `json:"duration"`
+	}
+	if json.Unmarshal([]byte(out), &meta) != nil || meta.Duration <= 0 {
+		return requested, "[分P策略] 未获取到有效时长，保留用户选择"
+	}
+	if meta.Duration < 30*60 {
+		return false, fmt.Sprintf("[分P策略] 视频时长 %s，小于 30 分钟，自动关闭章节分P", formatDurationSeconds(meta.Duration))
+	}
+	return requested, fmt.Sprintf("[分P策略] 视频时长 %s，按用户选择处理章节分P", formatDurationSeconds(meta.Duration))
+}
+
+func formatDurationSeconds(seconds float64) string {
+	whole := int64(seconds)
+	if whole < 60 {
+		return fmt.Sprintf("%ds", whole)
+	}
+	minutes := whole / 60
+	if minutes < 60 {
+		return fmt.Sprintf("%dm %ds", minutes, whole%60)
+	}
+	return fmt.Sprintf("%dh %dm", minutes/60, minutes%60)
+}
+
 func (a *App) youtube(w http.ResponseWriter, r *http.Request) {
 	var q youtubeReq
 	if decode(r, &q) != nil || !validYouTube(q.URL) {
@@ -919,6 +1024,10 @@ func (a *App) createYoutubeHandler(q youtubeReq) func(*Job) {
 					langs = "zh-Hans,zh,en,zh-Hant"
 				}
 				isPlaylist := isPlaylistURL(q.URL)
+				splitChapters, splitLog := a.chapterSplitDecision(nj.ctx, q.URL, cookiePath, q.SplitChapters)
+				if splitLog != "" {
+					totalLogs += splitLog + "\n"
+				}
 				args := []string{
 					"--ignore-errors",
 					"--no-abort-on-error",
@@ -956,7 +1065,7 @@ func (a *App) createYoutubeHandler(q youtubeReq) func(*Job) {
 				}
 
 				if isPlaylist {
-					if q.SplitChapters {
+					if splitChapters {
 						args = append(args,
 							"--split-chapters",
 							"-o", "chapter:"+filepath.Join(d, "P%(playlist_index|1)02d - C%(section_number)02d. %(section_title)s.%(ext)s"),
@@ -971,7 +1080,7 @@ func (a *App) createYoutubeHandler(q youtubeReq) func(*Job) {
 						q.URL,
 					)
 				} else {
-					if q.SplitChapters {
+					if splitChapters {
 						args = append(args,
 							"--split-chapters",
 							"-o", "chapter:"+filepath.Join(d, "%(title)s - P%(section_number)02d. %(section_title)s.%(ext)s"),
@@ -1976,6 +2085,10 @@ func (a *App) createPipelineHandler(q pipelineReq) func(*Job) {
 						langs = "zh-Hans,zh,en,zh-Hant"
 					}
 					isPlaylist := isPlaylistURL(q.URL)
+					splitChapters, splitLog := a.chapterSplitDecision(nj.ctx, q.URL, cookiePath, q.SplitChapters)
+					if splitLog != "" {
+						totalLogs += splitLog + "\n"
+					}
 					args := []string{
 						"--ignore-errors",
 						"--no-abort-on-error",
@@ -2013,7 +2126,7 @@ func (a *App) createPipelineHandler(q pipelineReq) func(*Job) {
 					}
 
 					if isPlaylist {
-						if q.SplitChapters {
+						if splitChapters {
 							args = append(args,
 								"--split-chapters",
 								"-o", "chapter:"+filepath.Join(d, "P%(playlist_index|1)02d - C%(section_number)02d. %(section_title)s.%(ext)s"),
@@ -2028,7 +2141,7 @@ func (a *App) createPipelineHandler(q pipelineReq) func(*Job) {
 							q.URL,
 						)
 					} else {
-						if q.SplitChapters {
+						if splitChapters {
 							args = append(args,
 								"--split-chapters",
 								"-o", "chapter:"+filepath.Join(d, "%(title)s - P%(section_number)02d. %(section_title)s.%(ext)s"),
