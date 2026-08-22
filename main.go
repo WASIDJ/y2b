@@ -57,6 +57,8 @@ type Config struct {
 	QueueWaitTimeout time.Duration
 	MagnetTimeout    time.Duration
 	BTListenPort     string
+	AutoRetryMax     int
+	AutoRetryBase    time.Duration
 }
 
 type MonitoredChannel struct {
@@ -82,21 +84,23 @@ type MonitoredChannel struct {
 }
 
 type Job struct {
-	ID         string       `json:"id"`
-	Kind       string       `json:"kind"`   // "youtube", "magnet", "biliup", "pipeline"
-	Status     string       `json:"status"` // "queued", "running", "done", "failed", "canceled"
-	Step       string       `json:"step,omitempty"`
-	Error      string       `json:"error,omitempty"`
-	Created    time.Time    `json:"created"`
-	Started    time.Time    `json:"started,omitempty"`
-	Finished   time.Time    `json:"finished,omitempty"`
-	Input      any          `json:"input,omitempty"`
-	Output     any          `json:"output,omitempty"`
-	Logs       string       `json:"logs,omitempty"`
-	Progress   *JobProgress `json:"progress,omitempty"`
-	ctx        context.Context
-	cancelFunc context.CancelFunc
-	retry      func(*Job)
+	ID              string       `json:"id"`
+	Kind            string       `json:"kind"`   // "youtube", "magnet", "biliup", "pipeline"
+	Status          string       `json:"status"` // "queued", "running", "done", "failed", "canceled"
+	Step            string       `json:"step,omitempty"`
+	Error           string       `json:"error,omitempty"`
+	Created         time.Time    `json:"created"`
+	Started         time.Time    `json:"started,omitempty"`
+	Finished        time.Time    `json:"finished,omitempty"`
+	Input           any          `json:"input,omitempty"`
+	Output          any          `json:"output,omitempty"`
+	Logs            string       `json:"logs,omitempty"`
+	Progress        *JobProgress `json:"progress,omitempty"`
+	FailureCategory string       `json:"failure_category,omitempty"`
+	AutoRetryCount  int          `json:"auto_retry_count,omitempty"`
+	ctx             context.Context
+	cancelFunc      context.CancelFunc
+	retry           func(*Job)
 }
 
 // JobProgress is the small, tool-agnostic snapshot rendered by the queue UI.
@@ -197,6 +201,18 @@ func loadConfig() Config {
 		}
 	}
 	btListenPort := env("Y2B_BT_LISTEN_PORT", "51413")
+	autoRetryMax := 3
+	if raw := os.Getenv("Y2B_AUTO_RETRY_MAX"); raw != "" {
+		if parsed, err := strconv.Atoi(raw); err == nil && parsed >= 0 && parsed <= 10 {
+			autoRetryMax = parsed
+		}
+	}
+	autoRetryBase := 30 * time.Second
+	if raw := os.Getenv("Y2B_AUTO_RETRY_BASE"); raw != "" {
+		if parsed, err := time.ParseDuration(raw); err == nil && parsed > 0 {
+			autoRetryBase = parsed
+		}
+	}
 
 	return Config{
 		Addr:             env("Y2B_ADDR", "127.0.0.1:8765"),
@@ -218,6 +234,8 @@ func loadConfig() Config {
 		QueueWaitTimeout: queueWaitTimeout,
 		MagnetTimeout:    magnetTimeout,
 		BTListenPort:     btListenPort,
+		AutoRetryMax:     autoRetryMax,
+		AutoRetryBase:    autoRetryBase,
 	}
 }
 
@@ -249,36 +267,40 @@ func (a *App) saveJobs() {
 	defer a.mu.RUnlock()
 
 	type persistedJob struct {
-		ID       string       `json:"id"`
-		Kind     string       `json:"kind"`
-		Status   string       `json:"status"`
-		Step     string       `json:"step,omitempty"`
-		Error    string       `json:"error,omitempty"`
-		Created  time.Time    `json:"created"`
-		Started  time.Time    `json:"started,omitempty"`
-		Finished time.Time    `json:"finished,omitempty"`
-		Input    any          `json:"input,omitempty"`
-		Output   any          `json:"output,omitempty"`
-		Logs     string       `json:"logs,omitempty"`
-		Progress *JobProgress `json:"progress,omitempty"`
+		ID              string       `json:"id"`
+		Kind            string       `json:"kind"`
+		Status          string       `json:"status"`
+		Step            string       `json:"step,omitempty"`
+		Error           string       `json:"error,omitempty"`
+		Created         time.Time    `json:"created"`
+		Started         time.Time    `json:"started,omitempty"`
+		Finished        time.Time    `json:"finished,omitempty"`
+		Input           any          `json:"input,omitempty"`
+		Output          any          `json:"output,omitempty"`
+		Logs            string       `json:"logs,omitempty"`
+		Progress        *JobProgress `json:"progress,omitempty"`
+		FailureCategory string       `json:"failure_category,omitempty"`
+		AutoRetryCount  int          `json:"auto_retry_count,omitempty"`
 	}
 
 	list := make([]persistedJob, 0, len(a.order))
 	for _, oid := range a.order {
 		if j := a.jobs[oid]; j != nil {
 			list = append(list, persistedJob{
-				ID:       j.ID,
-				Kind:     j.Kind,
-				Status:   j.Status,
-				Step:     j.Step,
-				Error:    j.Error,
-				Created:  j.Created,
-				Started:  j.Started,
-				Finished: j.Finished,
-				Input:    j.Input,
-				Output:   j.Output,
-				Logs:     j.Logs,
-				Progress: j.Progress,
+				ID:              j.ID,
+				Kind:            j.Kind,
+				Status:          j.Status,
+				Step:            j.Step,
+				Error:           j.Error,
+				Created:         j.Created,
+				Started:         j.Started,
+				Finished:        j.Finished,
+				Input:           j.Input,
+				Output:          j.Output,
+				Logs:            j.Logs,
+				Progress:        j.Progress,
+				FailureCategory: j.FailureCategory,
+				AutoRetryCount:  j.AutoRetryCount,
 			})
 		}
 	}
@@ -434,6 +456,8 @@ func (a *App) setProgress(j *Job, p JobProgress) {
 }
 
 func (a *App) set(j *Job, status, err string, out any, logs string) {
+	shouldAutoRetry := false
+	var retryDelay time.Duration
 	a.mu.Lock()
 	j.Status = status
 	j.Error = err
@@ -443,6 +467,14 @@ func (a *App) set(j *Job, status, err string, out any, logs string) {
 			logs = logs[len(logs)-64*1024:] // Keep latest 64KB to avoid RAM growth
 		}
 		j.Logs = logs
+	}
+	if status == "failed" {
+		j.FailureCategory = classifyFailure(err, logs)
+		if a.cfg.AutoRetryMax > j.AutoRetryCount && isAutoRetryableCategory(j.FailureCategory) {
+			j.AutoRetryCount++
+			shouldAutoRetry = true
+			retryDelay = a.cfg.AutoRetryBase * time.Duration(1<<(j.AutoRetryCount-1))
+		}
 	}
 	if status == "running" {
 		j.Started = time.Now()
@@ -464,6 +496,80 @@ func (a *App) set(j *Job, status, err string, out any, logs string) {
 	}
 	a.mu.Unlock()
 	a.saveJobs()
+	if shouldAutoRetry {
+		a.scheduleAutoRetry(j, retryDelay)
+	}
+}
+
+// classifyFailure turns noisy external-tool output into a stable category that
+// the UI and the bounded recovery loop can act on.
+func classifyFailure(err, logs string) string {
+	s := strings.ToLower(err + "\n" + logs)
+	switch {
+	case strings.Contains(s, "队列等待超时"), strings.Contains(s, "queue wait timeout"):
+		return "queue_timeout"
+	case strings.Contains(s, "code 406"), strings.Contains(s, `"code":406`),
+		strings.Contains(s, "上传视频过快"), strings.Contains(s, "upload too fast"):
+		return "upload_rate_limit"
+	case strings.Contains(s, "code 601"), strings.Contains(s, "upload rate limit"):
+		return "upload_rate_limit"
+	case strings.Contains(s, "magnet_timeout"):
+		return "magnet_timeout"
+	case strings.Contains(s, "dead_seed"):
+		return "dead_seed"
+	case strings.Contains(s, "context canceled"), strings.Contains(s, "已取消"):
+		return "canceled"
+	default:
+		return "unknown"
+	}
+}
+
+func isAutoRetryableCategory(category string) bool {
+	return category == "queue_timeout" || category == "upload_rate_limit" || category == "magnet_timeout"
+}
+
+func (a *App) scheduleAutoRetry(j *Job, delay time.Duration) {
+	if delay <= 0 {
+		delay = time.Second
+	}
+	go func(jobID string, retryNo int) {
+		timer := time.NewTimer(delay)
+		defer timer.Stop()
+		<-timer.C
+		if retried, err := a.retryJob(jobID); err == nil {
+			fmt.Printf("auto-retry #%d scheduled job %s as %s\n", retryNo, jobID, retried.ID)
+		}
+	}(j.ID, j.AutoRetryCount)
+}
+
+// recoverTransientJobs is called after loading persisted state so failures
+// from before this recovery logic existed also get one bounded retry policy.
+func (a *App) recoverTransientJobs() {
+	if a.cfg.AutoRetryMax <= 0 {
+		return
+	}
+	a.mu.RLock()
+	failed := make([]*Job, 0)
+	for _, oid := range a.order {
+		j := a.jobs[oid]
+		if j != nil && j.Status == "failed" {
+			category := classifyFailure(j.Error, j.Logs)
+			if j.AutoRetryCount < a.cfg.AutoRetryMax && isAutoRetryableCategory(category) {
+				failed = append(failed, j)
+			}
+		}
+	}
+	a.mu.RUnlock()
+	for i, j := range failed {
+		a.mu.Lock()
+		j.AutoRetryCount++
+		a.mu.Unlock()
+		a.scheduleAutoRetry(j, a.cfg.AutoRetryBase*time.Duration(i+1))
+	}
+	if len(failed) > 0 {
+		a.saveJobs()
+		fmt.Printf("scheduled %d transient failed jobs for bounded recovery\n", len(failed))
+	}
 }
 
 func (a *App) ensureSafeMemory(ctx context.Context) error {
@@ -733,14 +839,15 @@ func (a *App) retryJob(jobID string) (*Job, error) {
 	// a canceled worker from writing its final state into the retried attempt.
 	ctx, cancel := context.WithCancel(context.Background())
 	j := &Job{
-		ID:         id(),
-		Kind:       old.Kind,
-		Status:     "queued",
-		Step:       "排队中",
-		Created:    time.Now(),
-		Input:      old.Input,
-		ctx:        ctx,
-		cancelFunc: cancel,
+		ID:             id(),
+		Kind:           old.Kind,
+		Status:         "queued",
+		Step:           "排队中",
+		Created:        time.Now(),
+		Input:          old.Input,
+		ctx:            ctx,
+		cancelFunc:     cancel,
+		AutoRetryCount: old.AutoRetryCount,
 	}
 	for i, oid := range a.order {
 		if oid == jobID {
@@ -1435,6 +1542,112 @@ func (a *App) runMagnetProgress(ctx context.Context, args []string, callbacks ..
 	return logs, err
 }
 
+// runMagnetStreamingUpload keeps aria2 downloading while completed video files
+// are uploaded one at a time. aria2 removes the .aria2 control file only after
+// a file is complete, so this is safe for large multi-file torrents. A single
+// huge video still has to finish before an uploader can read it reliably.
+func (a *App) runMagnetStreamingUpload(ctx context.Context, args []string, dir string, onLine func(string), upload func(string) error) (string, []string, error) {
+	streamCtx := ctx
+	var cancel context.CancelFunc
+	if a.cfg.MagnetTimeout > 0 {
+		streamCtx, cancel = context.WithTimeout(ctx, a.cfg.MagnetTimeout)
+		defer cancel()
+	}
+
+	c := exec.CommandContext(streamCtx, a.cfg.Aria2, args...)
+	c.Env = os.Environ()
+	capture := &progressCapture{buffer: &limitedBuffer{max: 128 << 10}, onLine: onLine}
+	c.Stdout = capture
+	c.Stderr = capture
+	if err := c.Start(); err != nil {
+		return "", nil, err
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- c.Wait() }()
+
+	type fileState struct {
+		size int64
+		seen int
+	}
+	states := make(map[string]fileState)
+	uploaded := make(map[string]bool)
+	var uploadedFiles []string
+	uploadReady := func(force bool) error {
+		var firstErr error
+		_ = filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
+			if err != nil || info == nil || info.IsDir() || uploaded[path] || !isVideoFilePath(path) {
+				return nil
+			}
+			// The sidecar is present while aria2 is still writing this file.
+			if _, err := os.Stat(path + ".aria2"); err == nil {
+				return nil
+			}
+			st := states[path]
+			if st.size == info.Size() {
+				st.seen++
+			} else {
+				st.size, st.seen = info.Size(), 1
+			}
+			states[path] = st
+			if !force && st.seen < 2 { // protect against a sidecar disappearing just before a final write
+				return nil
+			}
+			if err := upload(path); err != nil {
+				firstErr = err
+				return filepath.SkipAll
+			}
+			uploaded[path] = true
+			uploadedFiles = append(uploadedFiles, path)
+			return nil
+		})
+		return firstErr
+	}
+
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+	var processErr error
+	for {
+		select {
+		case processErr = <-done:
+			// One final scan catches files completed immediately before aria2 exits.
+			if err := uploadReady(true); err != nil {
+				_ = c.Process.Kill()
+				return strings.TrimSpace(capture.String()), uploadedFiles, err
+			}
+			capture.flush()
+			logs := strings.TrimSpace(capture.String())
+			if processErr != nil {
+				if errors.Is(streamCtx.Err(), context.DeadlineExceeded) {
+					return logs, uploadedFiles, fmt.Errorf("magnet_timeout: BT 下载超过 %s", a.cfg.MagnetTimeout)
+				}
+				if isDeadSeedOutput(logs) {
+					return logs, uploadedFiles, fmt.Errorf("dead_seed: 未发现可用做种或下载速度持续为 0")
+				}
+				return logs, uploadedFiles, fmt.Errorf("%s: %w: %s", a.cfg.Aria2, processErr, logs)
+			}
+			return logs, uploadedFiles, nil
+		case <-ticker.C:
+			if err := uploadReady(false); err != nil {
+				_ = c.Process.Kill()
+				return strings.TrimSpace(capture.String()), uploadedFiles, err
+			}
+		case <-ctx.Done():
+			_ = c.Process.Kill()
+			return strings.TrimSpace(capture.String()), uploadedFiles, ctx.Err()
+		}
+	}
+}
+
+func isVideoFilePath(path string) bool {
+	switch strings.ToLower(filepath.Ext(path)) {
+	case ".mp4", ".mkv", ".avi", ".webm", ".mp3", ".m4v", ".mov":
+		return true
+	default:
+		return false
+	}
+}
+
 func (a *App) magnet(w http.ResponseWriter, r *http.Request) {
 	var q magnetReq
 	if decode(r, &q) != nil {
@@ -1469,6 +1682,8 @@ func (a *App) createMagnetHandler(q magnetReq) func(*Job) {
 			var videoFile string
 			var totalLogs string
 			var downloadErr error
+			var streamedUploads []map[string]any
+			var streamedFreed int64
 
 			// Stage 1: Magnet Download (acquires downloadSlots)
 			func() {
@@ -1490,7 +1705,7 @@ func (a *App) createMagnetHandler(q magnetReq) func(*Job) {
 				a.set(nj, "running", "", nil, "")
 				a.setStep(nj, "磁力下载中")
 				btTrackers := "udp://tracker.opentrackr.org:1337/announce,udp://open.tracker.cl:1337/announce,udp://tracker.openbittorrent.com:6969/announce,http://tracker.openbittorrent.com:80/announce,udp://opentracker.i2p.rocks:6969/announce,udp://open.demonii.com:1337/announce"
-				magLogs, err := a.runMagnetProgress(nj.ctx, []string{
+				magnetArgs := []string{
 					"--dir=" + d,
 					"--continue=true",
 					"--allow-overwrite=false",
@@ -1513,8 +1728,42 @@ func (a *App) createMagnetHandler(q magnetReq) func(*Job) {
 					"--summary-interval=1",
 					"--bt-tracker=" + btTrackers,
 					m,
-				}, func(line string) { a.progressLine(nj, "BT 下载", line) })
-				totalLogs = magLogs
+				}
+				var magLogs string
+				var err error
+				if q.AutoUpload {
+					magLogs, _, err = a.runMagnetStreamingUpload(nj.ctx, magnetArgs, d, func(line string) { a.progressLine(nj, "BT 下载", line) }, func(file string) error {
+						if err := a.acquireSlot(nj.ctx, a.uploadSlots); err != nil {
+							return err
+						}
+						defer func() { <-a.uploadSlots }()
+						a.setStep(nj, "B站投稿中（边下载边上传）")
+						a.setProgress(nj, JobProgress{Detail: "B站上传: " + filepath.Base(file)})
+						result, logs, uploadErr := a.executeBiliupUpload(nj.ctx, uploadReq{
+							File: file, Translate: q.Translate, Tid: q.Tid, Tag: q.Tags,
+							Source: m, Progress: func(line string) { a.progressLine(nj, "B站上传", line) },
+						})
+						totalLogs += "\n--- BILIUP STREAM UPLOAD LOGS ---\n" + logs
+						if uploadErr != nil {
+							return uploadErr
+						}
+						fileSize := calcFilesSize([]string{file})
+						if fileSize > 0 {
+							a.recordUpload(fileSize)
+							a.recordDownload(fileSize)
+						}
+						streamedFreed += purgeVideoFiles(file)
+						streamedUploads = append(streamedUploads, result)
+						videoFiles = append(videoFiles, file)
+						if videoFile == "" {
+							videoFile = file
+						}
+						return nil
+					})
+				} else {
+					magLogs, err = a.runMagnetProgress(nj.ctx, magnetArgs, func(line string) { a.progressLine(nj, "BT 下载", line) })
+				}
+				totalLogs += magLogs
 				downloadErr = err
 
 				_ = filepath.Walk(d, func(p string, info os.FileInfo, err error) error {
@@ -1543,6 +1792,25 @@ func (a *App) createMagnetHandler(q magnetReq) func(*Job) {
 				} else {
 					a.set(nj, "failed", downloadErr.Error(), outMap, totalLogs)
 				}
+				return
+			}
+
+			// Streaming uploads have already been committed and cleaned as each
+			// file completed. Do not run the old second upload pass.
+			if q.AutoUpload {
+				if len(streamedUploads) == 0 {
+					a.set(nj, "failed", "no video files found after download", outMap, totalLogs)
+					return
+				}
+				a.recordPipelineSuccess()
+				if q.Translate {
+					a.recordAiTrans()
+				}
+				outMap["upload"] = streamedUploads
+				outMap["stream_upload"] = true
+				outMap["cleaned_disk"] = formatBytes(streamedFreed)
+				totalLogs += fmt.Sprintf("\n[自动空间清理] 已按文件上传成功即删除，释放磁盘空间: %s\n", formatBytes(streamedFreed))
+				a.set(nj, "done", "", outMap, totalLogs)
 				return
 			}
 
@@ -1685,7 +1953,7 @@ func biliRepairActionFor(code int) biliRepairAction {
 		// biliup's own Python implementation treats this as web-submit
 		// incompatibility and falls back to the client endpoint.
 		return biliRepairSwitch
-	case 601:
+	case 406, 601:
 		return biliRepairRateLimit
 	default:
 		return biliRepairUnknown
@@ -1698,13 +1966,13 @@ func parseBiliupOutput(logs string) BiliCodeResult {
 	if m := reBV.FindString(logs); m != "" {
 		res.BVID = m
 	}
-	reCode := regexp.MustCompile(`code:\s*(-?\d+)`)
+	reCode := regexp.MustCompile(`code["']?\s*:\s*["']?(-?\d+)`)
 	if m := reCode.FindStringSubmatch(logs); len(m) > 1 {
 		if c, err := strconv.Atoi(m[1]); err == nil {
 			res.Code = c
 		}
 	}
-	reMsg := regexp.MustCompile(`message:\s*"([^"]+)"`)
+	reMsg := regexp.MustCompile(`message["']?\s*:\s*["']([^"']+)["']`)
 	if m := reMsg.FindStringSubmatch(logs); len(m) > 1 {
 		res.Message = m[1]
 	}
@@ -1999,11 +2267,11 @@ func (a *App) executeBiliupUpload(ctx context.Context, q uploadReq) (map[string]
 			goto finish
 
 		case biliRepairRateLimit:
-			// 601 is a server-side upload throttle. Switching endpoints or
+			// 406/601 are server-side upload throttles. Switching endpoints or
 			// immediately retrying only amplifies the throttle, so stop this
 			// attempt and let the queue retry after an operator/chill-down period.
 			totalLogs += fmt.Sprintf("[自动化自愈] B站上传限速 (code %d)，停止快速切换线路，保留本地文件等待冷却后重试。\n", res.Code)
-			execErr = fmt.Errorf("B站上传限速 (code 601: %s)，请等待冷却后重试", res.Message)
+			execErr = fmt.Errorf("B站上传限速 (code %d: %s)，请等待冷却后重试", res.Code, res.Message)
 			goto finish
 
 		case biliRepairTitle:
@@ -2051,7 +2319,12 @@ func (a *App) executeBiliupUpload(ctx context.Context, q uploadReq) (map[string]
 			}
 		}
 
-		time.Sleep(2 * time.Second)
+		select {
+		case <-ctx.Done():
+			execErr = ctx.Err()
+			goto finish
+		case <-time.After(2 * time.Second):
+		}
 	}
 
 finish:
@@ -4417,6 +4690,7 @@ func main() {
 	if removed := a.compactDuplicateJobs(); removed > 0 {
 		fmt.Printf("compacted %d duplicate terminal jobs\n", removed)
 	}
+	a.recoverTransientJobs()
 	if freed := a.cleanupCompletedJobMedia(); freed > 0 {
 		fmt.Printf("cleaned %s from completed pipeline jobs\n", formatBytes(freed))
 	}

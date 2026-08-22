@@ -2872,6 +2872,8 @@ function normalizeJob(j) {
     status: j.status || j.Status || 'queued',
     step: j.step || j.Step || '',
     error: j.error || j.Error || '',
+    failureCategory: j.failure_category || j.FailureCategory || '',
+    autoRetryCount: j.auto_retry_count || j.AutoRetryCount || 0,
     created: j.created || j.Created || '',
     started: j.started || j.Started || '',
     finished: j.finished || j.Finished || '',
@@ -3122,7 +3124,7 @@ function renderJobs() {
               </div>
               <div class="job-meta-line">
                 <span class="job-id-chip mono">#${escapeHtml(j.id)}</span>
-                ${j.error ? `<span style="color: var(--color-failed); font-weight: 600;">⚠ 出错</span>` : ''}
+                ${j.error ? `<span style="color: var(--color-failed); font-weight: 600;">⚠ ${escapeHtml(j.failureCategory || '出错')}</span>` : ''}
               </div>
             </div>
           </div>
@@ -3209,6 +3211,7 @@ function renderJobs() {
               ${j.error ? `
                 <div style="margin-top:10px;">
                   <div class="drawer-field-label" style="color: var(--color-failed);">错误诊断 (Error Trace)</div>
+                  ${j.failureCategory ? `<div style="font-size:12px; color:var(--color-text-muted); margin-bottom:4px;">失败分类: <span class="mono">${escapeHtml(j.failureCategory)}</span> · 自动重试次数: ${j.autoRetryCount}</div>` : ''}
                   <div class="error-block">${escapeHtml(j.error)}</div>
                 </div>
               ` : ''}

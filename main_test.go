@@ -147,6 +147,23 @@ func TestMagnetValidationAndDeadSeedClassification(t *testing.T) {
 	}
 }
 
+func TestMagnetStreamingUploadProcessesCompletedFiles(t *testing.T) {
+	dir := t.TempDir()
+	aria := filepath.Join(dir, "aria2-mock.sh")
+	if err := os.WriteFile(aria, []byte("#!/bin/sh\nprintf video > \"$1/part.mp4\"\necho done\n"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	a := &App{cfg: Config{Aria2: aria}}
+	var uploaded []string
+	logs, files, err := a.runMagnetStreamingUpload(context.Background(), []string{dir}, dir, nil, func(file string) error {
+		uploaded = append(uploaded, file)
+		return nil
+	})
+	if err != nil || !strings.Contains(logs, "done") || len(files) != 1 || len(uploaded) != 1 {
+		t.Fatalf("streaming upload failed: logs=%q files=%v uploaded=%v err=%v", logs, files, uploaded, err)
+	}
+}
+
 func TestBiliRepairActionMatrix(t *testing.T) {
 	cases := map[int]biliRepairAction{
 		0: biliRepairSuccess, -101: biliRepairStop,
@@ -248,6 +265,31 @@ exit 1
 	b, _ := os.ReadFile(state)
 	if strings.TrimSpace(string(b)) != "1" {
 		t.Fatalf("rate limit should stop after one endpoint, calls=%q", b)
+	}
+}
+
+func TestBiliupJSONRateLimitIsClassified(t *testing.T) {
+	got := parseBiliupOutput(`RuntimeError: {"OK":0,"info":"您上传视频过快，请您稍作休息后再继续","code":406,"message":"您上传视频过快，请您稍作休息后再继续"}`)
+	if got.Code != 406 || got.Message == "" {
+		t.Fatalf("JSON biliup error was not parsed: %+v", got)
+	}
+	if biliRepairActionFor(got.Code) != biliRepairRateLimit {
+		t.Fatalf("code 406 was not classified as rate limited")
+	}
+	if got := classifyFailure("biliup exit status 1", got.RawLogs); got != "upload_rate_limit" {
+		t.Fatalf("failure category = %q, want upload_rate_limit", got)
+	}
+}
+
+func TestFailureCategoriesOnlyRetryTransientErrors(t *testing.T) {
+	if got := classifyFailure("dead_seed: no seed", ""); got != "dead_seed" {
+		t.Fatalf("dead seed category = %q", got)
+	}
+	if isAutoRetryableCategory("dead_seed") {
+		t.Fatal("dead seed must not be auto-retried")
+	}
+	if !isAutoRetryableCategory("queue_timeout") || !isAutoRetryableCategory("upload_rate_limit") {
+		t.Fatal("transient categories should be auto-retryable")
 	}
 }
 

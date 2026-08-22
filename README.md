@@ -68,11 +68,13 @@ YouTube 字幕 → 保存 / 转换 SRT、BCC → 视频保留字幕 → Biliup o
 - 网络错误和上传限速：使用 Biliup 退避；`601` 不再快速轮询多个端点
 - 登录失效、重复稿、每日频控：保护性停止，保留本地文件
 - 未知状态码：有限尝试后失败，不会无限循环
+- 队列等待超时、B站 406/601 上传限速和 BT 下载超时会按失败分类执行最多 3 次指数退避自动重试；死种、登录失效、重复稿和频控不会自动重试
 - Biliup 外部进程默认 4 小时超时，可用 `Y2B_UPLOAD_TIMEOUT` 调整
 
 BT 防卡队列策略：
 
 - aria2 BT 任务默认总时限 30 分钟，可用 `Y2B_MAGNET_TIMEOUT` 调整
+- 磁力任务勾选自动投稿后支持按已完成视频边下载边上传，单个视频投稿成功立即清理；单个超大视频仍需先完整下载
 - 下载/投稿等待槽位默认最多 2 小时，可用 `Y2B_QUEUE_WAIT_TIMEOUT` 调整
 - BT 无 Peer、无 Seed 或持续 0 速度的失败会标记为 `dead_seed`，不会无限重试
 - Magnet URI 必须包含 `xt` 信息哈希；失败重试前应等待种子冷却，避免重复占用队列
@@ -102,6 +104,8 @@ DeepSeek 元数据增强：
 DEEPSEEK_API_KEY=your_key
 DEEPSEEK_MODEL=deepseek-chat
 ```
+
+自动重试默认从 30 秒开始退避，最多 3 次；可用 `Y2B_AUTO_RETRY_BASE` 和 `Y2B_AUTO_RETRY_MAX` 调整。
 
 建议将 API key 放入 `/etc/y2b.env`，不要写入仓库。
 
