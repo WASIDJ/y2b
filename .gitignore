@@ -1,0 +1,21 @@
+# Credentials and local secrets — keep on the VPS, never commit.
+cookies.json
+youtube_cookies.txt
+auth.cookie
+test_cookie.txt
+*.cookie
+.env
+.env.*
+!.env.example
+
+# Runtime state, downloaded media and logs.
+data/
+download.log
+channels.json
+*.log
+
+# Local build/runtime artifacts.
+y2b-go
+*.tmp
+*.bak
+.DS_Store

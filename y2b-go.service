@@ -1,0 +1,40 @@
+[Unit]
+Description=y2b Go media downloader/uploader
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=10
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/srv/y2b/data
+ExecStart=/srv/y2b/y2b-go
+EnvironmentFile=-/etc/y2b.env
+Environment=Y2B_ADDR=127.0.0.1:8765
+Environment=Y2B_COOKIES=/srv/y2b/cookies.json
+Environment=Y2B_BILI_COOKIES=/srv/y2b/cookies.json
+Environment=Y2B_DATA=/srv/y2b/data
+Environment=GOMEMLIMIT=64MiB
+Restart=always
+RestartSec=5
+TimeoutStopSec=20
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/srv/y2b/data /srv/y2b /home/ubuntu/.cache
+UMask=0077
+
+# Strict Memory and Resource Protections (Prevent RAM Spikes / VPS OOM Lockup)
+MemoryAccounting=true
+MemoryHigh=250M
+MemoryMax=350M
+MemorySwapMax=512M
+Nice=10
+CPUWeight=100
+IOWeight=100
+
+[Install]
+WantedBy=multi-user.target

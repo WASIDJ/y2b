@@ -1,0 +1,3852 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+<title>y2b Hub · 媒体流全自动控制台</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Plus+Jakarta+Sans:wght@400;500;600;700;800&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+:root {
+  --color-primary: #0891b2;
+  --color-primary-hover: #06b6d4;
+  --color-primary-glow: rgba(8, 145, 178, 0.28);
+  --color-secondary: #22d3ee;
+  --color-accent: #10b981;
+  --color-accent-hover: #059669;
+  --color-accent-glow: rgba(16, 185, 129, 0.25);
+  
+  --color-background: #080c15;
+  --color-sidebar: #0d1424;
+  --color-surface: #111b2f;
+  --color-surface-hover: #17243e;
+  --color-surface-subtle: #0b111e;
+  --color-border: #1e2c47;
+  --color-border-subtle: rgba(255, 255, 255, 0.07);
+  
+  --color-text: #f8fafc;
+  --color-text-muted: #94a3b8;
+  --color-text-dim: #64748b;
+  
+  --color-running: #38bdf8;
+  --color-queued: #fbbf24;
+  --color-done: #34d399;
+  --color-failed: #f87171;
+  --color-canceled: #94a3b8;
+
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.3);
+  --shadow-md: 0 4px 12px rgba(0, 0, 0, 0.35);
+  --shadow-lg: 0 10px 25px rgba(0, 0, 0, 0.45);
+  --shadow-xl: 0 20px 45px rgba(0, 0, 0, 0.6);
+  --shadow-glow: 0 0 24px var(--color-primary-glow);
+  
+  --radius-sm: 6px;
+  --radius-md: 10px;
+  --radius-lg: 14px;
+  --radius-xl: 20px;
+  --radius-full: 9999px;
+  
+  --transition-fast: 150ms cubic-bezier(0.4, 0, 0.2, 1);
+  --transition-normal: 200ms cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+* { box-sizing: border-box; }
+html { scroll-behavior: smooth; }
+body {
+  margin: 0;
+  background: var(--color-background);
+  color: var(--color-text);
+  font-family: 'Plus Jakarta Sans', 'Inter', system-ui, -apple-system, sans-serif;
+  font-size: 14px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+}
+
+button, input, textarea, select {
+  font-family: inherit;
+  font-size: inherit;
+  color: inherit;
+}
+
+button {
+  cursor: pointer;
+  border: none;
+  background: transparent;
+}
+
+a {
+  color: var(--color-secondary);
+  text-decoration: none;
+}
+
+.mono {
+  font-family: 'JetBrains Mono', monospace;
+}
+
+/* App Shell */
+.app-shell {
+  display: flex;
+  min-height: 100vh;
+}
+
+/* Sidebar */
+.sidebar {
+  width: 250px;
+  flex: 0 0 250px;
+  background: var(--color-sidebar);
+  border-right: 1px solid var(--color-border);
+  padding: 24px 16px;
+  display: flex;
+  flex-direction: column;
+  position: sticky;
+  top: 0;
+  height: 100vh;
+  z-index: 50;
+}
+
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 4px 10px 24px;
+  border-bottom: 1px solid var(--color-border-subtle);
+  margin-bottom: 18px;
+}
+
+.brand-icon {
+  width: 36px;
+  height: 36px;
+  border-radius: var(--radius-md);
+  background: linear-gradient(135deg, var(--color-primary), #6366f1);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  box-shadow: 0 4px 14px var(--color-primary-glow);
+  color: white;
+  flex-shrink: 0;
+}
+
+.brand-text {
+  font-size: 17px;
+  font-weight: 800;
+  letter-spacing: -0.03em;
+  color: #ffffff;
+  display: flex;
+  flex-direction: column;
+  line-height: 1.2;
+}
+
+.brand-sub {
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--color-text-dim);
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+
+.nav-group-label {
+  padding: 10px 10px 6px;
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  color: var(--color-text-dim);
+  font-family: 'JetBrains Mono', monospace;
+}
+
+.nav-link {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 12px;
+  border-radius: var(--radius-md);
+  color: var(--color-text-muted);
+  font-weight: 600;
+  font-size: 13px;
+  transition: all var(--transition-fast);
+  margin-bottom: 3px;
+  cursor: pointer;
+}
+
+.nav-link:hover {
+  background: var(--color-surface-hover);
+  color: var(--color-text);
+}
+
+.nav-link.active {
+  background: linear-gradient(90deg, rgba(8, 145, 178, 0.18), transparent);
+  color: var(--color-secondary);
+  border-left: 3px solid var(--color-primary);
+}
+
+.nav-icon {
+  width: 18px;
+  height: 18px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: currentColor;
+  opacity: 0.85;
+}
+
+/* Sidebar Hardware Meter */
+.sidebar-meters {
+  margin-top: auto;
+  padding: 14px 10px 0;
+  border-top: 1px solid var(--color-border-subtle);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.meter-box {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.meter-label-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-size: 11px;
+  font-family: 'JetBrains Mono', monospace;
+}
+
+.meter-title {
+  color: var(--color-text-muted);
+  font-weight: 600;
+}
+
+.meter-val {
+  color: #ffffff;
+}
+
+.progress-track {
+  width: 100%;
+  height: 5px;
+  background: #152238;
+  border-radius: 999px;
+  overflow: hidden;
+  position: relative;
+}
+
+.progress-bar {
+  height: 100%;
+  border-radius: 999px;
+  transition: width 0.4s ease;
+}
+
+.progress-ram { background: linear-gradient(90deg, #38bdf8, #818cf8); }
+.progress-rom { background: linear-gradient(90deg, #34d399, #0891b2); }
+
+.sidebar-footer {
+  padding-top: 10px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 11px;
+  color: var(--color-text-dim);
+}
+
+.status-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--color-accent);
+}
+
+.pulse-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--color-accent);
+  box-shadow: 0 0 0 3px rgba(16, 185, 129, 0.2);
+  animation: pulse 2s infinite;
+}
+
+@keyframes pulse {
+  0% { box-shadow: 0 0 0 0 rgba(16, 185, 129, 0.5); }
+  70% { box-shadow: 0 0 0 6px rgba(16, 185, 129, 0); }
+  100% { box-shadow: 0 0 0 0 rgba(16, 185, 129, 0); }
+}
+
+/* Main Content Area */
+.main-container {
+  flex: 1;
+  min-width: 0;
+  padding: 32px clamp(20px, 3.5vw, 48px) 60px;
+  max-width: 1520px;
+  margin: 0 auto;
+}
+
+.view-section {
+  display: none;
+}
+
+.view-section.active {
+  display: block;
+  animation: fade-in 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+@keyframes fade-in {
+  from { opacity: 0; transform: translateY(6px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+/* Topbar */
+.topbar {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 20px;
+  margin-bottom: 28px;
+  flex-wrap: wrap;
+}
+
+.eyebrow {
+  margin: 0 0 6px;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--color-secondary);
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+.page-title {
+  margin: 0;
+  font-size: clamp(24px, 2.5vw, 32px);
+  font-weight: 800;
+  letter-spacing: -0.04em;
+  color: #ffffff;
+}
+
+.subtitle {
+  margin: 6px 0 0;
+  color: var(--color-text-muted);
+  font-size: 13px;
+}
+
+.topbar-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.sync-status {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 11px;
+  color: var(--color-text-dim);
+  padding: 6px 10px;
+  background: var(--color-surface-subtle);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+/* Button Styles */
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 9px 16px;
+  min-height: 40px;
+  border-radius: var(--radius-md);
+  font-weight: 600;
+  font-size: 13px;
+  transition: all var(--transition-fast);
+  border: 1px solid transparent;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.btn:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-visible {
+  outline: 2px solid var(--color-secondary);
+  outline-offset: 2px;
+}
+
+.btn-primary {
+  background: linear-gradient(135deg, var(--color-primary), #0284c7);
+  color: #ffffff;
+  box-shadow: 0 4px 14px var(--color-primary-glow);
+}
+
+.btn-primary:hover {
+  background: linear-gradient(135deg, var(--color-primary-hover), #0369a1);
+  box-shadow: 0 6px 20px var(--color-primary-glow);
+  transform: translateY(-1px);
+}
+
+.btn-pipeline {
+  background: linear-gradient(135deg, #8b5cf6, #3b82f6);
+  color: #ffffff;
+  box-shadow: 0 4px 14px rgba(139, 92, 246, 0.35);
+}
+
+.btn-pipeline:hover {
+  background: linear-gradient(135deg, #7c3aed, #2563eb);
+  box-shadow: 0 6px 20px rgba(139, 92, 246, 0.45);
+  transform: translateY(-1px);
+}
+
+.btn-secondary {
+  background: var(--color-surface);
+  border-color: var(--color-border);
+  color: var(--color-text);
+}
+
+.btn-secondary:hover {
+  background: var(--color-surface-hover);
+  border-color: #334568;
+}
+
+.btn-danger {
+  background: rgba(244, 63, 94, 0.12);
+  border-color: rgba(244, 63, 94, 0.28);
+  color: #fda4af;
+}
+
+.btn-danger:hover {
+  background: rgba(244, 63, 94, 0.22);
+  border-color: rgba(244, 63, 94, 0.45);
+  color: #ffffff;
+}
+
+.btn-small {
+  min-height: 32px;
+  padding: 5px 10px;
+  font-size: 12px;
+  border-radius: var(--radius-sm);
+}
+
+.btn-icon-only {
+  width: 32px;
+  min-height: 32px;
+  padding: 0;
+  border-radius: var(--radius-sm);
+}
+
+/* Hardware & Traffic Live Status Banner */
+.hardware-bar {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 14px;
+  margin-bottom: 22px;
+}
+
+.hw-card {
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-lg);
+  padding: 14px 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.hw-card-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.hw-card-title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: #ffffff;
+}
+
+.hw-card-metric {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 12px;
+  color: var(--color-secondary);
+}
+
+.hw-card-sub {
+  font-size: 11px;
+  color: var(--color-text-dim);
+  font-family: 'JetBrains Mono', monospace;
+}
+
+/* Stats Cards */
+.stats-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 14px;
+  margin-bottom: 22px;
+}
+
+.stat-card {
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-lg);
+  padding: 16px 18px;
+  box-shadow: var(--shadow-sm);
+  transition: all var(--transition-fast);
+  cursor: pointer;
+  position: relative;
+  overflow: hidden;
+}
+
+.stat-card:hover {
+  border-color: #3b5078;
+  transform: translateY(-2px);
+  box-shadow: var(--shadow-md);
+}
+
+.stat-card.active-filter {
+  border-color: var(--color-primary);
+  background: linear-gradient(180deg, rgba(8, 145, 178, 0.12), var(--color-surface));
+}
+
+.stat-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 8px;
+}
+
+.stat-label {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--color-text-muted);
+}
+
+.stat-indicator {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+}
+
+.stat-value {
+  font-size: 26px;
+  font-weight: 800;
+  letter-spacing: -0.04em;
+  font-family: 'JetBrains Mono', monospace;
+  color: #ffffff;
+}
+
+/* Panel & Toolbar */
+.panel {
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-md);
+  overflow: hidden;
+}
+
+.panel-toolbar {
+  padding: 16px 20px;
+  border-bottom: 1px solid var(--color-border);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  flex-wrap: wrap;
+  background: #0f182c;
+}
+
+.filter-tabs {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  background: var(--color-surface-subtle);
+  padding: 4px;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--color-border);
+  overflow-x: auto;
+  max-width: 100%;
+}
+
+.filter-tab {
+  padding: 6px 12px;
+  border-radius: var(--radius-sm);
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--color-text-muted);
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  transition: all var(--transition-fast);
+  white-space: nowrap;
+}
+
+.filter-tab:hover {
+  color: var(--color-text);
+  background: rgba(255, 255, 255, 0.05);
+}
+
+.filter-tab.active {
+  background: var(--color-surface-hover);
+  color: var(--color-secondary);
+  box-shadow: var(--shadow-sm);
+}
+
+.filter-count {
+  font-size: 10px;
+  padding: 1px 6px;
+  border-radius: var(--radius-full);
+  background: rgba(255, 255, 255, 0.1);
+  font-family: 'JetBrains Mono', monospace;
+}
+
+.panel-controls {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.search-box {
+  position: relative;
+  display: flex;
+  align-items: center;
+}
+
+.search-box input {
+  background: var(--color-surface-subtle);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  padding: 7px 32px 7px 12px;
+  font-size: 12px;
+  min-height: 34px;
+  width: 180px;
+  transition: width var(--transition-normal), border-color var(--transition-fast);
+}
+
+.search-box input:focus {
+  width: 240px;
+  border-color: var(--color-secondary);
+}
+
+.search-clear {
+  position: absolute;
+  right: 8px;
+  color: var(--color-text-dim);
+  font-size: 14px;
+  line-height: 1;
+  display: none;
+}
+
+/* Queue Table */
+.table-wrap {
+  overflow-x: auto;
+  min-height: 240px;
+}
+
+.jobs-table {
+  width: 100%;
+  border-collapse: collapse;
+  text-align: left;
+}
+
+.jobs-table th {
+  padding: 12px 18px;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--color-text-dim);
+  background: #0c1322;
+  border-bottom: 1px solid var(--color-border);
+}
+
+.jobs-table td {
+  padding: 14px 18px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+  vertical-align: middle;
+  font-size: 13px;
+  transition: background var(--transition-fast);
+}
+
+.job-row { cursor: pointer; }
+.job-row:hover td { background: #16233b; }
+.job-row.expanded td { background: #182742; border-bottom: none; }
+
+.job-main-info {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  max-width: 480px;
+}
+
+.job-type-icon {
+  width: 32px;
+  height: 32px;
+  border-radius: var(--radius-sm);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  margin-top: 2px;
+}
+
+.job-type-pipeline { background: rgba(139, 92, 246, 0.18); color: #a78bfa; border: 1px solid rgba(139, 92, 246, 0.35); }
+.job-type-youtube { background: rgba(239, 68, 68, 0.16); color: #f87171; border: 1px solid rgba(239, 68, 68, 0.3); }
+.job-type-magnet { background: rgba(14, 165, 233, 0.16); color: #38bdf8; border: 1px solid rgba(14, 165, 233, 0.3); }
+.job-type-biliup { background: rgba(236, 72, 153, 0.16); color: #f472b6; border: 1px solid rgba(236, 72, 153, 0.3); }
+
+.job-title-line {
+  font-weight: 700;
+  color: #ffffff;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 400px;
+}
+
+.job-title-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.copy-btn {
+  opacity: 0.6;
+  padding: 2px 4px;
+  border-radius: 4px;
+  display: inline-flex;
+  align-items: center;
+  transition: opacity var(--transition-fast);
+}
+
+.copy-btn:hover {
+  opacity: 1;
+  background: rgba(255, 255, 255, 0.1);
+  color: var(--color-secondary);
+}
+
+.job-meta-line {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 11px;
+  color: var(--color-text-dim);
+  margin-top: 3px;
+}
+
+/* Badges */
+.badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  border-radius: var(--radius-full);
+  font-size: 11px;
+  font-weight: 700;
+  font-family: 'JetBrains Mono', monospace;
+}
+
+.badge-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+}
+
+.badge-running { background: rgba(56, 189, 248, 0.15); color: #38bdf8; border: 1px solid rgba(56, 189, 248, 0.3); }
+.badge-running .badge-dot { animation: pulse-cyan 1.5s infinite; }
+@keyframes pulse-cyan {
+  0% { box-shadow: 0 0 0 0 rgba(56, 189, 248, 0.6); }
+  70% { box-shadow: 0 0 0 5px rgba(56, 189, 248, 0); }
+  100% { box-shadow: 0 0 0 0 rgba(56, 189, 248, 0); }
+}
+
+.badge-queued { background: rgba(251, 191, 36, 0.15); color: #fbbf24; border: 1px solid rgba(251, 191, 36, 0.3); }
+.badge-done { background: rgba(52, 211, 153, 0.15); color: #34d399; border: 1px solid rgba(52, 211, 153, 0.3); }
+.badge-failed { background: rgba(248, 113, 113, 0.15); color: #f87171; border: 1px solid rgba(248, 113, 113, 0.3); }
+.badge-canceled { background: rgba(148, 163, 184, 0.12); color: #94a3b8; border: 1px solid rgba(148, 163, 184, 0.25); }
+
+.action-buttons {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+}
+
+/* Inline Expand Drawer */
+.drawer-row td {
+  padding: 0 18px 18px;
+  background: #182742;
+  border-bottom: 1px solid var(--color-border);
+}
+
+.drawer-content {
+  background: #0f192b;
+  border: 1px solid #22375a;
+  border-radius: var(--radius-md);
+  padding: 16px;
+  margin-top: 4px;
+}
+
+.drawer-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: 14px;
+  margin-bottom: 12px;
+}
+
+.drawer-field-label {
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--color-text-dim);
+  margin-bottom: 4px;
+  font-family: 'JetBrains Mono', monospace;
+}
+
+.drawer-field-val {
+  font-size: 12px;
+  color: #e2e8f0;
+  word-break: break-all;
+  background: #09101d;
+  padding: 8px 10px;
+  border-radius: var(--radius-sm);
+  border: 1px solid #1a2842;
+}
+
+.log-terminal {
+  background: #060a12;
+  border: 1px solid #1a2842;
+  border-radius: var(--radius-sm);
+  padding: 12px;
+  color: #cbd5e1;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 11px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  max-height: 240px;
+  overflow-y: auto;
+}
+
+.error-block {
+  background: rgba(244, 63, 94, 0.08);
+  border: 1px solid rgba(244, 63, 94, 0.25);
+  border-radius: var(--radius-sm);
+  padding: 10px 12px;
+  color: #fca5a5;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 12px;
+  white-space: pre-wrap;
+  max-height: 180px;
+  overflow-y: auto;
+  margin-top: 10px;
+}
+
+.drawer-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 12px;
+  padding-top: 10px;
+  border-top: 1px solid #1a2944;
+}
+
+/* =======================================
+   CLEAN & INTUITIVE FILE MANAGER VIEW
+========================================== */
+.media-list {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 16px;
+}
+
+.media-item {
+  background: #0e172a;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-lg);
+  padding: 14px 18px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+  transition: all var(--transition-fast);
+}
+
+.media-item:hover {
+  border-color: #3b5078;
+  background: #121e36;
+  transform: translateY(-1px);
+  box-shadow: var(--shadow-md);
+}
+
+.media-thumb-box {
+  width: 110px;
+  height: 64px;
+  border-radius: var(--radius-md);
+  background: #09101d;
+  border: 1px solid #233758;
+  position: relative;
+  overflow: hidden;
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+}
+
+.media-thumb-img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  transition: transform var(--transition-fast);
+}
+
+.media-item:hover .media-thumb-img {
+  transform: scale(1.05);
+}
+
+.media-thumb-play {
+  position: absolute;
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  background: rgba(8, 145, 178, 0.85);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: white;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.5);
+  transition: transform var(--transition-fast);
+}
+
+.media-item:hover .media-thumb-play {
+  transform: scale(1.15);
+}
+
+.media-content {
+  flex: 1;
+  min-width: 0;
+}
+
+.media-title {
+  font-size: 14px;
+  font-weight: 700;
+  color: #ffffff;
+  margin-bottom: 5px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.media-meta-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 11px;
+  color: var(--color-text-dim);
+  flex-wrap: wrap;
+}
+
+.media-badge-src {
+  padding: 2px 7px;
+  border-radius: var(--radius-sm);
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  font-family: 'JetBrains Mono', monospace;
+}
+
+.media-badge-yt { background: rgba(239, 68, 68, 0.18); color: #f87171; border: 1px solid rgba(239, 68, 68, 0.3); }
+.media-badge-mag { background: rgba(14, 165, 233, 0.18); color: #38bdf8; border: 1px solid rgba(14, 165, 233, 0.3); }
+
+.media-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+/* Video Player Modal */
+.video-player-modal {
+  width: min(880px, calc(100% - 32px));
+  background: #090e1a;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-lg);
+  padding: 0;
+  color: #ffffff;
+  box-shadow: var(--shadow-xl);
+  overflow: hidden;
+}
+
+.video-player-modal::backdrop {
+  background: rgba(3, 5, 10, 0.88);
+  backdrop-filter: blur(8px);
+}
+
+.video-wrap {
+  width: 100%;
+  max-height: 520px;
+  background: #000000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.video-wrap video {
+  width: 100%;
+  max-height: 520px;
+  outline: none;
+}
+
+/* Modals & Dialogs */
+.modal {
+  width: min(640px, calc(100% - 32px));
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-lg);
+  background: var(--color-surface);
+  color: var(--color-text);
+  padding: 0;
+  box-shadow: var(--shadow-xl);
+  outline: none;
+}
+
+.modal::backdrop {
+  background: rgba(4, 7, 13, 0.78);
+  backdrop-filter: blur(6px);
+}
+
+.modal-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 18px 22px;
+  border-bottom: 1px solid var(--color-border);
+}
+
+.modal-title {
+  margin: 0;
+  font-size: 18px;
+  font-weight: 700;
+}
+
+.modal-close {
+  width: 32px;
+  height: 32px;
+  border-radius: var(--radius-sm);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--color-text-muted);
+  transition: all var(--transition-fast);
+}
+
+.modal-close:hover {
+  background: var(--color-surface-hover);
+  color: var(--color-text);
+}
+
+.modal-tabs {
+  display: flex;
+  gap: 6px;
+  padding: 12px 22px 0;
+  border-bottom: 1px solid var(--color-border);
+  background: #0d1627;
+  overflow-x: auto;
+}
+
+.modal-tab {
+  padding: 10px 14px;
+  font-weight: 600;
+  font-size: 13px;
+  color: var(--color-text-muted);
+  border-bottom: 2px solid transparent;
+  transition: all var(--transition-fast);
+  white-space: nowrap;
+}
+
+.modal-tab:hover { color: var(--color-text); }
+.modal-tab.active { color: var(--color-secondary); border-bottom-color: var(--color-primary); }
+
+.modal-body { padding: 22px; }
+
+.form-group { margin-bottom: 16px; }
+.form-label { display: block; font-size: 12px; font-weight: 600; color: #cbd5e1; margin-bottom: 6px; }
+
+.form-control {
+  width: 100%;
+  background: var(--color-surface-subtle);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  padding: 10px 14px;
+  font-size: 13px;
+  color: #ffffff;
+  min-height: 42px;
+  transition: border-color var(--transition-fast);
+}
+
+.form-control:focus {
+  border-color: var(--color-primary);
+  box-shadow: 0 0 0 3px var(--color-primary-glow);
+}
+
+textarea.form-control { min-height: 84px; resize: vertical; }
+.form-hint { font-size: 11px; color: var(--color-text-dim); margin-top: 5px; }
+
+.preset-chips { display: flex; align-items: center; gap: 6px; margin-top: 6px; flex-wrap: wrap; }
+.preset-chip {
+  padding: 3px 9px;
+  border-radius: var(--radius-sm);
+  background: #152238;
+  border: 1px solid #23375a;
+  font-size: 11px;
+  color: #93c5fd;
+  cursor: pointer;
+  transition: all var(--transition-fast);
+}
+.preset-chip:hover, .preset-chip.active { background: var(--color-primary); border-color: var(--color-primary); color: #ffffff; }
+
+.form-check { display: flex; align-items: center; gap: 8px; margin-top: 10px; font-size: 13px; color: #cbd5e1; cursor: pointer; }
+.form-check input[type="checkbox"] { width: 16px; height: 16px; accent-color: var(--color-primary); cursor: pointer; }
+
+.char-counter { float: right; font-size: 11px; color: var(--color-text-dim); font-family: 'JetBrains Mono', monospace; }
+.modal-footer { display: flex; align-items: center; justify-content: flex-end; gap: 10px; padding: 16px 22px 22px; }
+
+/* Toast Notifications */
+.toast-container {
+  position: fixed;
+  bottom: 24px;
+  right: 24px;
+  z-index: 9999;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  pointer-events: none;
+}
+
+.toast {
+  padding: 12px 18px;
+  border-radius: var(--radius-md);
+  background: #111d33;
+  border: 1px solid #233758;
+  color: #ffffff;
+  font-size: 13px;
+  font-weight: 500;
+  box-shadow: var(--shadow-xl);
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  pointer-events: auto;
+  animation: toast-in 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+  max-width: 380px;
+}
+
+@keyframes toast-in {
+  from { transform: translateY(16px); opacity: 0; }
+  to { transform: translateY(0); opacity: 1; }
+}
+
+.toast.success { border-left: 4px solid var(--color-accent); }
+.toast.error { border-left: 4px solid var(--color-failed); }
+.toast.info { border-left: 4px solid var(--color-primary); }
+
+.empty-state { text-align: center; padding: 48px 20px; color: var(--color-text-muted); }
+.empty-icon { width: 48px; height: 48px; margin: 0 auto 12px; opacity: 0.4; color: var(--color-text-dim); }
+
+/* Secure Login Modal Overlay */
+.login-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(5, 8, 15, 0.94);
+  backdrop-filter: blur(16px);
+  z-index: 99999;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+}
+
+.login-card {
+  width: min(400px, 100%);
+  background: #0f182b;
+  border: 1px solid #203254;
+  border-radius: var(--radius-xl);
+  padding: 32px 28px;
+  box-shadow: var(--shadow-xl), 0 0 50px rgba(8, 145, 178, 0.15);
+  animation: toast-in 0.25s ease-out;
+}
+
+.login-header {
+  text-align: center;
+  margin-bottom: 24px;
+}
+
+.login-logo-box {
+  width: 52px;
+  height: 52px;
+  background: linear-gradient(135deg, var(--color-primary), var(--color-secondary));
+  border-radius: var(--radius-lg);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin: 0 auto 16px;
+  color: #030712;
+  box-shadow: var(--shadow-glow);
+}
+
+.login-title {
+  margin: 0 0 6px;
+  font-size: 20px;
+  font-weight: 800;
+  letter-spacing: -0.02em;
+  color: #ffffff;
+}
+
+.login-subtitle {
+  margin: 0;
+  font-size: 13px;
+  color: var(--color-text-muted);
+}
+
+/* Mobile Bottom Navigation Bar & Mobile Top Brand */
+.mobile-top-brand {
+  display: none;
+}
+
+.mobile-bottom-nav {
+  display: none;
+  position: fixed;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  height: calc(58px + env(safe-area-inset-bottom, 0px));
+  padding-bottom: env(safe-area-inset-bottom, 0px);
+  background: rgba(13, 20, 36, 0.94);
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+  border-top: 1px solid var(--color-border);
+  z-index: 990;
+  justify-content: space-around;
+  align-items: center;
+  box-shadow: 0 -4px 24px rgba(0, 0, 0, 0.45);
+}
+
+.mobile-nav-item {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  background: none;
+  border: none;
+  color: var(--color-text-dim);
+  font-size: 11px;
+  font-weight: 600;
+  gap: 3px;
+  padding: 6px 4px;
+  cursor: pointer;
+  transition: all var(--transition-fast);
+  flex: 1;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.mobile-nav-item svg {
+  transition: transform var(--transition-fast), stroke var(--transition-fast);
+}
+
+.mobile-nav-item.active {
+  color: var(--color-secondary);
+}
+
+.mobile-nav-item.active svg {
+  stroke: var(--color-secondary);
+  filter: drop-shadow(0 0 6px var(--color-primary-glow));
+}
+
+.mobile-nav-action {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  background: none;
+  border: none;
+  color: #ffffff;
+  font-size: 10px;
+  font-weight: 700;
+  gap: 2px;
+  cursor: pointer;
+  margin-top: -16px;
+  flex: 0 0 56px;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.mobile-action-btn {
+  width: 44px;
+  height: 44px;
+  border-radius: 50%;
+  background: linear-gradient(135deg, var(--color-secondary), var(--color-primary));
+  box-shadow: 0 4px 16px rgba(6, 182, 212, 0.45);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #080c15;
+  transition: transform var(--transition-fast);
+}
+
+.mobile-nav-action:active .mobile-action-btn {
+  transform: scale(0.92);
+}
+
+@media (max-width: 1024px) {
+  .sidebar { width: 72px; flex: 0 0 72px; padding: 18px 8px; }
+  .brand-text, .nav-group-label, .nav-link span, .sidebar-meters, .sidebar-footer { display: none; }
+  .brand { justify-content: center; padding: 0 0 18px; }
+  .nav-link { justify-content: center; padding: 12px; }
+  .stats-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .hardware-bar { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+
+@media (max-width: 768px) {
+  /* Mobile Layout Shell */
+  .app-shell { display: block; }
+  .sidebar { display: none !important; }
+  .mobile-bottom-nav { display: flex; }
+  
+  .main-container {
+    padding: 12px 12px calc(76px + env(safe-area-inset-bottom, 0px));
+    min-height: 100vh;
+  }
+
+  /* Mobile Top Brand & Topbar Header */
+  .mobile-top-brand {
+    display: flex !important;
+    justify-content: space-between;
+    align-items: center;
+    width: 100%;
+    margin-bottom: 8px;
+    padding-bottom: 6px;
+    border-bottom: 1px solid var(--color-border-subtle);
+  }
+
+  .mobile-top-actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .topbar {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 8px;
+    margin-bottom: 14px;
+    padding-bottom: 10px;
+  }
+  
+  .topbar-actions {
+    width: 100%;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+  }
+
+  .topbar-actions .btn-pipeline,
+  .topbar-actions .btn-primary {
+    display: none; /* Central floating button on mobile bottom bar */
+  }
+
+  .topbar-actions .btn-secondary {
+    padding: 6px 10px;
+    font-size: 12px;
+  }
+
+  .page-title {
+    font-size: 18px;
+    letter-spacing: -0.01em;
+  }
+
+  .subtitle {
+    font-size: 11px;
+    line-height: 1.4;
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+  }
+
+  .eyebrow {
+    font-size: 10px;
+    margin-bottom: 2px;
+  }
+
+  /* Hardware & Traffic Grid on Mobile */
+  .hardware-bar {
+    grid-template-columns: 1fr;
+    gap: 10px;
+    margin-bottom: 14px;
+  }
+
+  .hw-card {
+    padding: 12px 14px;
+    gap: 6px;
+  }
+
+  .hw-card-header {
+    font-size: 12px;
+  }
+
+  .hw-card-sub {
+    font-size: 11px;
+  }
+
+  /* Stats Cards on Mobile */
+  .stats-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 8px;
+    margin-bottom: 14px;
+  }
+
+  .stat-card {
+    padding: 12px 14px;
+  }
+
+  .stat-value {
+    font-size: 20px;
+    margin-top: 2px;
+  }
+
+  /* Panel Toolbar & Filter Tabs */
+  .panel-toolbar {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 10px;
+    padding: 12px;
+  }
+
+  .filter-tabs {
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+    padding-bottom: 4px;
+    scrollbar-width: none;
+    gap: 4px;
+  }
+  .filter-tabs::-webkit-scrollbar {
+    display: none;
+  }
+
+  .filter-tab {
+    white-space: nowrap;
+    padding: 6px 10px;
+    font-size: 12px;
+    min-height: 34px;
+  }
+
+  .panel-controls {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    width: 100%;
+  }
+
+  .panel-controls select,
+  .panel-controls button,
+  .panel-controls input {
+    flex: 1 1 auto;
+    min-height: 38px;
+  }
+
+  /* Tables: Mobile Horizontal Scroll & Touch Friendly */
+  .table-wrap {
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+    border-radius: 0;
+  }
+
+  .table {
+    min-width: 540px;
+  }
+
+  .table th, .table td {
+    padding: 10px 8px;
+    font-size: 12px;
+  }
+
+  .drawer-row td {
+    padding: 0 10px 14px;
+  }
+
+  .drawer-content {
+    padding: 12px;
+  }
+
+  .drawer-grid {
+    grid-template-columns: 1fr;
+    gap: 10px;
+  }
+
+  .drawer-actions {
+    flex-wrap: wrap;
+    justify-content: stretch;
+  }
+
+  .drawer-actions .btn {
+    flex: 1 1 auto;
+    justify-content: center;
+  }
+
+  /* Channels View on Mobile */
+  .channel-grid {
+    grid-template-columns: 1fr !important;
+    gap: 12px;
+  }
+
+  .channel-card {
+    padding: 14px;
+  }
+
+  /* Media List on Mobile */
+  .media-item {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 12px;
+    padding: 14px;
+  }
+
+  .media-thumb-box {
+    width: 100%;
+    height: 180px;
+    max-width: 100%;
+  }
+
+  .media-info {
+    width: 100%;
+  }
+
+  .media-actions {
+    width: 100%;
+    display: grid;
+    grid-template-columns: repeat(2, 1fr);
+    gap: 6px;
+  }
+
+  .media-actions .btn {
+    width: 100%;
+    justify-content: center;
+  }
+
+  /* Modals: Mobile Bottom-Sheet UX */
+  dialog.modal {
+    width: 100vw !important;
+    max-width: 100vw !important;
+    height: auto !important;
+    max-height: 92vh !important;
+    margin: auto 0 0 0 !important;
+    border-radius: 20px 20px 0 0 !important;
+    border-left: none;
+    border-right: none;
+    border-bottom: none;
+    padding: 0;
+    box-shadow: 0 -8px 36px rgba(0, 0, 0, 0.7);
+    animation: slideUpModal 0.28s cubic-bezier(0.16, 1, 0.3, 1);
+  }
+
+  @keyframes slideUpModal {
+    from { transform: translateY(100%); }
+    to { transform: translateY(0); }
+  }
+
+  .modal-header {
+    padding: 14px 16px;
+    border-bottom: 1px solid var(--color-border);
+    position: sticky;
+    top: 0;
+    background: var(--color-surface);
+    z-index: 10;
+  }
+
+  .modal-title {
+    font-size: 16px;
+  }
+
+  .modal-tabs {
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+    scrollbar-width: none;
+    padding: 8px 12px 0;
+    gap: 4px;
+  }
+  .modal-tabs::-webkit-scrollbar {
+    display: none;
+  }
+
+  .modal-tab {
+    white-space: nowrap;
+    padding: 8px 12px;
+    font-size: 13px;
+    min-height: 38px;
+  }
+
+  .modal-body {
+    padding: 14px 16px 24px;
+    max-height: calc(92vh - 120px);
+    overflow-y: auto;
+    -webkit-overflow-scrolling: touch;
+  }
+
+  .modal-footer {
+    display: flex;
+    gap: 8px;
+    margin-top: 18px;
+  }
+
+  .modal-footer .btn {
+    flex: 1;
+    justify-content: center;
+    min-height: 44px;
+  }
+
+  /* Form Elements Touch & Anti-Zoom on Mobile */
+  .form-control,
+  .form-select,
+  input[type="text"],
+  input[type="password"],
+  input[type="url"],
+  input[type="number"],
+  select,
+  textarea {
+    font-size: 16px !important; /* Prevents auto-zoom on iOS */
+    min-height: 44px;
+  }
+
+  .form-row {
+    grid-template-columns: 1fr !important;
+    gap: 10px;
+  }
+
+  /* Toast Notification on Mobile */
+  .toast-container {
+    left: 14px !important;
+    right: 14px !important;
+    bottom: calc(68px + env(safe-area-inset-bottom, 0px)) !important;
+    top: auto !important;
+  }
+
+  .toast {
+    max-width: 100%;
+    font-size: 13px;
+    padding: 10px 14px;
+  }
+
+  /* Video Player Modal on Mobile */
+  dialog.video-player-modal {
+    width: 100vw;
+    max-width: 100vw;
+    margin: auto 0 0 0;
+    border-radius: 16px 16px 0 0;
+    max-height: 85vh;
+  }
+}
+
+@media (max-width: 480px) {
+  .page-title { font-size: 17px; }
+  .stats-grid { grid-template-columns: 1fr 1fr; gap: 6px; }
+  .stat-card { padding: 10px 12px; }
+  .stat-value { font-size: 18px; }
+  .btn { min-height: 38px; padding: 6px 10px; font-size: 12px; }
+  .btn-small { min-height: 30px; padding: 3px 8px; font-size: 11px; }
+}
+</style>
+</head>
+<body>
+<div class="app-shell">
+  <!-- Sidebar -->
+  <aside class="sidebar">
+    <div class="brand">
+      <div class="brand-icon">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2">
+          <polygon points="5 3 19 12 5 21 5 3"></polygon>
+        </svg>
+      </div>
+      <div class="brand-text">
+        <span>y2b Hub</span>
+        <span class="brand-sub">Media Pipeline</span>
+      </div>
+    </div>
+
+    <div class="nav-group-label">导航菜单</div>
+    <div class="nav-link active" data-view="queue">
+      <span class="nav-icon">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <rect x="3" y="3" width="7" height="7" rx="1.5"></rect>
+          <rect x="14" y="3" width="7" height="7" rx="1.5"></rect>
+          <rect x="3" y="14" width="7" height="7" rx="1.5"></rect>
+          <rect x="14" y="14" width="7" height="7" rx="1.5"></rect>
+        </svg>
+      </span>
+      <span>任务工作台</span>
+    </div>
+
+    <div class="nav-link" data-view="channels">
+      <span class="nav-icon">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <circle cx="12" cy="12" r="2"></circle>
+          <path d="M16.24 7.76a6 6 0 0 1 0 8.49m-8.48-.01a6 6 0 0 1 0-8.49m11.31-2.82a10 10 0 0 1 0 14.14m-14.14 0a10 10 0 0 1 0-14.14"></path>
+        </svg>
+      </span>
+      <span>频道自动监控</span>
+      <span class="badge badge-done" id="sideChannelsBadge" style="margin-left:auto; display:none; padding:1px 6px; font-size:10px;">0</span>
+    </div>
+
+    <div class="nav-link" data-view="files">
+      <span class="nav-icon">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path>
+        </svg>
+      </span>
+      <span>媒体文件库</span>
+    </div>
+
+    <div class="nav-link" data-view="system">
+      <span class="nav-icon">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <circle cx="12" cy="12" r="3"></circle>
+          <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
+        </svg>
+      </span>
+      <span>监控与设置</span>
+    </div>
+
+    <!-- Live Sidebar Hardware Progress -->
+    <div class="sidebar-meters">
+      <div class="meter-box">
+        <div class="meter-label-row">
+          <span class="meter-title">RAM 内存</span>
+          <span class="meter-val" id="sideRamText">--%</span>
+        </div>
+        <div class="progress-track">
+          <div class="progress-bar progress-ram" id="sideRamBar" style="width: 0%;"></div>
+        </div>
+      </div>
+      <div class="meter-box">
+        <div class="meter-label-row">
+          <span class="meter-title">ROM 磁盘</span>
+          <span class="meter-val" id="sideRomText">--%</span>
+        </div>
+        <div class="progress-track">
+          <div class="progress-bar progress-rom" id="sideRomBar" style="width: 0%;"></div>
+        </div>
+      </div>
+      <div class="meter-box">
+        <div class="meter-label-row">
+          <span class="meter-title">实时网速</span>
+          <span class="meter-val" style="font-size:11px; color:#38bdf8;" id="sideNetRate">↓ 0 B/s</span>
+        </div>
+        <div style="display:flex; justify-content:space-between; font-size:10px; font-family:'JetBrains Mono', monospace; color:var(--color-text-dim); margin-top:2px;">
+          <span>下: <strong id="sideRxSpeed" style="color:#38bdf8;">0 B/s</strong></span>
+          <span>上: <strong id="sideTxSpeed" style="color:#a78bfa;">0 B/s</strong></span>
+        </div>
+      </div>
+    </div>
+
+    <div class="sidebar-footer">
+      <div class="status-pill">
+        <span class="pulse-dot"></span>
+        <span>Worker 在线</span>
+      </div>
+      <div class="mono" id="sideCpuText" style="color:var(--color-text-dim)">CPU: 0.00</div>
+    </div>
+  </aside>
+
+  <!-- Main Container -->
+  <main class="main-container">
+    <!-- Topbar -->
+    <header class="topbar">
+      <div class="mobile-top-brand">
+        <div style="display:flex; align-items:center; gap:8px;">
+          <div class="brand-icon" style="width:28px; height:28px; border-radius:6px;">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2">
+              <polygon points="5 3 19 12 5 21 5 3"></polygon>
+            </svg>
+          </div>
+          <span style="font-weight:800; font-size:16px; color:#ffffff; letter-spacing:-0.02em;">y2b Hub</span>
+        </div>
+        <div class="mobile-top-actions">
+          <button class="btn btn-secondary btn-small" onclick="fetchJobs(true); fetchSystemInfo(true);" title="刷新数据" style="padding:4px 8px; font-size:11px;">
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67"></path>
+            </svg>
+            <span>刷新</span>
+          </button>
+          <div class="status-pill" style="font-size:11px; padding:3px 8px;">
+            <span class="pulse-dot"></span>
+            <span>Online</span>
+          </div>
+        </div>
+      </div>
+      <div>
+        <p class="eyebrow" id="viewEyebrow">工作台 / 队列编排系统</p>
+        <h1 class="page-title" id="viewTitle">任务管理控制台</h1>
+        <p class="subtitle" id="viewSubtitle">YouTube 视频下载 · 磁力 / BT 抓取 · DeepSeek AI 翻译 · B站全自动分 P 投稿</p>
+      </div>
+      <div class="topbar-actions">
+        <div id="syncTime" class="sync-status">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <circle cx="12" cy="12" r="10"></circle>
+            <polyline points="12 6 12 12 16 14"></polyline>
+          </svg>
+          <span id="syncText">正在同步…</span>
+        </div>
+        <button class="btn btn-secondary" id="btnRefresh" title="快捷键 R 刷新">
+          <svg id="refreshIcon" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67"></path>
+          </svg>
+          <span>刷新</span>
+        </button>
+        <button class="btn btn-pipeline" onclick="openModal('pipeline')">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+            <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"></polygon>
+          </svg>
+          <span>⚡ 全自动流水线</span>
+        </button>
+        <button class="btn btn-primary" id="btnNewTask" title="快捷键 N 打开">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+            <line x1="12" y1="5" x2="12" y2="19"></line>
+            <line x1="5" y1="12" x2="19" y2="12"></line>
+          </svg>
+          <span>＋ 新建任务</span>
+        </button>
+        <div id="userBadge" class="status-pill" style="display:none; cursor:pointer; background:#132038; border-color:#2a3e63;" onclick="handleLogout()" title="点击安全退出登录">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"></path>
+            <circle cx="12" cy="7" r="4"></circle>
+          </svg>
+          <span id="userNameText">admin</span>
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#f43f5e" stroke-width="2" style="margin-left:2px;">
+            <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"></path>
+            <polyline points="16 17 21 12 16 7"></polyline>
+            <line x1="21" y1="12" x2="9" y2="12"></line>
+          </svg>
+        </div>
+      </div>
+    </header>
+
+    <!-- Real-time Hardware & Traffic Monitoring Cards -->
+    <section class="hardware-bar" aria-label="实时硬件与流量监控">
+      <div class="hw-card">
+        <div class="hw-card-header">
+          <span class="hw-card-title">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#38bdf8" stroke-width="2">
+              <rect x="2" y="2" width="20" height="8" rx="2" ry="2"></rect>
+              <rect x="2" y="14" width="20" height="8" rx="2" ry="2"></rect>
+              <line x1="6" y1="6" x2="6.01" y2="6"></line>
+              <line x1="6" y1="18" x2="6.01" y2="18"></line>
+            </svg>
+            <span>RAM 运行内存</span>
+          </span>
+          <span class="hw-card-metric" id="hwRamPercent">--%</span>
+        </div>
+        <div class="progress-track">
+          <div class="progress-bar progress-ram" id="hwRamBar" style="width: 0%;"></div>
+        </div>
+        <div class="hw-card-sub" id="hwRamText">正在读取 RAM…</div>
+      </div>
+
+      <div class="hw-card">
+        <div class="hw-card-header">
+          <span class="hw-card-title">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#34d399" stroke-width="2">
+              <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path>
+            </svg>
+            <span>ROM 存储空间 (Disk)</span>
+          </span>
+          <span class="hw-card-metric" id="hwRomPercent">--%</span>
+        </div>
+        <div class="progress-track">
+          <div class="progress-bar progress-rom" id="hwRomBar" style="width: 0%;"></div>
+        </div>
+        <div class="hw-card-sub" id="hwRomText">正在读取 ROM…</div>
+      </div>
+
+      <div class="hw-card">
+        <div class="hw-card-header">
+          <span class="hw-card-title">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#38bdf8" stroke-width="2">
+              <circle cx="12" cy="12" r="10"></circle>
+              <line x1="2" y1="12" x2="22" y2="12"></line>
+              <path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"></path>
+            </svg>
+            <span>实时网络吞吐</span>
+          </span>
+          <span class="hw-card-metric" style="font-size:11px;" id="hwNetRate">↓ 0 B/s · ↑ 0 B/s</span>
+        </div>
+        <div style="display:flex; justify-content:space-between; align-items:center; font-size:12px; font-family:'JetBrains Mono', monospace;">
+          <span>下行: <strong id="hwNetRxSpeed" style="color:#38bdf8;">0 B/s</strong></span>
+          <span>上行: <strong id="hwNetTxSpeed" style="color:#a78bfa;">0 B/s</strong></span>
+        </div>
+        <div class="hw-card-sub" id="hwNetTotals">总接收: 0 B · 发送: 0 B</div>
+      </div>
+
+      <div class="hw-card">
+        <div class="hw-card-header">
+          <span class="hw-card-title">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#fbbf24" stroke-width="2">
+              <path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"></path>
+              <polyline points="3.27 6.96 12 12.01 20.73 6.96"></polyline>
+              <line x1="12" y1="22.08" x2="12" y2="12"></line>
+            </svg>
+            <span>业务传输历史总量</span>
+          </span>
+          <span class="hw-card-metric" style="color:#fbbf24;" id="hwDataSummary">--</span>
+        </div>
+        <div style="display:flex; justify-content:space-between; font-size:12px; font-family:'JetBrains Mono', monospace;">
+          <span>下载: <strong id="hwTotalDownloaded" style="color:#38bdf8">0 B</strong> (<span id="hwDownCount">0</span>)</span>
+          <span>投稿: <strong id="hwTotalUploaded" style="color:#34d399">0 B</strong> (<span id="hwUpCount">0</span>)</span>
+        </div>
+        <div class="hw-card-sub" id="hwDataSub">本地媒体库: 0 B · 0 个包</div>
+      </div>
+
+      <div class="hw-card">
+        <div class="hw-card-header">
+          <span class="hw-card-title">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#a78bfa" stroke-width="2">
+              <polyline points="22 12 18 12 15 21 9 3 6 12 2 12"></polyline>
+            </svg>
+            <span>CPU 负载与任务</span>
+          </span>
+          <span class="hw-card-metric" id="hwCpuLoad">--</span>
+        </div>
+        <div style="font-size:12px; color:#ffffff; font-family:'JetBrains Mono', monospace;" id="hwJobsActive">0 个运行中任务</div>
+        <div class="hw-card-sub" id="hwCpuSub">LoadAvg: 0.00, 0.00, 0.00</div>
+      </div>
+    </section>
+
+    <!-- SECTION 1: QUEUE WORKBENCH -->
+    <div id="section-queue" class="view-section active">
+      <!-- Stats Cards -->
+      <section class="stats-grid" aria-label="队列统计">
+        <article class="stat-card" data-filter-click="" title="点击查看全部任务">
+          <div class="stat-header">
+            <span class="stat-label">全部任务</span>
+            <span class="stat-indicator" style="background: var(--color-secondary);"></span>
+          </div>
+          <div class="stat-value" id="statTotal">0</div>
+        </article>
+        <article class="stat-card" data-filter-click="active" title="点击筛选执行中与排队任务">
+          <div class="stat-header">
+            <span class="stat-label">排队 & 运行中</span>
+            <span class="stat-indicator" style="background: var(--color-running);"></span>
+          </div>
+          <div class="stat-value" id="statActive">0</div>
+        </article>
+        <article class="stat-card" data-filter-click="done" title="点击筛选已完成任务">
+          <div class="stat-header">
+            <span class="stat-label">已完成</span>
+            <span class="stat-indicator" style="background: var(--color-done);"></span>
+          </div>
+          <div class="stat-value" id="statDone">0</div>
+        </article>
+        <article class="stat-card" data-filter-click="failed" title="点击筛选失败任务">
+          <div class="stat-header">
+            <span class="stat-label">失败 / 取消</span>
+            <span class="stat-indicator" style="background: var(--color-failed);"></span>
+          </div>
+          <div class="stat-value" id="statFailed">0</div>
+        </article>
+      </section>
+
+      <!-- Queue Table Panel -->
+      <section class="panel" id="queue">
+        <div class="panel-toolbar">
+          <div class="filter-tabs" role="tablist">
+            <button class="filter-tab active" data-status="">全部 <span class="filter-count" id="countAll">0</span></button>
+            <button class="filter-tab" data-status="running">运行中 <span class="filter-count" id="countRunning">0</span></button>
+            <button class="filter-tab" data-status="queued">排队中 <span class="filter-count" id="countQueued">0</span></button>
+            <button class="filter-tab" data-status="done">已完成 <span class="filter-count" id="countDone">0</span></button>
+            <button class="filter-tab" data-status="failed">失败 <span class="filter-count" id="countFailed">0</span></button>
+            <button class="filter-tab" data-status="canceled">已取消 <span class="filter-count" id="countCanceled">0</span></button>
+          </div>
+
+          <div class="panel-controls">
+            <select id="kindSelect" class="form-control" style="min-height: 34px; padding: 5px 10px; font-size: 12px; width: auto;">
+              <option value="">全部类型</option>
+              <option value="pipeline">⚡ 全自动流水线</option>
+              <option value="youtube">YouTube</option>
+              <option value="magnet">磁力下载</option>
+              <option value="biliup">Biliup 投稿</option>
+            </select>
+            <div class="search-box">
+              <input type="text" id="searchInput" placeholder="搜索 ID / 链接 / 标题…" />
+              <button class="search-clear" id="searchClear" aria-label="清除搜索">×</button>
+            </div>
+            <button class="btn btn-secondary btn-small" id="btnClearDone" title="清理所有已完成、失败或取消的记录">
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <polyline points="3 6 5 6 21 6"></polyline>
+                <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path>
+              </svg>
+              <span>清理已结束</span>
+            </button>
+          </div>
+        </div>
+
+        <div class="table-wrap">
+          <table class="jobs-table">
+            <thead>
+              <tr>
+                <th style="width: 42%;">任务内容</th>
+                <th style="width: 16%;">状态 / 阶段</th>
+                <th style="width: 12%;">类型</th>
+                <th style="width: 16%;">创建时间</th>
+                <th style="width: 14%; text-align: right;">操作</th>
+              </tr>
+            </thead>
+            <tbody id="jobsTbody">
+              <tr>
+                <td colspan="5" class="empty-state">
+                  <div class="empty-icon">
+                    <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+                      <circle cx="12" cy="12" r="10"></circle>
+                      <line x1="12" y1="8" x2="12" y2="12"></line>
+                      <line x1="12" y1="16" x2="12.01" y2="16"></line>
+                    </svg>
+                  </div>
+                  <div>正在加载任务队列…</div>
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+    </div>
+
+    <!-- SECTION 2: YOUTUBE CHANNEL AUTO-SYNC MONITOR -->
+    <div id="section-channels" class="view-section">
+      <div class="panel">
+        <div class="panel-toolbar">
+          <div style="display:flex; align-items:center; gap:10px;">
+            <h3 style="margin:0; font-size:15px; font-weight:700; color:#ffffff;">YouTube 频道自动追踪订阅池</h3>
+            <span class="badge badge-done" id="channelsActiveBadge">0 个监控中</span>
+          </div>
+
+          <div class="panel-controls">
+            <button class="btn btn-primary btn-small" onclick="openAddChannelModal()">
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+                <line x1="12" y1="5" x2="12" y2="19"></line>
+                <line x1="5" y1="12" x2="19" y2="12"></line>
+              </svg>
+              <span>＋ 添加监控频道</span>
+            </button>
+            <button class="btn btn-secondary btn-small" onclick="fetchChannels(true)">
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67"></path>
+              </svg>
+              <span>刷新列表</span>
+            </button>
+          </div>
+        </div>
+
+        <div id="channelsListContainer" style="padding:16px; display:grid; grid-template-columns:repeat(auto-fill, minmax(360px, 1fr)); gap:14px;">
+          <div class="empty-state">正在加载订阅频道列表…</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- SECTION 3: CLEAN MEDIA FILE MANAGER -->
+    <div id="section-files" class="view-section">
+      <div class="panel">
+        <div class="panel-toolbar">
+          <div class="filter-tabs">
+            <button class="filter-tab active" data-media-filter="all">全部媒体 <span class="filter-count" id="mediaCountAll">0</span></button>
+            <button class="filter-tab" data-media-filter="youtube">YouTube <span class="filter-count" id="mediaCountYt">0</span></button>
+            <button class="filter-tab" data-media-filter="magnet">磁力 <span class="filter-count" id="mediaCountMag">0</span></button>
+          </div>
+
+          <div class="panel-controls">
+            <div class="search-box">
+              <input type="text" id="mediaSearchInput" placeholder="按视频名称搜索…" />
+            </div>
+            <button class="btn btn-secondary btn-small" onclick="cleanTempFiles()" title="一键清理所有未完成的 .part 临时文件与空目录" style="color: #fbbf24;">
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83"></path>
+              </svg>
+              <span>🧹 清理缓存与残留</span>
+            </button>
+            <button class="btn btn-secondary btn-small" onclick="fetchMediaPackages(true)">
+              <span>刷新文件</span>
+            </button>
+          </div>
+        </div>
+
+        <div id="mediaListContainer" class="media-list">
+          <div class="empty-state">正在扫描媒体文件…</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- SECTION 3: SYSTEM MONITOR -->
+    <div id="section-system" class="view-section">
+      <div style="display:grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 16px;">
+        <!-- Network Real-Time Throughput Panel -->
+        <div class="panel" style="padding: 20px;">
+          <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:14px;">
+            <h3 style="margin:0; font-size:15px; color:#ffffff;">🌐 实时网络与服务器吞吐</h3>
+            <span class="status-pill" style="font-size:11px; padding:2px 8px;">
+              <span class="pulse-dot"></span>
+              <span>实时采样中</span>
+            </span>
+          </div>
+          <div style="display:flex; flex-direction:column; gap:12px;">
+            <div style="display:grid; grid-template-columns: 1fr 1fr; gap:10px;">
+              <div style="background:rgba(56,189,248,0.06); border:1px solid rgba(56,189,248,0.2); border-radius:var(--radius-md); padding:10px 12px;">
+                <div style="font-size:11px; color:var(--color-text-dim); margin-bottom:4px;">实时下行速率 (RX)</div>
+                <strong class="mono" id="sysRxSpeed" style="color:#38bdf8; font-size:18px;">0 B/s</strong>
+              </div>
+              <div style="background:rgba(167,139,250,0.06); border:1px solid rgba(167,139,250,0.2); border-radius:var(--radius-md); padding:10px 12px;">
+                <div style="font-size:11px; color:var(--color-text-dim); margin-bottom:4px;">实时上行速率 (TX)</div>
+                <strong class="mono" id="sysTxSpeed" style="color:#a78bfa; font-size:18px;">0 B/s</strong>
+              </div>
+            </div>
+            <div style="display:flex; flex-direction:column; gap:6px; font-size:12px; color:var(--color-text-muted); border-top:1px solid var(--color-border); padding-top:8px;" class="mono">
+              <div style="display:flex; justify-content:space-between;">
+                <span>网卡累计接收 (总下载流量):</span>
+                <strong id="sysRxTotal" style="color:#ffffff">--</strong>
+              </div>
+              <div style="display:flex; justify-content:space-between;">
+                <span>网卡累计发送 (总上传流量):</span>
+                <strong id="sysTxTotal" style="color:#ffffff">--</strong>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Historical Data Statistics Panel -->
+        <div class="panel" style="padding: 20px;">
+          <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:14px;">
+            <h3 style="margin:0; font-size:15px; color:#ffffff;">📊 业务数据历史总量</h3>
+            <button class="btn btn-secondary btn-small" onclick="rescanStats()" title="重新扫描磁盘并校准历史统计数据" style="font-size:11px; padding:3px 8px;">
+              <span>校准统计</span>
+            </button>
+          </div>
+          <div style="display:flex; flex-direction:column; gap:10px; font-size:13px;">
+            <div style="display:flex; justify-content:space-between; align-items:center;">
+              <span style="color:var(--color-text-muted)">历史累计下载媒体</span>
+              <div>
+                <strong class="mono" id="sysTotalDownloaded" style="color:#38bdf8; font-size:15px;">0 B</strong>
+                <span class="mono" style="font-size:11px; color:var(--color-text-dim);"> (<span id="sysDownCount">0</span> 个视频)</span>
+              </div>
+            </div>
+            <div style="display:flex; justify-content:space-between; align-items:center;">
+              <span style="color:var(--color-text-muted)">历史累计投稿上传</span>
+              <div>
+                <strong class="mono" id="sysTotalUploaded" style="color:#34d399; font-size:15px;">0 B</strong>
+                <span class="mono" style="font-size:11px; color:var(--color-text-dim);"> (<span id="sysUpCount">0</span> 次成功投稿)</span>
+              </div>
+            </div>
+            <div style="display:flex; justify-content:space-between; font-size:12px; border-top:1px solid var(--color-border); padding-top:8px;">
+              <span style="color:var(--color-text-dim)">全流程自动化流水线:</span>
+              <span class="mono" style="color:#ffffff;"><strong id="sysPipelineCount">0</strong> 次完成</span>
+            </div>
+            <div style="display:flex; justify-content:space-between; font-size:12px;">
+              <span style="color:var(--color-text-dim)">AI 智能翻译与元数据:</span>
+              <span class="mono" style="color:#ffffff;"><strong id="sysAiTransCount">0</strong> 次处理</span>
+            </div>
+            <div style="display:flex; justify-content:space-between; font-size:12px;">
+              <span style="color:var(--color-text-dim)">当前本地媒体库沉淀:</span>
+              <span class="mono" style="color:#fbbf24;"><strong id="sysMediaLibBytes">0 B</strong> (<span id="sysMediaLibCount">0</span> 个包)</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="panel" style="padding: 20px;">
+          <h3 style="margin:0 0 14px; font-size:15px; color:#ffffff;">🧠 RAM 运行内存详情</h3>
+          <div style="display:flex; flex-direction:column; gap:10px;">
+            <div style="display:flex; justify-content:space-between;">
+              <span style="color:var(--color-text-muted)">已用 / 总内存</span>
+              <strong class="mono" id="sysRamText">--</strong>
+            </div>
+            <div class="progress-track" style="height:8px;">
+              <div class="progress-bar progress-ram" id="sysRamBar"></div>
+            </div>
+            <div style="display:flex; justify-content:space-between; font-size:12px; color:var(--color-text-dim);" class="mono">
+              <span>空闲内存: <span id="sysRamFree">--</span></span>
+              <span>Swap 交换区: <span id="sysSwapText">--</span></span>
+            </div>
+          </div>
+        </div>
+
+        <div class="panel" style="padding: 20px;">
+          <h3 style="margin:0 0 14px; font-size:15px; color:#ffffff;">💽 ROM 磁盘空间详情</h3>
+          <div style="display:flex; flex-direction:column; gap:10px;">
+            <div style="display:flex; justify-content:space-between;">
+              <span style="color:var(--color-text-muted)">已用 / 总容量</span>
+              <strong class="mono" id="sysRomText">--</strong>
+            </div>
+            <div class="progress-track" style="height:8px;">
+              <div class="progress-bar progress-rom" id="sysRomBar"></div>
+            </div>
+            <div style="display:flex; justify-content:space-between; font-size:12px; color:var(--color-text-dim);" class="mono">
+              <span>可用空间: <span id="sysRomFree" style="color:var(--color-done)">--</span></span>
+              <span>存储路径: /srv/y2b/data</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="panel" style="padding: 20px;">
+          <h3 style="margin:0 0 14px; font-size:15px; color:#ffffff;">📺 Bilibili 账号凭证</h3>
+          <div style="display:flex; flex-direction:column; gap:10px; font-size:13px;">
+            <div style="display:flex; justify-content:space-between;">
+              <span style="color:var(--color-text-muted)">UID (mid)</span>
+              <strong class="mono" style="color:#ffffff" id="sysBiliMid">--</strong>
+            </div>
+            <div style="display:flex; justify-content:space-between;">
+              <span style="color:var(--color-text-muted)">SESSDATA 到期时间</span>
+              <span class="mono" id="sysBiliExpires">--</span>
+            </div>
+            <div style="display:flex; justify-content:space-between;">
+              <span style="color:var(--color-text-muted)">凭证路径</span>
+              <span class="mono" style="font-size:11px;">/srv/y2b/cookies.json</span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </main>
+</div>
+
+<!-- Mobile Bottom Navigation Bar -->
+<nav class="mobile-bottom-nav" aria-label="移动端底部导航">
+  <button class="mobile-nav-item active" data-view="queue" type="button">
+    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+      <rect x="3" y="3" width="7" height="7" rx="1.5"></rect>
+      <rect x="14" y="3" width="7" height="7" rx="1.5"></rect>
+      <rect x="3" y="14" width="7" height="7" rx="1.5"></rect>
+      <rect x="14" y="14" width="7" height="7" rx="1.5"></rect>
+    </svg>
+    <span>任务</span>
+  </button>
+  <button class="mobile-nav-item" data-view="channels" type="button">
+    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+      <path d="M22.54 6.42a2.78 2.78 0 0 0-1.94-2C18.88 4 12 4 12 4s-6.88 0-8.6.46a2.78 2.78 0 0 0-1.94 2A29 29 0 0 0 1 11.75a29 29 0 0 0 .46 5.33A2.78 2.78 0 0 0 3.4 19c1.72.46 8.6.46 8.6.46s6.88 0 8.6-.46a2.78 2.78 0 0 0 1.94-2 29 29 0 0 0 .46-5.25 29 29 0 0 0-.46-5.33z"></path>
+      <polygon points="9.75 15.02 15.5 11.75 9.75 8.48 9.75 15.02"></polygon>
+    </svg>
+    <span>频道</span>
+  </button>
+  <button class="mobile-nav-action" onclick="openModal('pipeline')" title="⚡ 全自动流水线" type="button">
+    <div class="mobile-action-btn">
+      <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+        <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"></polygon>
+      </svg>
+    </div>
+    <span>新建</span>
+  </button>
+  <button class="mobile-nav-item" data-view="files" type="button">
+    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+      <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path>
+    </svg>
+    <span>媒体库</span>
+  </button>
+  <button class="mobile-nav-item" data-view="system" type="button">
+    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+      <circle cx="12" cy="12" r="3"></circle>
+      <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
+    </svg>
+    <span>监控</span>
+  </button>
+</nav>
+
+<!-- Clean Video Player Modal -->
+<dialog class="video-player-modal" id="videoModal">
+  <div style="display:flex; align-items:center; justify-content:space-between; padding:12px 18px; border-bottom:1px solid #1a2844;">
+    <div style="font-size:14px; font-weight:700; color:#ffffff; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; max-width:700px;" id="videoModalTitle">在线播放</div>
+    <button class="modal-close" onclick="closeVideoModal()">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+        <line x1="18" y1="6" x2="6" y2="18"></line>
+        <line x1="6" y1="6" x2="18" y2="18"></line>
+      </svg>
+    </button>
+  </div>
+  <div class="video-wrap">
+    <video id="playerEl" controls autoplay preload="metadata"></video>
+  </div>
+</dialog>
+
+<!-- Task Creation Modal -->
+<dialog class="modal" id="taskModal">
+  <div class="modal-header">
+    <h2 class="modal-title" id="modalTitle">新建处理任务</h2>
+    <button class="modal-close" id="modalClose" aria-label="关闭">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+        <line x1="18" y1="6" x2="6" y2="18"></line>
+        <line x1="6" y1="6" x2="18" y2="18"></line>
+      </svg>
+    </button>
+  </div>
+
+  <div class="modal-tabs">
+    <button class="modal-tab active" data-tab="pipeline">⚡ 全自动流水线</button>
+    <button class="modal-tab" data-tab="youtube">YouTube 下载</button>
+    <button class="modal-tab" data-tab="magnet">磁力下载</button>
+    <button class="modal-tab" data-tab="biliup">B站 投稿</button>
+  </div>
+
+  <!-- Pipeline Form -->
+  <form id="formPipeline" class="modal-body" onsubmit="handleJobSubmit(event, '/api/pipeline')">
+    <div class="form-group">
+      <label class="form-label" for="plUrl">视频链接 / 磁力链接 <span style="color: var(--color-failed)">*</span></label>
+      <input type="text" id="plUrl" name="url" required class="form-control mono" placeholder="https://www.youtube.com/watch?v=... 或 magnet:?xt=..." />
+      <div class="form-hint">支持 YouTube 视频/Shorts 或 Magnet 种子链接。</div>
+    </div>
+    <div class="form-group">
+      <label class="form-label" for="plTid">B站投稿目标分区</label>
+      <select id="plTid" name="tid" class="form-control">
+        <option value="188">科技 · 软件应用 / 数码 (TID: 188)</option>
+        <option value="122">科技 · 野生技术协会 (TID: 122)</option>
+        <option value="17">游戏 · 单机游戏 (TID: 17)</option>
+        <option value="21">生活 · 日常 (TID: 21)</option>
+        <option value="124">生活 · 趣味科普人文 (TID: 124)</option>
+      </select>
+    </div>
+    <div class="form-group">
+      <label class="form-label" for="plTags">投稿标签（逗号分隔）</label>
+      <input type="text" id="plTags" name="tags" value="AI,Vibe Coding,编程,教程" class="form-control" />
+    </div>
+    <div class="form-group">
+      <label class="form-label" for="plSub">字幕抓取与视频轨挂载 (中英双语)</label>
+      <input type="text" id="plSub" name="sub_langs" value="zh-Hans,zh,en,zh-Hant" class="form-control mono" />
+      <div class="preset-chips">
+        <span class="preset-chip active" onclick="setPipelineSubPreset('zh-Hans,zh,en,zh-Hant')">常用中英</span>
+        <span class="preset-chip" onclick="setPipelineSubPreset('zh-Hans')">仅中文</span>
+        <span class="preset-chip" onclick="setPipelineSubPreset('all')">全语种</span>
+        <span class="preset-chip" onclick="setPipelineSubPreset('none')">不下载字幕</span>
+      </div>
+    </div>
+    <div class="form-group">
+      <label class="form-check">
+        <input type="checkbox" name="burn_subs" id="plBurnSubs" />
+        <span>🔥 压制中英硬字幕到视频画面（可选，默认关闭；默认复用 YouTube 字幕）</span>
+      </label>
+      <label class="form-check">
+        <input type="checkbox" name="translate" id="plTranslate" checked />
+        <span>调用 AI (Groq/DeepSeek) 全新提炼吸引人标题、简介与精准标签</span>
+      </label>
+      <label class="form-check">
+        <input type="checkbox" name="split_chapters" id="plSplitChapters" checked />
+        <span>📑 长视频自动按 YouTube 段落/章节拆分分 P 投稿 (Split Chapters)</span>
+      </label>
+    </div>
+    <div class="modal-footer">
+      <button type="button" class="btn btn-secondary" onclick="closeModal()">取消</button>
+      <button type="submit" class="btn btn-pipeline">⚡ 一键启动全自动流水线</button>
+    </div>
+  </form>
+
+  <!-- YouTube Form -->
+  <form id="formYoutube" class="modal-body" style="display: none;" onsubmit="handleJobSubmit(event, '/api/youtube/download')">
+    <div class="form-group">
+      <label class="form-label" for="ytUrl">YouTube 视频 URL <span style="color: var(--color-failed)">*</span></label>
+      <input type="url" id="ytUrl" name="url" required class="form-control mono" placeholder="https://www.youtube.com/watch?v=..." />
+    </div>
+    <div class="form-group">
+      <label class="form-label" for="ytQuality">清晰度 / 格式</label>
+      <select id="ytQuality" name="quality" class="form-control">
+        <option value="best">最佳清晰度 MP4 (最高 1080p/4K 并发合并)</option>
+        <option value="1080p">优先 1080p MP4</option>
+        <option value="720p">平衡 720p MP4 (更快速)</option>
+        <option value="audio_only">仅提取音频 MP3</option>
+      </select>
+    </div>
+    <div class="form-group">
+      <label class="form-label" for="ytSub">字幕语言偏好</label>
+      <input type="text" id="ytSub" name="sub_langs" value="zh-Hans,zh,en" class="form-control mono" />
+      <div class="preset-chips">
+        <span class="preset-chip active" onclick="setSubPreset('zh-Hans,zh,en')">常用中英</span>
+        <span class="preset-chip" onclick="setSubPreset('zh-Hans')">仅中文</span>
+        <span class="preset-chip" onclick="setSubPreset('all')">全语种</span>
+        <span class="preset-chip" onclick="setSubPreset('none')">不下载字幕</span>
+      </div>
+    </div>
+    <div class="form-group">
+      <label class="form-check">
+        <input type="checkbox" name="burn_subs" id="ytBurnSubs" />
+        <span>🔥 压制中英硬字幕到视频画面（可选，默认关闭；默认复用 YouTube 字幕）</span>
+      </label>
+      <label class="form-check">
+        <input type="checkbox" name="split_chapters" id="ytSplitChapters" checked />
+        <span>📑 自动按 YouTube 段落/章节拆分多文件 (Split Chapters)</span>
+      </label>
+      <label class="form-check">
+        <input type="checkbox" name="auto_upload" id="ytAutoUpload" />
+        <span>下载完成后自动投递至 Bilibili (分 P 投稿)</span>
+      </label>
+    </div>
+    <div class="modal-footer">
+      <button type="button" class="btn btn-secondary" onclick="closeModal()">取消</button>
+      <button type="submit" class="btn btn-primary">加入执行队列</button>
+    </div>
+  </form>
+
+  <!-- Magnet Form -->
+  <form id="formMagnet" class="modal-body" style="display: none;" onsubmit="handleJobSubmit(event, '/api/magnet/download')">
+    <div class="form-group">
+      <label class="form-label" for="magnetUri">Magnet 磁力链接 <span style="color: var(--color-failed)">*</span></label>
+      <textarea id="magnetUri" name="magnet" required class="form-control mono" placeholder="magnet:?xt=urn:btih:..."></textarea>
+      <div class="form-hint">Aria2c 将在后台无缓冲高速落盘至数据目录。</div>
+    </div>
+    <div class="form-group">
+      <label class="form-check">
+        <input type="checkbox" name="auto_upload" id="magAutoUpload" />
+        <span>下载完成后自动投递至 Bilibili</span>
+      </label>
+    </div>
+    <div class="modal-footer">
+      <button type="button" class="btn btn-secondary" onclick="closeModal()">取消</button>
+      <button type="submit" class="btn btn-primary">加入执行队列</button>
+    </div>
+  </form>
+
+  <!-- Biliup Form -->
+  <form id="formBiliup" class="modal-body" style="display: none;" onsubmit="handleJobSubmit(event, '/api/biliup/upload')">
+    <div class="form-group">
+      <label class="form-label" for="biliFiles">视频文件绝对路径 <span style="color: var(--color-failed)">*</span></label>
+      <textarea id="biliFiles" name="file" required class="form-control mono" placeholder="/srv/y2b/data/youtube/.../video.mp4"></textarea>
+    </div>
+    <div class="form-group">
+      <label class="form-label" for="biliTitle">稿件标题（留空自动使用文件名 / YouTube 标题）</label>
+      <div style="display:flex; gap:8px;">
+        <input type="text" id="biliTitle" name="title" class="form-control" placeholder="自定义标题" />
+        <button type="button" class="btn btn-secondary btn-small" onclick="enhanceTitleWithAI()">✨ AI 润色</button>
+      </div>
+    </div>
+    <div class="form-group">
+      <label class="form-label" for="biliDesc">
+        稿件简介
+        <span class="char-counter" id="descCounter">0 / 200</span>
+      </label>
+      <textarea id="biliDesc" name="description" maxlength="200" class="form-control" placeholder="留空自动关联 .description 文本文件" oninput="updateDescCounter(this)"></textarea>
+    </div>
+    <div class="form-group">
+      <label class="form-label" for="biliTid">投稿目标分区</label>
+      <select id="biliTid" name="tid" class="form-control">
+        <option value="188">科技 · 软件应用 / 数码 (TID: 188)</option>
+        <option value="122">科技 · 野生技术协会 (TID: 122)</option>
+        <option value="17">游戏 · 单机游戏 (TID: 17)</option>
+        <option value="21">生活 · 日常 (TID: 21)</option>
+      </select>
+    </div>
+    <div class="form-group">
+      <label class="form-check">
+        <input type="checkbox" name="translate" id="biliTranslate" />
+        <span>使用 DeepSeek AI 智能翻译视频标题为地道简体中文</span>
+      </label>
+      <label class="form-check">
+        <input type="checkbox" name="parts" id="biliParts" checked />
+        <span>启用 3 路并发分 P 上传优化</span>
+      </label>
+    </div>
+    <div class="modal-footer">
+      <button type="button" class="btn btn-secondary" onclick="closeModal()">取消</button>
+      <button type="submit" class="btn btn-primary">加入执行队列</button>
+    </div>
+  </form>
+</dialog>
+
+<!-- Task Details Modal -->
+<dialog class="modal" id="detailsModal">
+  <div class="modal-header">
+    <h2 class="modal-title" id="detailsModalTitle">任务详情</h2>
+    <button class="modal-close" onclick="$('#detailsModal').close()">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+        <line x1="18" y1="6" x2="6" y2="18"></line>
+        <line x1="6" y1="6" x2="18" y2="18"></line>
+      </svg>
+    </button>
+  </div>
+  <div class="modal-body">
+    <div class="drawer-field-label">原始 JSON 数据</div>
+    <pre id="detailsJson" class="error-block" style="background:#09101d; border-color:#203250; color:#cbd5e1; max-height:280px;"></pre>
+    <div class="modal-footer" style="padding-bottom: 0;">
+      <button class="btn btn-secondary btn-small" onclick="copyDetailsJson()">复制 JSON</button>
+      <button class="btn btn-primary btn-small" onclick="$('#detailsModal').close()">关闭</button>
+    </div>
+  </div>
+</dialog>
+
+<!-- Add Channel Modal -->
+<dialog class="modal" id="addChannelModal">
+  <div class="modal-header">
+    <h2 class="modal-title">添加 YouTube 监控频道 / 播放列表</h2>
+    <button class="modal-close" onclick="$('#addChannelModal').close()">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+        <line x1="18" y1="6" x2="6" y2="18"></line>
+        <line x1="6" y1="6" x2="18" y2="18"></line>
+      </svg>
+    </button>
+  </div>
+
+  <form id="formAddChannel" class="modal-body" onsubmit="handleAddChannelSubmit(event)">
+    <div class="form-group">
+      <label class="form-label" for="chUrl">YouTube 频道 / 播放列表 URL <span style="color: var(--color-failed)">*</span></label>
+      <input type="url" id="chUrl" required class="form-control mono" placeholder="https://www.youtube.com/@Channel 或 https://www.youtube.com/playlist?list=..." />
+      <div class="form-hint">支持博主主页（@handle）、/channel/ID、/c/名字 或 播放列表链接。</div>
+    </div>
+
+    <div class="form-row" style="display:grid; grid-template-columns: 1fr 1fr; gap: 12px;">
+      <div class="form-group">
+        <label class="form-label" for="chInterval">自动检查周期</label>
+        <select id="chInterval" class="form-control">
+          <option value="30">每 30 分钟检查一次</option>
+          <option value="60" selected>每 1 小时检查一次</option>
+          <option value="180">每 3 小时检查一次</option>
+          <option value="360">每 6 小时检查一次</option>
+          <option value="720">每 12 小时检查一次</option>
+          <option value="1440">每 24 小时检查一次</option>
+        </select>
+      </div>
+      <div class="form-group">
+        <label class="form-label" for="chMaxPerCheck">单次最大拉取新片数</label>
+        <select id="chMaxPerCheck" class="form-control">
+          <option value="1">最新 1 条</option>
+          <option value="2" selected>最新 2 条</option>
+          <option value="3">最新 3 条</option>
+          <option value="5">最新 5 条</option>
+        </select>
+      </div>
+    </div>
+
+    <div class="form-row" style="display:grid; grid-template-columns: 1fr 1fr; gap: 12px;">
+      <div class="form-group">
+        <label class="form-label" for="chTid">B站 投稿目标分区</label>
+        <select id="chTid" class="form-control">
+          <option value="188" selected>科技 · 软件应用 (188)</option>
+          <option value="122">科技 · 野生技术协会 (122)</option>
+          <option value="17">游戏 · 单机游戏 (17)</option>
+          <option value="21">生活 · 日常 (21)</option>
+          <option value="124">生活 · 趣味科普人文 (124)</option>
+        </select>
+      </div>
+      <div class="form-group">
+        <label class="form-label" for="chQuality">视频最高画质</label>
+        <select id="chQuality" class="form-control">
+          <option value="1080p" selected>1080P 高清 (推荐)</option>
+          <option value="720p">720P 标清</option>
+          <option value="best">原始最高画质</option>
+        </select>
+      </div>
+    </div>
+
+    <div class="form-group">
+      <label class="form-label" for="chTags">投稿默认标签（逗号分隔）</label>
+      <input type="text" id="chTags" value="YouTube搬运,科技,教程,AI" class="form-control" />
+    </div>
+
+    <div class="form-group">
+      <label class="form-check">
+        <input type="checkbox" id="chTranslate" checked />
+        <span>启用 Groq 120B 大模型 AI 翻译与爆款标题润色</span>
+      </label>
+      <label class="form-check">
+        <input type="checkbox" id="chSplitChapters" checked />
+        <span>自动按 YouTube 章节/段落拆分分 P 投稿</span>
+      </label>
+    </div>
+
+    <div class="modal-footer">
+      <button type="button" class="btn btn-secondary" onclick="$('#addChannelModal').close()">取消</button>
+      <button type="submit" class="btn btn-primary" id="btnAddChannelSubmit">
+        <span>立即添加并启动追踪</span>
+      </button>
+    </div>
+  </form>
+</dialog>
+<!-- Secure Login Overlay -->
+<div id="loginOverlay" class="login-overlay" style="display:none;">
+  <div class="login-card">
+    <div class="login-header">
+      <div class="login-logo-box">
+        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+          <rect x="3" y="11" width="18" height="11" rx="2" ry="2"></rect>
+          <path d="M7 11V7a5 5 0 0 1 10 0v4"></path>
+        </svg>
+      </div>
+      <h2 class="login-title">安全验证 · y2b Hub</h2>
+      <p class="login-subtitle">请输入管理员账号与访问密码以使用系统</p>
+    </div>
+
+    <form id="formLogin" onsubmit="handleLoginSubmit(event)">
+      <div class="form-group">
+        <label class="form-label" for="loginUser">管理员账号</label>
+        <input type="text" class="form-control mono" id="loginUser" required autocomplete="username" placeholder="admin" value="admin" />
+      </div>
+      <div class="form-group" style="margin-bottom:22px;">
+        <label class="form-label" for="loginPass">访问密码</label>
+        <input type="password" class="form-control mono" id="loginPass" required autocomplete="current-password" placeholder="请输入密码..." />
+      </div>
+      <button type="submit" class="btn btn-primary" id="btnLoginSubmit" style="width:100%; justify-content:center; padding:12px 16px; font-weight:700;">
+        <span>立即登录</span>
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <polyline points="9 18 15 12 9 6"></polyline>
+        </svg>
+      </button>
+    </form>
+  </div>
+</div>
+
+<div class="toast-container" id="toastContainer" aria-live="polite"></div>
+
+<script>
+const $ = s => document.querySelector(s);
+const $$ = s => [...document.querySelectorAll(s)];
+
+let rawJobs = [];
+let rawMedia = [];
+let activeStatusFilter = '';
+let activeKindFilter = '';
+let searchQuery = '';
+let mediaFilter = 'all';
+let mediaSearch = '';
+let expandedJobId = null;
+let currentModalTab = 'pipeline';
+let currentView = 'queue';
+let authConfig = { auth_enabled: false, authenticated: false, username: 'admin' };
+
+async function apiFetch(url, options = {}) {
+  const res = await fetch(url, options);
+  if (res.status === 401) {
+    showLoginOverlay();
+    throw new Error('未授权，请先登录');
+  }
+  return res;
+}
+
+async function checkAuthStatus() {
+  try {
+    const res = await fetch('/api/auth/status');
+    const data = await res.json();
+    authConfig = data;
+    if (data.auth_enabled && !data.authenticated) {
+      showLoginOverlay();
+      return false;
+    } else {
+      hideLoginOverlay();
+      if (data.auth_enabled) {
+        $('#userBadge').style.display = 'inline-flex';
+        $('#userNameText').textContent = data.username || 'admin';
+      }
+      return true;
+    }
+  } catch (err) {
+    return false;
+  }
+}
+
+function showLoginOverlay() {
+  $('#loginOverlay').style.display = 'flex';
+  setTimeout(() => $('#loginPass').focus(), 100);
+}
+
+function hideLoginOverlay() {
+  $('#loginOverlay').style.display = 'none';
+  $('#loginPass').value = '';
+}
+
+async function handleLoginSubmit(e) {
+  e.preventDefault();
+  const user = $('#loginUser').value.trim();
+  const pass = $('#loginPass').value;
+  const btn = $('#btnLoginSubmit');
+  btn.disabled = true;
+  btn.querySelector('span').textContent = '正在验证...';
+
+  try {
+    const res = await fetch('/api/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: user, password: pass })
+    });
+    const data = await res.json();
+    if (!res.ok || !data.ok) {
+      throw new Error(data.error || '账号或密码错误');
+    }
+    toast('登录成功', 'success');
+    hideLoginOverlay();
+    $('#userBadge').style.display = 'inline-flex';
+    $('#userNameText').textContent = data.username || user;
+    await refreshAll();
+  } catch (err) {
+    toast(err.message, 'error');
+    $('#loginPass').focus();
+    $('#loginPass').select();
+  } finally {
+    btn.disabled = false;
+    btn.querySelector('span').textContent = '立即登录';
+  }
+}
+
+async function handleLogout() {
+  if (!confirm('确定退出当前登录状态吗？')) return;
+  try {
+    await fetch('/api/logout', { method: 'POST' });
+    toast('已安全退出登录', 'info');
+    $('#userBadge').style.display = 'none';
+    showLoginOverlay();
+  } catch (err) {
+    toast(err.message, 'error');
+  }
+}
+
+async function refreshAll() {
+  await fetchJobs();
+  await fetchSystemInfo();
+  await fetchMediaPackages();
+  await fetchChannels();
+}
+
+function normalizeJob(j) {
+  return {
+    id: j.id || j.ID || '',
+    kind: j.kind || j.Kind || '',
+    status: j.status || j.Status || 'queued',
+    step: j.step || j.Step || '',
+    error: j.error || j.Error || '',
+    created: j.created || j.Created || '',
+    started: j.started || j.Started || '',
+    finished: j.finished || j.Finished || '',
+    input: j.input !== undefined ? j.input : (j.Input !== undefined ? j.Input : null),
+    output: j.output !== undefined ? j.output : (j.Output !== undefined ? j.Output : null),
+    logs: j.logs || j.Logs || '',
+    _raw: j
+  };
+}
+
+function escapeHtml(s) {
+  return String(s ?? '').replace(/[&<>"']/g, c => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+  }[c]));
+}
+
+function toast(msg, type = 'info') {
+  const container = $('#toastContainer');
+  const el = document.createElement('div');
+  el.className = `toast ${type}`;
+  el.textContent = msg;
+  container.appendChild(el);
+  setTimeout(() => {
+    el.style.opacity = '0';
+    el.style.transform = 'translateY(10px)';
+    el.style.transition = 'all 0.2s';
+    setTimeout(() => el.remove(), 200);
+  }, 2800);
+}
+
+function formatDuration(startStr, endStr) {
+  if (!startStr || startStr.startsWith('0001')) return '';
+  const start = new Date(startStr);
+  const end = endStr && !endStr.startsWith('0001') ? new Date(endStr) : new Date();
+  const sec = Math.max(0, Math.floor((end - start) / 1000));
+  if (sec < 60) return `${sec}s`;
+  const min = Math.floor(sec / 60);
+  const remSec = sec % 60;
+  return `${min}m ${remSec}s`;
+}
+
+function formatTime(tStr) {
+  if (!tStr || tStr.startsWith('0001')) return '—';
+  try {
+    const d = new Date(tStr);
+    const pad = n => String(n).padStart(2, '0');
+    return `${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+  } catch {
+    return tStr;
+  }
+}
+
+function getJobSummary(j) {
+  const input = j.input || {};
+  if (typeof input === 'string') return input;
+  if (j.kind === 'pipeline') return input.url ? '⚡ ' + input.url : '全自动流水线任务';
+  if (j.kind === 'youtube') return input.url || input.URL || 'YouTube 任务';
+  if (j.kind === 'magnet') return input.magnet || input.url || input.Magnet || '磁力下载任务';
+  if (j.kind === 'biliup') {
+    if (input.title) return input.title;
+    if (input.files && input.files.length) return input.files.join(', ');
+    if (input.file) return input.file;
+    return 'Bilibili 投稿任务';
+  }
+  return j.id;
+}
+
+function renderBadge(status, job) {
+  switch (status) {
+    case 'running': {
+      const dur = formatDuration(job.started, null);
+      return `<span class="badge badge-running"><span class="badge-dot"></span>${escapeHtml(job.step || '执行中')}${dur ? ` (${dur})` : ''}</span>`;
+    }
+    case 'queued':
+      return `<span class="badge badge-queued"><span class="badge-dot"></span>排队中</span>`;
+    case 'done': {
+      const dur = formatDuration(job.started, job.finished);
+      return `<span class="badge badge-done"><span class="badge-dot"></span>已完成${dur ? ` (${dur})` : ''}</span>`;
+    }
+    case 'failed':
+      return `<span class="badge badge-failed"><span class="badge-dot"></span>失败</span>`;
+    case 'canceled':
+      return `<span class="badge badge-canceled"><span class="badge-dot"></span>已取消</span>`;
+    default:
+      return `<span class="badge">${escapeHtml(status)}</span>`;
+  }
+}
+
+function renderTypeIcon(kind) {
+  if (kind === 'pipeline') {
+    return `<div class="job-type-icon job-type-pipeline" title="全自动流水线"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"></polygon></svg></div>`;
+  }
+  if (kind === 'youtube') {
+    return `<div class="job-type-icon job-type-youtube" title="YouTube 下载"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M23.498 6.186a3.016 3.016 0 0 0-2.122-2.136C19.505 3.545 12 3.545 12 3.545s-7.505 0-9.377.505A3.017 3.017 0 0 0 .502 6.186C0 8.07 0 12 0 12s0 3.93.502 5.814a3.016 3.016 0 0 0 2.122 2.136c1.871.505 9.376.505 9.376.505s7.505 0 9.377-.505a3.015 3.015 0 0 0 2.122-2.136C24 15.93 24 12 24 12s0-3.93-.502-5.814zM9.545 15.568V8.432L15.818 12l-6.273 3.568z"/></svg></div>`;
+  }
+  if (kind === 'magnet') {
+    return `<div class="job-type-icon job-type-magnet" title="磁力下载"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 3v7a6 6 0 0 0 12 0V3"></path><line x1="4" y1="7" x2="8" y2="7"></line><line x1="16" y1="7" x2="20" y2="7"></line></svg></div>`;
+  }
+  return `<div class="job-type-icon job-type-biliup" title="Biliup 投稿"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="6" width="20" height="12" rx="2"></rect><path d="m10 10 5 3-5 3v-6Z"></path></svg></div>`;
+}
+
+function renderKindLabel(kind) {
+  const map = { pipeline: '⚡ 流水线', youtube: 'YouTube', magnet: '磁力下载', biliup: 'Biliup 投稿' };
+  return map[kind] || kind || '任务';
+}
+
+function renderJobs() {
+  const tbody = $('#jobsTbody');
+  const counts = { all: rawJobs.length, running: 0, queued: 0, done: 0, failed: 0, canceled: 0, active: 0 };
+
+  rawJobs.forEach(j => {
+    if (counts[j.status] !== undefined) counts[j.status]++;
+    if (j.status === 'running' || j.status === 'queued') counts.active++;
+  });
+
+  $('#statTotal').textContent = counts.all;
+  $('#statActive').textContent = counts.active;
+  $('#statDone').textContent = counts.done;
+  $('#statFailed').textContent = counts.failed + counts.canceled;
+  $('#hwJobsActive').textContent = `${counts.active} 个进行中任务 (${counts.running} 运行, ${counts.queued} 排队)`;
+
+  $('#countAll').textContent = counts.all;
+  $('#countRunning').textContent = counts.running;
+  $('#countQueued').textContent = counts.queued;
+  $('#countDone').textContent = counts.done;
+  $('#countFailed').textContent = counts.failed;
+  $('#countCanceled').textContent = counts.canceled;
+
+  let filtered = rawJobs.filter(j => {
+    if (activeStatusFilter) {
+      if (activeStatusFilter === 'active') {
+        if (j.status !== 'running' && j.status !== 'queued') return false;
+      } else if (j.status !== activeStatusFilter) {
+        return false;
+      }
+    }
+    if (activeKindFilter && j.kind !== activeKindFilter) return false;
+    if (searchQuery) {
+      const q = searchQuery.toLowerCase();
+      const summary = getJobSummary(j).toLowerCase();
+      const id = j.id.toLowerCase();
+      const err = (j.error || '').toLowerCase();
+      if (!summary.includes(q) && !id.includes(q) && !err.includes(q)) return false;
+    }
+    return true;
+  });
+
+  if (!filtered.length) {
+    const isFiltered = activeStatusFilter || activeKindFilter || searchQuery;
+    tbody.innerHTML = `
+      <tr>
+        <td colspan="5" class="empty-state">
+          <div class="empty-icon">
+            <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+              <circle cx="12" cy="12" r="10"></circle>
+              <line x1="8" y1="12" x2="16" y2="12"></line>
+            </svg>
+          </div>
+          <div>${isFiltered ? '无符合当前筛选条件的任务' : '当前队列暂无任务，点击右上角「＋ 新建任务」开始'}</div>
+        </td>
+      </tr>`;
+    return;
+  }
+
+  let html = '';
+  filtered.forEach(j => {
+    const isExpanded = expandedJobId === j.id;
+    const summaryText = getJobSummary(j);
+
+    html += `
+      <tr class="job-row ${isExpanded ? 'expanded' : ''}" onclick="toggleExpand('${escapeHtml(j.id)}', event)">
+        <td>
+          <div class="job-main-info">
+            ${renderTypeIcon(j.kind)}
+            <div style="min-width:0;">
+              <div class="job-title-line" title="${escapeHtml(summaryText)}">
+                <span class="job-title-text">${escapeHtml(summaryText)}</span>
+                <button class="copy-btn" onclick="copyText('${escapeHtml(summaryText)}', event)" title="复制内容">
+                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect>
+                    <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path>
+                  </svg>
+                </button>
+              </div>
+              <div class="job-meta-line">
+                <span class="job-id-chip mono">#${escapeHtml(j.id)}</span>
+                ${j.error ? `<span style="color: var(--color-failed); font-weight: 600;">⚠ 出错</span>` : ''}
+              </div>
+            </div>
+          </div>
+        </td>
+        <td>${renderBadge(j.status, j)}</td>
+        <td><span class="mono" style="color: var(--color-text-muted); font-size:12px;">${escapeHtml(renderKindLabel(j.kind))}</span></td>
+        <td><span class="mono" style="font-size: 12px; color: var(--color-text-dim);">${formatTime(j.created)}</span></td>
+        <td>
+          <div class="action-buttons" onclick="event.stopPropagation()">
+            ${(j.status === 'queued' || j.status === 'running') ? `
+              <button class="btn btn-danger btn-small" onclick="actJob('${escapeHtml(j.id)}', 'cancel')" title="取消执行">取消</button>
+            ` : ''}
+            ${(j.status === 'failed' || j.status === 'canceled') ? `
+              <button class="btn btn-secondary btn-small" onclick="actJob('${escapeHtml(j.id)}', 'retry')" title="重新执行">重试</button>
+            ` : ''}
+            ${(j.status === 'done' || j.status === 'failed' || j.status === 'canceled') ? `
+              <button class="btn btn-secondary btn-small btn-icon-only" onclick="actJob('${escapeHtml(j.id)}', 'delete')" title="删除记录" style="color: var(--color-failed);">
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <polyline points="3 6 5 6 21 6"></polyline>
+                  <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path>
+                </svg>
+              </button>
+            ` : ''}
+            <button class="btn btn-secondary btn-small btn-icon-only" onclick="openDetailsModal('${escapeHtml(j.id)}')" title="查看完整 JSON 详情">
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <circle cx="11" cy="11" r="8"></circle>
+                <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
+              </svg>
+            </button>
+          </div>
+        </td>
+      </tr>
+    `;
+
+    if (isExpanded) {
+      const out = j.output || {};
+      const outputDir = out.dir || '';
+      const outputFiles = out.files || [];
+      const uploadResult = out.upload || {};
+
+      html += `
+        <tr class="drawer-row">
+          <td colspan="5">
+            <div class="drawer-content">
+              <div class="drawer-grid">
+                <div>
+                  <div class="drawer-field-label">输入参数 (Input)</div>
+                  <div class="drawer-field-val mono">${escapeHtml(JSON.stringify(j.input, null, 2))}</div>
+                </div>
+                <div>
+                  <div class="drawer-field-label">执行产物与落盘目录 (Output)</div>
+                  <div class="drawer-field-val">
+                    ${outputDir ? `
+                      <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:4px;">
+                        <span class="mono">${escapeHtml(outputDir)}</span>
+                        <button class="btn-small" style="color:var(--color-secondary); padding:0;" onclick="copyText('${escapeHtml(outputDir)}', event)">复制路径</button>
+                      </div>
+                    ` : ''}
+                    ${outputFiles.length ? `
+                      <div style="font-size:11px; color:var(--color-text-dim); margin-top:4px;">
+                        落盘文件 (${outputFiles.length}):
+                        <div class="mono" style="margin-top:2px;">${outputFiles.map(f => escapeHtml(f)).join('<br>')}</div>
+                      </div>
+                    ` : (outputDir ? '' : '<span style="color:var(--color-text-dim)">暂无产物输出</span>')}
+                    ${uploadResult.title ? `
+                      <div style="margin-top:8px; border-top:1px solid #1a2842; padding-top:6px; font-size:11px;">
+                        <span style="color:var(--color-done)">✓ B站投稿成功</span>: <strong>${escapeHtml(uploadResult.title)}</strong>
+                      </div>
+                    ` : ''}
+                  </div>
+                </div>
+              </div>
+
+              ${j.logs ? `
+                <div style="margin-top:10px;">
+                  <div class="drawer-field-label">终端执行日志 (Live Logs)</div>
+                  <div class="log-terminal">${escapeHtml(j.logs)}</div>
+                </div>
+              ` : ''}
+
+              ${j.error ? `
+                <div style="margin-top:10px;">
+                  <div class="drawer-field-label" style="color: var(--color-failed);">错误诊断 (Error Trace)</div>
+                  <div class="error-block">${escapeHtml(j.error)}</div>
+                </div>
+              ` : ''}
+
+              <div class="drawer-actions">
+                <button class="btn btn-secondary btn-small" onclick="copyText('${escapeHtml(JSON.stringify(j._raw, null, 2))}', event)">复制完整 JSON</button>
+                ${(j.status === 'failed' || j.status === 'canceled') ? `
+                  <button class="btn btn-primary btn-small" onclick="actJob('${escapeHtml(j.id)}', 'retry')">重试任务</button>
+                ` : ''}
+              </div>
+            </div>
+          </td>
+        </tr>
+      `;
+    }
+  });
+
+  tbody.innerHTML = html;
+}
+
+// =======================================
+// RENDER CLEAN MEDIA PACKAGES (FILE MANAGER)
+// =======================================
+function renderMedia() {
+  const container = $('#mediaListContainer');
+  let filtered = rawMedia.filter(m => {
+    if (mediaFilter === 'youtube' && m.source !== 'youtube') return false;
+    if (mediaFilter === 'magnet' && m.source !== 'magnet') return false;
+    if (mediaSearch) {
+      const q = mediaSearch.toLowerCase();
+      if (!m.title.toLowerCase().includes(q) && !(m.video_name || '').toLowerCase().includes(q)) return false;
+    }
+    return true;
+  });
+
+  const ytCount = rawMedia.filter(m => m.source === 'youtube').length;
+  const magCount = rawMedia.filter(m => m.source === 'magnet').length;
+  $('#mediaCountAll').textContent = rawMedia.length;
+  $('#mediaCountYt').textContent = ytCount;
+  $('#mediaCountMag').textContent = magCount;
+
+  if (!filtered.length) {
+    container.innerHTML = `<div class="empty-state"><div class="empty-icon"><svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="2" y="2" width="20" height="20" rx="2"/><line x1="8" y1="12" x2="16" y2="12"/></svg></div><div>暂无已完成的下载媒体项目</div></div>`;
+    return;
+  }
+
+  let html = '';
+  filtered.forEach(m => {
+    const isYt = m.source === 'youtube';
+    const subCount = m.subtitles ? m.subtitles.length : 0;
+    const hasVideo = !!m.video_file;
+    const isMultiP = (m.video_count || 1) > 1;
+
+    html += `
+      <article class="media-item">
+        <div class="media-thumb-box" onclick="${hasVideo ? `playVideo('/files/${encodeURIComponent(m.video_file)}', '${escapeHtml(m.title)}')` : ''}">
+          ${m.cover_file ? `
+            <img class="media-thumb-img" src="/files/${encodeURIComponent(m.cover_file)}" alt="Cover" loading="lazy" />
+          ` : `
+            <div style="color:var(--color-text-dim);"><svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><polygon points="5 3 19 12 5 21 5 3"></polygon></svg></div>
+          `}
+          ${hasVideo ? `
+            <div class="media-thumb-play">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><polygon points="5 3 19 12 5 21 5 3"></polygon></svg>
+            </div>
+          ` : ''}
+        </div>
+
+        <div class="media-content">
+          <div class="media-title" title="${escapeHtml(m.title)}">${escapeHtml(m.title)}</div>
+          <div class="media-meta-row">
+            <span class="media-badge-src ${isYt ? 'media-badge-yt' : 'media-badge-mag'}">${isYt ? 'YouTube' : '磁力'}</span>
+            ${isMultiP ? `<span class="media-badge-src" style="background:rgba(168, 85, 247, 0.15); color:#c084fc; border-color:rgba(168, 85, 247, 0.3);">📑 ${m.video_count} 个分 P 连载</span>` : ''}
+            ${hasVideo ? `<span>体积: <strong>${escapeHtml(m.video_size_str || m.total_size_str)}</strong></span>` : `<span style="color:var(--color-failed)">仅临时分片 / 正在下载</span>`}
+            ${subCount ? `<span>·</span><span>字幕: ${subCount} 语种</span>` : ''}
+            <span>·</span>
+            <span>更新: ${formatTime(m.mod_time)}</span>
+          </div>
+        </div>
+
+        <div class="media-actions">
+          ${hasVideo ? `
+            <button class="btn btn-secondary btn-small" onclick="playVideo('/files/${encodeURIComponent(m.video_file)}', '${escapeHtml(m.title)}')">
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><polygon points="5 3 19 12 5 21 5 3"></polygon></svg>
+              <span>播放</span>
+            </button>
+            <a class="btn btn-secondary btn-small" href="/files/${encodeURIComponent(m.video_file)}" target="_blank" download>
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="7 10 12 15 17 10"></polyline><line x1="12" y1="15" x2="12" y2="3"></line></svg>
+              <span>下载</span>
+            </a>
+            <button class="btn btn-primary btn-small" onclick="quickUploadMediaById('${m.id}')">
+              ${isMultiP ? `多P投稿 (${m.video_count})` : '投稿B站'}
+            </button>
+          ` : ''}
+          <button class="btn btn-danger btn-small btn-icon-only" onclick="deleteMediaPackage('${escapeHtml(m.folder)}')" title="删除该文件夹释放空间">
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path></svg>
+          </button>
+        </div>
+      </article>
+    `;
+  });
+
+  container.innerHTML = html;
+}
+
+function quickUploadMediaById(id) {
+  const m = rawMedia.find(x => x.id === id);
+  if (!m) return;
+  openModal('biliup');
+  const files = m.video_files && m.video_files.length ? m.video_files : [m.folder + '/' + m.video_name];
+  $('#biliFiles').value = files.join('\n');
+  $('#biliTitle').value = m.title;
+  if (m.description) {
+    $('#biliDesc').value = m.description.slice(0, 200);
+    updateDescCounter($('#biliDesc'));
+  }
+  toast('已预填视频与分 P 信息至 B站 投稿弹窗', 'info');
+}
+
+// Video Player Modal Control
+function playVideo(src, title) {
+  const modal = $('#videoModal');
+  const player = $('#playerEl');
+  $('#videoModalTitle').textContent = title;
+  player.src = src;
+  if (modal.showModal) modal.showModal();
+  else modal.setAttribute('open', '');
+  player.play().catch(() => {});
+}
+
+function closeVideoModal() {
+  const modal = $('#videoModal');
+  const player = $('#playerEl');
+  player.pause();
+  player.src = '';
+  if (modal.close) modal.close();
+  else modal.removeAttribute('open');
+}
+
+// Fetch Media Packages
+async function fetchMediaPackages(isManual = false) {
+  try {
+    const res = await apiFetch('/api/media');
+    if (!res.ok) throw new Error('获取媒体列表失败');
+    rawMedia = await res.json();
+    renderMedia();
+    if (isManual) toast('媒体文件库已刷新', 'info');
+  } catch (err) {
+    if (isManual) toast(err.message, 'error');
+  }
+}
+
+// Clean Temp Files
+async function cleanTempFiles() {
+  if (!confirm('确定清理所有未完成的 .part 临时文件与空文件夹吗？')) return;
+  try {
+    const res = await apiFetch('/api/files/clean-temp', { method: 'POST' });
+    const d = await res.json();
+    toast(`已清理 ${d.deleted_count} 个临时项，释放 ${d.freed_str} 磁盘空间`, 'success');
+    await fetchMediaPackages();
+    await fetchSystemInfo();
+  } catch (err) {
+    toast('清理失败: ' + err.message, 'error');
+  }
+}
+
+// Delete Media Package
+async function deleteMediaPackage(folder) {
+  if (!confirm(`确定彻底删除该媒体项目及所有相关文件吗？\n${folder}`)) return;
+  try {
+    const res = await apiFetch('/api/media', {
+      method: 'DELETE',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ folder })
+    });
+    if (!res.ok) throw new Error('删除失败');
+    toast('项目已删除', 'info');
+    await fetchMediaPackages();
+    await fetchSystemInfo();
+  } catch (err) {
+    toast(err.message, 'error');
+  }
+}
+
+function quickUploadMedia(filePath, title) {
+  openModal('biliup');
+  $('#biliFiles').value = filePath;
+  $('#biliTitle').value = title;
+  toast('已预填视频信息至 B站 投稿弹窗', 'info');
+}
+
+// Fetch System Diagnostics (Hardware ROM / RAM / CPU / Network / Traffic Stats)
+async function fetchSystemInfo(isManual = false) {
+  try {
+    const res = await apiFetch('/api/system');
+    if (!res.ok) throw new Error('获取系统状态失败');
+    const d = await res.json();
+
+    // RAM
+    const ramPercent = d.ram.percent || 0;
+    if ($('#sideRamText')) $('#sideRamText').textContent = `${ramPercent}%`;
+    if ($('#sideRamBar')) $('#sideRamBar').style.width = `${ramPercent}%`;
+    if ($('#hwRamPercent')) $('#hwRamPercent').textContent = `${ramPercent}%`;
+    if ($('#hwRamBar')) $('#hwRamBar').style.width = `${ramPercent}%`;
+    if ($('#hwRamText')) $('#hwRamText').textContent = `${d.ram.used_mb} MB / ${d.ram.total_mb} MB (空闲 ${d.ram.available_mb} MB)`;
+    if ($('#sysRamText')) $('#sysRamText').textContent = `${d.ram.used_mb} MB / ${d.ram.total_mb} MB (${ramPercent}%)`;
+    if ($('#sysRamBar')) $('#sysRamBar').style.width = `${ramPercent}%`;
+    if ($('#sysRamFree')) $('#sysRamFree').textContent = `${d.ram.available_mb} MB`;
+    if ($('#sysSwapText')) $('#sysSwapText').textContent = `${d.ram.swap_used_mb} MB / ${d.ram.swap_total_mb} MB`;
+
+    // ROM (Disk)
+    const romPercent = d.rom.percent || 0;
+    if ($('#sideRomText')) $('#sideRomText').textContent = `${romPercent}%`;
+    if ($('#sideRomBar')) $('#sideRomBar').style.width = `${romPercent}%`;
+    if ($('#hwRomPercent')) $('#hwRomPercent').textContent = `${romPercent}%`;
+    if ($('#hwRomBar')) $('#hwRomBar').style.width = `${romPercent}%`;
+    if ($('#hwRomText')) $('#hwRomText').textContent = `${d.rom.used_gb} GB / ${d.rom.total_gb} GB (可用 ${d.rom.free_gb} GB)`;
+    if ($('#sysRomText')) $('#sysRomText').textContent = `${d.rom.used_gb} GB / ${d.rom.total_gb} GB (${romPercent}%)`;
+    if ($('#sysRomBar')) $('#sysRomBar').style.width = `${romPercent}%`;
+    if ($('#sysRomFree')) $('#sysRomFree').textContent = `${d.rom.free_gb} GB`;
+
+    // Real-time Network Throughput
+    if (d.network) {
+      const rxSpeed = d.network.rx_speed_text || '0 B/s';
+      const txSpeed = d.network.tx_speed_text || '0 B/s';
+      const rxTotal = d.network.rx_total_text || '0 B';
+      const txTotal = d.network.tx_total_text || '0 B';
+
+      if ($('#sideNetRate')) $('#sideNetRate').textContent = `↓ ${rxSpeed}`;
+      if ($('#sideRxSpeed')) $('#sideRxSpeed').textContent = rxSpeed;
+      if ($('#sideTxSpeed')) $('#sideTxSpeed').textContent = txSpeed;
+
+      if ($('#hwNetRate')) $('#hwNetRate').textContent = `↓ ${rxSpeed} · ↑ ${txSpeed}`;
+      if ($('#hwNetRxSpeed')) $('#hwNetRxSpeed').textContent = rxSpeed;
+      if ($('#hwNetTxSpeed')) $('#hwNetTxSpeed').textContent = txSpeed;
+      if ($('#hwNetTotals')) $('#hwNetTotals').textContent = `总接收: ${rxTotal} · 发送: ${txTotal}`;
+
+      if ($('#sysRxSpeed')) $('#sysRxSpeed').textContent = `↓ ${rxSpeed}`;
+      if ($('#sysTxSpeed')) $('#sysTxSpeed').textContent = `↑ ${txSpeed}`;
+      if ($('#sysRxTotal')) $('#sysRxTotal').textContent = rxTotal;
+      if ($('#sysTxTotal')) $('#sysTxTotal').textContent = txTotal;
+    }
+
+    // Historical Business Data & Traffic Statistics
+    if (d.traffic_stats) {
+      const downTotal = d.traffic_stats.total_downloaded_text || '0 B';
+      const upTotal = d.traffic_stats.total_uploaded_text || '0 B';
+      const downCount = d.traffic_stats.total_downloads_count || 0;
+      const upCount = d.traffic_stats.total_uploads_count || 0;
+      const pipeCount = d.traffic_stats.total_pipeline_count || 0;
+      const aiCount = d.traffic_stats.total_ai_trans_count || 0;
+      const libTotal = d.traffic_stats.media_library_text || '0 B';
+      const libCount = d.traffic_stats.media_packages_count || 0;
+
+      if ($('#hwDataSummary')) $('#hwDataSummary').textContent = `下 ${downTotal} · 上 ${upTotal}`;
+      if ($('#hwTotalDownloaded')) $('#hwTotalDownloaded').textContent = downTotal;
+      if ($('#hwDownCount')) $('#hwDownCount').textContent = downCount;
+      if ($('#hwTotalUploaded')) $('#hwTotalUploaded').textContent = upTotal;
+      if ($('#hwUpCount')) $('#hwUpCount').textContent = upCount;
+      if ($('#hwDataSub')) $('#hwDataSub').textContent = `媒体库: ${libTotal} · ${libCount} 个包`;
+
+      if ($('#sysTotalDownloaded')) $('#sysTotalDownloaded').textContent = downTotal;
+      if ($('#sysDownCount')) $('#sysDownCount').textContent = downCount;
+      if ($('#sysTotalUploaded')) $('#sysTotalUploaded').textContent = upTotal;
+      if ($('#sysUpCount')) $('#sysUpCount').textContent = upCount;
+      if ($('#sysPipelineCount')) $('#sysPipelineCount').textContent = pipeCount;
+      if ($('#sysAiTransCount')) $('#sysAiTransCount').textContent = aiCount;
+      if ($('#sysMediaLibBytes')) $('#sysMediaLibBytes').textContent = libTotal;
+      if ($('#sysMediaLibCount')) $('#sysMediaLibCount').textContent = libCount;
+    }
+
+    // CPU & Jobs
+    if ($('#sideCpuText')) $('#sideCpuText').textContent = `CPU: ${d.cpu.load_1m}`;
+    if ($('#hwCpuLoad')) $('#hwCpuLoad').textContent = `${d.cpu.load_1m}`;
+    if ($('#hwCpuSub')) $('#hwCpuSub').textContent = `Load: ${d.cpu.load_1m}, ${d.cpu.load_5m}, ${d.cpu.load_15m}`;
+    if ($('#hwJobsActive')) $('#hwJobsActive').textContent = `${d.running_jobs || 0} 个运行中任务`;
+
+    // Bilibili
+    if ($('#sysBiliMid')) $('#sysBiliMid').textContent = d.bilibili.mid || '未登录';
+    if ($('#sysBiliExpires')) $('#sysBiliExpires').textContent = d.bilibili.expires || '未知';
+
+    if (isManual) toast('硬件、网络与系统状态已更新', 'info');
+  } catch (err) {
+    if (isManual) toast(err.message, 'error');
+  }
+}
+
+// Rescan and Re-calibrate stats
+async function rescanStats() {
+  try {
+    const res = await apiFetch('/api/stats/rescan', { method: 'POST' });
+    if (!res.ok) throw new Error('重新校准统计失败');
+    await fetchSystemInfo();
+    toast('历史数据统计已重新扫描并完成校准', 'success');
+  } catch (err) {
+    toast(err.message, 'error');
+  }
+}
+
+// Fetch Jobs
+async function fetchJobs(isManual = false) {
+  const icon = $('#refreshIcon');
+  if (isManual && icon) icon.style.animation = 'spin 0.6s linear infinite';
+
+  try {
+    const res = await apiFetch('/api/jobs');
+    if (!res.ok) throw new Error('读取任务列表失败');
+    const data = await res.json();
+    rawJobs = (Array.isArray(data) ? data : []).map(normalizeJob);
+    renderJobs();
+
+    const now = new Date();
+    const pad = n => String(n).padStart(2, '0');
+    $('#syncText').textContent = `已同步 ${pad(now.getHours())}:${pad(now.getMinutes())}:${pad(now.getSeconds())}`;
+    if (isManual) toast('队列数据已刷新', 'info');
+  } catch (err) {
+    $('#syncText').textContent = '同步出错';
+    if (isManual) toast(err.message, 'error');
+  } finally {
+    if (isManual && icon) icon.style.animation = '';
+  }
+}
+
+// Actions
+async function actJob(id, action) {
+  if (action === 'delete' && !confirm('确定删除该任务记录吗？')) return;
+  const url = `/api/jobs/${encodeURIComponent(id)}` + (action === 'delete' ? '' : `/${action}`);
+  const method = action === 'delete' ? 'DELETE' : 'POST';
+
+  try {
+    const res = await apiFetch(url, { method });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || '操作执行失败');
+    
+    if (action === 'delete') toast('任务记录已删除', 'info');
+    else if (action === 'cancel') toast('已请求取消任务', 'info');
+    else if (action === 'retry') toast('任务已重新加入队列', 'success');
+
+    await fetchJobs();
+    await fetchMediaPackages();
+  } catch (err) {
+    toast(err.message, 'error');
+  }
+}
+
+async function clearAllFinished() {
+  const finishedJobs = rawJobs.filter(j => ['done', 'failed', 'canceled'].includes(j.status));
+  if (!finishedJobs.length) {
+    toast('当前没有已结束的任务需要清理', 'info');
+    return;
+  }
+  if (!confirm(`确定清理全部 ${finishedJobs.length} 条已结束的任务记录吗？`)) return;
+
+  try {
+    const res = await apiFetch('/api/jobs/clear', { method: 'POST' });
+    if (res.ok) {
+      const data = await res.json();
+      toast(`已清理 ${data.deleted || finishedJobs.length} 条任务记录`, 'success');
+      await fetchJobs();
+    }
+  } catch (err) {
+    toast(err.message, 'error');
+  }
+}
+
+// ==========================================
+// YouTube Channel Monitor & Auto-Sync (Frontend)
+// ==========================================
+let rawChannels = [];
+
+async function fetchChannels(isManual = false) {
+  try {
+    const res = await apiFetch('/api/channels');
+    if (!res.ok) throw new Error('获取监控频道失败');
+    rawChannels = await res.json();
+    renderChannels();
+    const activeCount = rawChannels.filter(c => c.enabled).length;
+    $('#sideChannelsBadge').style.display = activeCount > 0 ? 'inline-block' : 'none';
+    $('#sideChannelsBadge').textContent = activeCount;
+    $('#channelsActiveBadge').textContent = `${activeCount} 个正在监控`;
+    if (isManual) toast('订阅频道列表已刷新', 'info');
+  } catch (err) {
+    if (isManual) toast(err.message, 'error');
+  }
+}
+
+function renderChannels() {
+  const container = $('#channelsListContainer');
+  if (!rawChannels || !rawChannels.length) {
+    container.innerHTML = `
+      <div class="empty-state" style="grid-column: 1 / -1;">
+        <div class="empty-icon">
+          <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+            <circle cx="12" cy="12" r="2"></circle>
+            <path d="M16.24 7.76a6 6 0 0 1 0 8.49m-8.48-.01a6 6 0 0 1 0-8.49m11.31-2.82a10 10 0 0 1 0 14.14m-14.14 0a10 10 0 0 1 0-14.14"></path>
+          </svg>
+        </div>
+        <div style="font-size:14px; font-weight:600; margin-bottom:6px;">当前暂无自动监控的 YouTube 频道</div>
+        <div style="font-size:12px; color:var(--color-text-dim); margin-bottom:14px;">添加博主主页链接后，系统将在后台全自动侦测新视频并一键 AI 润色投递 B 站</div>
+        <button class="btn btn-primary btn-small" onclick="openAddChannelModal()">＋ 立即添加监控频道</button>
+      </div>`;
+    return;
+  }
+
+  let html = '';
+  rawChannels.forEach(ch => {
+    const isAct = ch.enabled;
+    const lastSyncTime = formatTime(ch.last_synced_at);
+    const lastCheckTime = formatTime(ch.last_checked_at);
+    const syncedCount = ch.sync_count || 0;
+
+    html += `
+      <div class="panel" style="padding:16px; display:flex; flex-direction:column; justify-content:space-between; border-color:${isAct ? '#203456' : '#1a2233'}; background:${isAct ? '#0f172a' : '#0b101c'};">
+        <div>
+          <div style="display:flex; align-items:flex-start; justify-content:space-between; gap:10px; margin-bottom:10px;">
+            <div style="min-width:0;">
+              <h4 style="margin:0 0 4px; font-size:15px; font-weight:700; color:#ffffff; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;" title="${escapeHtml(ch.title || ch.url)}">
+                ${escapeHtml(ch.title || ch.uploader || 'YouTube 频道')}
+              </h4>
+              <a href="${escapeHtml(ch.url)}" target="_blank" class="mono" style="font-size:11px; color:var(--color-primary); text-decoration:none; display:inline-flex; align-items:center; gap:4px; max-width:240px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">
+                ${escapeHtml(ch.url)}
+                <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"></path><polyline points="15 3 21 3 21 9"></polyline><line x1="21" y1="3" x2="9" y2="15"></line></svg>
+              </a>
+            </div>
+            <span class="badge ${isAct ? 'badge-running' : 'badge-failed'}" style="flex-shrink:0;">
+              <span class="badge-dot"></span>${isAct ? '监控中' : '已暂停'}
+            </span>
+          </div>
+
+          <div style="display:flex; flex-wrap:wrap; gap:6px; margin-bottom:12px; font-size:11px;">
+            <span class="media-badge-src" style="background:#14223d; color:#38bdf8; border-color:#233a63;">⏱ 每 ${ch.check_interval_minutes || 60}m 检查</span>
+            <span class="media-badge-src" style="background:#1e1a3a; color:#c084fc; border-color:#3b2d6b;">分区 TID: ${escapeHtml(ch.tid || '188')}</span>
+            ${ch.translate ? `<span class="media-badge-src" style="background:#112a20; color:#4ade80; border-color:#1e4d36;">✨ AI 润色</span>` : ''}
+            ${ch.split_chapters ? `<span class="media-badge-src" style="background:#2a1c11; color:#fb923c; border-color:#4d2f19;">📑 分P切片</span>` : ''}
+          </div>
+
+          <div style="background:#090d16; border:1px solid #1a2538; border-radius:var(--radius-md); padding:10px 12px; font-size:12px; margin-bottom:14px;">
+            <div style="display:flex; justify-content:space-between; margin-bottom:4px; color:var(--color-text-muted);">
+              <span>已自动搬运</span>
+              <strong style="color:var(--color-accent);">${syncedCount} 部视频</strong>
+            </div>
+            <div style="display:flex; justify-content:space-between; margin-bottom:4px; color:var(--color-text-muted);">
+              <span>上次检查</span>
+              <span class="mono">${lastCheckTime}</span>
+            </div>
+            ${ch.last_synced_title ? `
+              <div style="margin-top:6px; padding-top:6px; border-top:1px solid #141c2c; font-size:11px; color:var(--color-text-dim); overflow:hidden; text-overflow:ellipsis; white-space:nowrap;" title="${escapeHtml(ch.last_synced_title)}">
+                最新: <span style="color:#ffffff">${escapeHtml(ch.last_synced_title)}</span>
+              </div>
+            ` : ''}
+          </div>
+        </div>
+
+        <div style="display:flex; gap:8px; justify-content:flex-end;">
+          <button class="btn btn-secondary btn-small" onclick="toggleChannel('${ch.id}')" title="${isAct ? '暂停自动抓取' : '恢复自动抓取'}">
+            ${isAct ? '⏸ 暂停' : '▶ 启用'}
+          </button>
+          <button class="btn btn-pipeline btn-small" onclick="syncChannelNow('${ch.id}')" title="立即探测并抓取最新视频">
+            ⚡ 立即检查
+          </button>
+          <button class="btn btn-danger btn-small btn-icon-only" onclick="deleteChannel('${ch.id}')" title="删除该订阅">
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path></svg>
+          </button>
+        </div>
+      </div>
+    `;
+  });
+
+  container.innerHTML = html;
+}
+
+function openAddChannelModal() {
+  const modal = $('#addChannelModal');
+  if (modal.showModal) modal.showModal();
+  else modal.setAttribute('open', '');
+}
+
+async function handleAddChannelSubmit(e) {
+  e.preventDefault();
+  const btn = $('#btnAddChannelSubmit');
+  const orig = btn.innerHTML;
+  btn.disabled = true;
+  btn.innerHTML = '正在解析频道…';
+
+  const body = {
+    url: $('#chUrl').value.trim(),
+    check_interval_minutes: parseInt($('#chInterval').value, 10) || 60,
+    max_per_check: parseInt($('#chMaxPerCheck').value, 10) || 2,
+    tid: $('#chTid').value,
+    quality: $('#chQuality').value,
+    tags: $('#chTags').value.trim(),
+    translate: $('#chTranslate').checked,
+    split_chapters: $('#chSplitChapters').checked
+  };
+
+  try {
+    const res = await apiFetch('/api/channels', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body)
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || '添加频道失败');
+
+    toast(`已添加监控频道: ${data.title || data.url}`, 'success');
+    $('#addChannelModal').close();
+    $('#formAddChannel').reset();
+    await fetchChannels();
+    switchView('channels');
+  } catch (err) {
+    toast(err.message, 'error');
+  } finally {
+    btn.disabled = false;
+    btn.innerHTML = orig;
+  }
+}
+
+async function toggleChannel(id) {
+  try {
+    const res = await apiFetch(`/api/channels/${encodeURIComponent(id)}/toggle`, { method: 'POST' });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || '操作失败');
+    toast(`已${data.enabled ? '恢复' : '暂停'}频道自动监控`, 'info');
+    await fetchChannels();
+  } catch (err) {
+    toast(err.message, 'error');
+  }
+}
+
+async function syncChannelNow(id) {
+  toast('正在抓取频道最新视频…', 'info');
+  try {
+    const res = await apiFetch(`/api/channels/${encodeURIComponent(id)}/sync`, { method: 'POST' });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || '检查失败');
+    if (data.synced_new > 0) {
+      toast(`发现 ${data.synced_new} 部新视频，已自动推入流水线队列！`, 'success');
+      await fetchJobs();
+    } else {
+      toast('当前频道暂无新发布的视频', 'info');
+    }
+    await fetchChannels();
+  } catch (err) {
+    toast(err.message, 'error');
+  }
+}
+
+async function deleteChannel(id) {
+  if (!confirm('确定停止并删除该 YouTube 频道的监控任务吗？')) return;
+  try {
+    const res = await apiFetch(`/api/channels/${encodeURIComponent(id)}`, { method: 'DELETE' });
+    if (!res.ok) throw new Error('删除失败');
+    toast('已删除该频道监控', 'info');
+    await fetchChannels();
+  } catch (err) {
+    toast(err.message, 'error');
+  }
+}
+
+// View switching
+function switchView(viewName) {
+  currentView = viewName;
+  $$('[data-view]').forEach(link => {
+    link.classList.toggle('active', link.dataset.view === viewName);
+  });
+  $$('.view-section').forEach(sec => {
+    sec.classList.toggle('active', sec.id === `section-${viewName}`);
+  });
+
+  const titles = {
+    queue: { eyebrow: '工作台 / 队列编排系统', title: '任务管理控制台', sub: 'YouTube 视频下载 · 磁力 / BT 抓取 · DeepSeek AI 翻译 · B站全自动分 P 投稿' },
+    channels: { eyebrow: '全自动追踪 / Auto-Sync', title: 'YouTube 频道监控中心', sub: '自动定时追踪 YouTube 博主更新，一键 Groq AI 翻译并自动投递至 B 站' },
+    files: { eyebrow: '资源管理 / Storage', title: '媒体文件库', sub: '清晰管理已下载视频、封面与字幕，支持直接在线播放、下载或一键投稿' },
+    system: { eyebrow: '健康诊断 / Diagnostics', title: '硬件与系统健康监控', sub: '实时监控服务器 RAM 运行内存、ROM 磁盘存储、CPU 负载及 B站 账号凭据' }
+  };
+  const t = titles[viewName] || titles.queue;
+  $('#viewEyebrow').textContent = t.eyebrow;
+  $('#viewTitle').textContent = t.title;
+  $('#viewSubtitle').textContent = t.sub;
+
+  if (viewName === 'channels') fetchChannels();
+  if (viewName === 'files') fetchMediaPackages();
+  if (viewName === 'system') fetchSystemInfo();
+}
+
+// Modal Handlers
+function openModal(mode = 'pipeline') {
+  currentModalTab = mode;
+  const modal = $('#taskModal');
+  
+  $$('.modal-tab').forEach(t => t.classList.toggle('active', t.dataset.tab === mode));
+  $('#formPipeline').style.display = mode === 'pipeline' ? 'block' : 'none';
+  $('#formYoutube').style.display = mode === 'youtube' ? 'block' : 'none';
+  $('#formMagnet').style.display = mode === 'magnet' ? 'block' : 'none';
+  $('#formBiliup').style.display = mode === 'biliup' ? 'block' : 'none';
+
+  if (modal.showModal) modal.showModal();
+  else modal.setAttribute('open', '');
+}
+
+function closeModal() {
+  const modal = $('#taskModal');
+  if (modal.close) modal.close();
+  else modal.removeAttribute('open');
+}
+
+function setSubPreset(val) {
+  $('#ytSub').value = val;
+  $('#formYoutube').querySelectorAll('.preset-chip').forEach(c => {
+    c.classList.toggle('active', c.textContent.includes(val) || (val.includes('zh-Hans,zh,en') && c.textContent.includes('常用')));
+  });
+}
+
+function setPipelineSubPreset(val) {
+  $('#plSub').value = val;
+  $('#formPipeline').querySelectorAll('.preset-chip').forEach(c => {
+    c.classList.toggle('active', c.textContent.includes(val) || (val.includes('zh-Hans,zh,en') && c.textContent.includes('常用')));
+  });
+}
+
+function updateDescCounter(el) {
+  $('#descCounter').textContent = `${el.value.length} / 200`;
+}
+
+async function enhanceTitleWithAI() {
+  const title = $('#biliTitle').value.trim();
+  const desc = $('#biliDesc').value.trim();
+  if (!title && !desc) {
+    toast('请先输入需要润色的标题或简介', 'info');
+    return;
+  }
+  toast('正在调用 DeepSeek AI 润色标题…', 'info');
+  try {
+    const res = await apiFetch('/api/ai/enhance', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ title, description: desc })
+    });
+    const data = await res.json();
+    if (data.title) {
+      $('#biliTitle').value = data.title;
+      if (data.summary && !$('#biliDesc').value) {
+        $('#biliDesc').value = data.summary;
+        updateDescCounter($('#biliDesc'));
+      }
+      toast('AI 润色标题已应用！', 'success');
+    }
+  } catch (err) {
+    toast('AI 润色失败: ' + err.message, 'error');
+  }
+}
+
+async function handleJobSubmit(e, endpoint) {
+  e.preventDefault();
+  const form = e.target;
+  const submitBtn = form.querySelector('button[type="submit"]');
+  const originalText = submitBtn.textContent;
+  submitBtn.disabled = true;
+  submitBtn.textContent = '提交中…';
+
+  let body = {};
+  if (endpoint.includes('pipeline')) {
+    body = {
+      url: $('#plUrl').value.trim(),
+      tid: $('#plTid').value,
+      tags: $('#plTags').value.trim(),
+      sub_langs: $('#plSub') ? $('#plSub').value.trim() : 'zh-Hans,zh,en,zh-Hant',
+      burn_subs: $('#plBurnSubs') ? $('#plBurnSubs').checked : false,
+      translate: $('#plTranslate').checked,
+      split_chapters: $('#plSplitChapters') ? $('#plSplitChapters').checked : false
+    };
+  } else if (endpoint.includes('youtube')) {
+    body = {
+      url: $('#ytUrl').value.trim(),
+      quality: $('#ytQuality').value,
+      sub_langs: $('#ytSub').value.trim(),
+      burn_subs: $('#ytBurnSubs') ? $('#ytBurnSubs').checked : false,
+      split_chapters: $('#ytSplitChapters') ? $('#ytSplitChapters').checked : false,
+      auto_upload: $('#ytAutoUpload').checked
+    };
+  } else if (endpoint.includes('magnet')) {
+    body = {
+      magnet: $('#magnetUri').value.trim(),
+      auto_upload: $('#magAutoUpload').checked
+    };
+  } else if (endpoint.includes('biliup')) {
+    const rawFiles = $('#biliFiles').value.split('\n').map(x => x.trim()).filter(Boolean);
+    body = {
+      files: rawFiles,
+      title: $('#biliTitle').value.trim(),
+      description: $('#biliDesc').value.trim(),
+      tid: $('#biliTid').value,
+      translate: $('#biliTranslate').checked,
+      parts: $('#biliParts').checked
+    };
+  }
+
+  try {
+    const res = await apiFetch(endpoint, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body)
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || '提交任务失败');
+
+    toast(`任务已加入队列 (#${data.id || data.ID || ''})`, 'success');
+    closeModal();
+    form.reset();
+    if (endpoint.includes('youtube')) setSubPreset('zh-Hans,zh,en');
+    switchView('queue');
+    await fetchJobs();
+  } catch (err) {
+    toast(err.message, 'error');
+  } finally {
+    submitBtn.disabled = false;
+    submitBtn.textContent = originalText;
+  }
+}
+
+function toggleExpand(id, event) {
+  if (event.target.closest('button') || event.target.closest('a') || event.target.closest('input')) return;
+  expandedJobId = (expandedJobId === id) ? null : id;
+  renderJobs();
+}
+
+let activeDetailsJson = '';
+function openDetailsModal(id) {
+  const job = rawJobs.find(j => j.id === id);
+  if (!job) return;
+  activeDetailsJson = JSON.stringify(job._raw, null, 2);
+  $('#detailsModalTitle').textContent = `任务详情 #${job.id}`;
+  $('#detailsJson').textContent = activeDetailsJson;
+  $('#detailsModal').showModal();
+}
+
+function copyDetailsJson() {
+  navigator.clipboard.writeText(activeDetailsJson).then(() => toast('已复制 JSON 数据', 'success'));
+}
+
+function copyText(txt, e) {
+  if (e) e.stopPropagation();
+  navigator.clipboard.writeText(txt).then(() => toast('已复制到剪贴板', 'success')).catch(() => toast('复制失败', 'error'));
+}
+
+document.addEventListener('DOMContentLoaded', () => {
+  $$('[data-view]').forEach(item => {
+    item.addEventListener('click', () => switchView(item.dataset.view));
+  });
+
+  $('#btnRefresh').addEventListener('click', () => {
+    fetchJobs(true);
+    fetchSystemInfo(true);
+    if (currentView === 'files') fetchMediaPackages(true);
+  });
+
+  $('#btnNewTask').addEventListener('click', () => openModal('youtube'));
+  $('#modalClose').addEventListener('click', closeModal);
+  $('#btnClearDone').addEventListener('click', clearAllFinished);
+
+  $$('.filter-tab[data-status]').forEach(tab => {
+    tab.addEventListener('click', () => {
+      $$('.filter-tab[data-status]').forEach(t => t.classList.remove('active'));
+      tab.classList.add('active');
+      activeStatusFilter = tab.dataset.status;
+      renderJobs();
+    });
+  });
+
+  $$('[data-media-filter]').forEach(tab => {
+    tab.addEventListener('click', () => {
+      $$('[data-media-filter]').forEach(t => t.classList.remove('active'));
+      tab.classList.add('active');
+      mediaFilter = tab.dataset.mediaFilter;
+      renderMedia();
+    });
+  });
+
+  $('#mediaSearchInput').addEventListener('input', e => {
+    mediaSearch = e.target.value.trim();
+    renderMedia();
+  });
+
+  $$('.stat-card').forEach(card => {
+    card.addEventListener('click', () => {
+      const f = card.dataset.filterClick;
+      activeStatusFilter = f;
+      $$('.filter-tab[data-status]').forEach(t => t.classList.toggle('active', t.dataset.status === f));
+      $$('.stat-card').forEach(c => c.classList.toggle('active-filter', c === card));
+      renderJobs();
+    });
+  });
+
+  $('#kindSelect').addEventListener('change', e => {
+    activeKindFilter = e.target.value;
+    renderJobs();
+  });
+
+  const searchInput = $('#searchInput');
+  const searchClear = $('#searchClear');
+  searchInput.addEventListener('input', e => {
+    searchQuery = e.target.value.trim();
+    searchClear.style.display = searchQuery ? 'block' : 'none';
+    renderJobs();
+  });
+  searchClear.addEventListener('click', () => {
+    searchInput.value = '';
+    searchQuery = '';
+    searchClear.style.display = 'none';
+    renderJobs();
+  });
+
+  $$('.modal-tab').forEach(tab => {
+    tab.addEventListener('click', () => openModal(tab.dataset.tab));
+  });
+
+  document.addEventListener('keydown', e => {
+    if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
+    if (e.key === 'n' || e.key === 'N') {
+      e.preventDefault();
+      openModal('pipeline');
+    } else if (e.key === 'r' || e.key === 'R') {
+      e.preventDefault();
+      fetchJobs(true);
+      fetchSystemInfo(true);
+    } else if (e.key === 'Escape') {
+      closeVideoModal();
+    }
+  });
+
+  checkAuthStatus().then(authed => {
+    if (authed) {
+      fetchJobs();
+      fetchSystemInfo();
+      fetchMediaPackages();
+    }
+  });
+
+  pollTimer = setInterval(() => {
+    if (authConfig.auth_enabled && !authConfig.authenticated) return;
+    if (currentView === 'queue') {
+      fetchJobs();
+      fetchSystemInfo();
+    }
+  }, 2500);
+
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) {
+      clearInterval(pollTimer);
+    } else {
+      if (authConfig.auth_enabled && !authConfig.authenticated) return;
+      fetchJobs();
+      fetchSystemInfo();
+      pollTimer = setInterval(() => {
+        if (currentView === 'queue') {
+          fetchJobs();
+          fetchSystemInfo();
+        }
+      }, 2500);
+    }
+  });
+});
+</script>
+</body>
+</html>
