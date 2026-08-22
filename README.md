@@ -1,35 +1,159 @@
-# y2b-go
+<div align="center">
 
-轻量 Go 编排服务。媒体内容始终由外部工具流式落盘，Go 进程只保存队列元数据和受限日志，不把视频读入内存，适合低内存 VPS。
+# y2b
 
-凭据文件保持原样：B站 `cookies.json`、YouTube `youtube_cookies.txt`（或通过环境变量指定的 cookie 文件），以及 API key 不会被程序覆盖。YouTube 浏览器 JSON cookie 只会在单个任务目录生成临时 Netscape 文件，任务结束自动删除。
+### YouTube / Magnet → Bilibili 的低内存 Go 自动化流水线
 
-## 运行
+<p>
+  <img src="https://cdn.simpleicons.org/go/00ADD8" width="42" height="42" alt="Go" title="Go" />
+  <img src="https://cdn.simpleicons.org/youtube/FF0000" width="42" height="42" alt="YouTube" title="YouTube" />
+  <img src="https://cdn.simpleicons.org/ffmpeg/007808" width="42" height="42" alt="FFmpeg" title="FFmpeg" />
+  <img src="https://cdn.simpleicons.org/bilibili/00A1D6" width="42" height="42" alt="Bilibili" title="Bilibili" />
+  <img src="https://cdn.simpleicons.org/linux/FCC624" width="42" height="42" alt="Linux" title="Linux" />
+  <img src="https://cdn.simpleicons.org/systemd/1DA1F2" width="42" height="42" alt="systemd" title="systemd" />
+</p>
+
+![Go](https://img.shields.io/badge/Go-1.22-00ADD8?logo=go&logoColor=white)
+![License](https://img.shields.io/badge/license-private%20deployment-64748b)
+![Memory](https://img.shields.io/badge/memory--first-低内存-16a34a)
+![Self healing](https://img.shields.io/badge/systemd-self--healing-7c3aed)
+
+</div>
+
+## 简介
+
+y2b 是一个面向低内存 VPS 的 Go 媒体编排服务，将 YouTube 或 Magnet 内容下载、章节拆分、字幕保留、Biliup 投稿和频道监控整合到一个中文 Web 控制台中。
+
+设计目标：媒体内容始终由外部工具流式落盘，Go 只管理任务元数据和受限日志；默认不压制硬字幕，直接复用 YouTube 字幕，避免不必要的长时间转码。
+
+## 技术栈
+
+| 模块 | 技术 |
+| --- | --- |
+| 服务端 | Go · `net/http` · goroutine · context |
+| 下载 | `yt-dlp` · `aria2c` |
+| 媒体处理 | `ffmpeg` · VTT/SRT/BCC |
+| B站投稿 | `biliup` · 多 P · 多提交端点 |
+| 前端 | 原生 HTML/CSS/JavaScript · 内嵌单页控制台 |
+| 守护 | systemd · 自动重启 · 资源限制 |
+
+## 功能
+
+- YouTube 视频、播放列表和 Magnet 异步下载
+- YouTube 字幕、封面、简介保存；默认直接复用字幕投稿
+- 章节自动拆分多 P
+- Biliup 多 P 投稿、封面、标签、转载来源和 AI 元数据
+- 频道监控与自动同步
+- 队列状态、取消、重试、删除和日志查看
+- 媒体库、磁盘/RAM/CPU/网络和累计流量统计
+- 中文 Web 控制台与登录保护
+- 原子队列持久化、`.bak` 回退、进程自动恢复
+
+## 字幕策略
+
+默认流程为：
+
+```text
+YouTube 字幕 → 保存 / 转换 SRT、BCC → 视频保留字幕 → Biliup open_subtitle
+```
+
+默认不会调用 ffmpeg 重新编码视频。只有在请求中显式设置 `burn_subs:true`，或在控制台手动勾选硬字幕压制时，才会执行压制。
+
+## Biliup 自修复策略
+
+投稿失败会按状态分类处理，并且所有路径都有有限边界：
+
+- 标题、简介、标签、分区、封面错误：自动清洗或回退后重试
+- `21138`：切换备用投稿接口
+- 网络错误和上传限速：使用 Biliup 退避；`601` 不再快速轮询多个端点
+- 登录失效、重复稿、每日频控：保护性停止，保留本地文件
+- 未知状态码：有限尝试后失败，不会无限循环
+- Biliup 外部进程默认 4 小时超时，可用 `Y2B_UPLOAD_TIMEOUT` 调整
+
+## 快速运行
+
+依赖：`yt-dlp`、`ffmpeg`、`aria2c` 和 `biliup`。
 
 ```sh
 Y2B_COOKIES=/srv/y2b/youtube_cookies.txt \
 Y2B_BILI_COOKIES=/srv/y2b/cookies.json \
-Y2B_DATA=/srv/y2b/data ./y2b-go
+Y2B_DATA=/srv/y2b/data \
+./y2b-go
 ```
 
-依赖：`yt-dlp`、`ffmpeg`、`aria2c`；上传依赖 `biliup`。先执行 `biliup --user-cookie /srv/y2b/cookies.json login`。YouTube cookie 可用 `Y2B_COOKIES` 指定 Netscape/浏览器 JSON 文件，服务会在任务目录临时转换浏览器 JSON，不修改源文件。DeepSeek 可通过 `DEEPSEEK_API_KEY` 和 `DEEPSEEK_MODEL` 配置，systemd 部署时放进 `/etc/y2b.env`。
+DeepSeek 元数据增强：
 
-systemd 部署：复制 `y2b-go.service` 到 `/etc/systemd/system/`，执行 `systemctl daemon-reload && systemctl enable --now y2b-go`。服务异常退出会自动重启；队列写入采用临时文件和 `.bak` 回退，重启不会丢失已完成任务记录。
+```sh
+DEEPSEEK_API_KEY=your_key
+DEEPSEEK_MODEL=deepseek-chat
+```
 
-Biliup 投稿有有限自修复策略：参数类状态码会清洗参数后重试，`21138` 会切换备用提交通道，网络/上传限速由 Biliup 自身退避；账号失效、重复稿、每日频控会保护性停止，不会无限撞接口。每次投稿有 `Y2B_UPLOAD_TIMEOUT` 超时保护，默认 4 小时。
+建议将 API key 放入 `/etc/y2b.env`，不要写入仓库。
+
+## systemd 部署
+
+```sh
+sudo install -m 0644 y2b-go.service /etc/systemd/system/y2b-go.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now y2b-go
+```
+
+默认策略：
+
+- `Restart=always`
+- Go 内存上限 64 MiB runtime limit / systemd 350 MiB
+- 下载和投稿各自单槽位，避免 VPS OOM
+- 任务状态原子写入并保留备份
+- 收到 SIGTERM/SIGINT 时优雅退出
 
 ## API
 
-打开 `https://y2b.jeffkafka.top/` 可使用内置中文控制台；页面会自动轮询任务状态。
+控制台：`http://127.0.0.1:8765/`（生产环境建议通过反向代理提供 HTTPS）。
 
-- `POST /api/youtube/download`：`{"url":"https://youtu.be/...","sub_langs":"all"}`。保存视频、字幕、封面和简介；默认不压制硬字幕，`burn_subs:true` 才会启用 ffmpeg 压制。
-- `POST /api/magnet/download`：`{"magnet":"magnet:?xt=..."}`。
-- `POST /api/biliup/upload`：`{"file":"/path/a.mp4","files":["/path/p1.mp4","/path/p2.mp4"],"title":"...","description":"...","translate":true,"parts":true}`。`files` 会作为 Biliup 多 P 投稿，简介按 Unicode 截断到 200 字符；`parts:true` 默认沿用 Biliup 的 3 路并发策略。
-- YouTube 自动流水线默认直接上传 YouTube 字幕（视频内嵌字幕 + Biliup `open_subtitle`），不重新编码视频；只有请求显式设置 `burn_subs:true` 才会压制硬字幕。
-- `GET /api/jobs/{id}`：查询异步任务。
-- `GET /api/jobs`：按创建时间倒序查看队列，可用 `?status=queued|running|done|failed|canceled` 筛选。
-- `POST /api/jobs/{id}/cancel`：取消排队或运行中的任务，并终止对应外部进程。
-- `POST /api/jobs/{id}/retry`：重试失败或已取消任务。
-- `DELETE /api/jobs/{id}`：删除已完成、失败或取消的任务记录。
+| 方法 | 路径 | 用途 |
+| --- | --- | --- |
+| `POST` | `/api/youtube/download` | YouTube 下载、字幕、封面和简介 |
+| `POST` | `/api/magnet/download` | Magnet 下载 |
+| `POST` | `/api/biliup/upload` | 单视频或多 P 投稿 |
+| `POST` | `/api/pipeline` | 下载 → 处理 → B站投稿 |
+| `GET` | `/api/jobs` | 查询任务队列 |
+| `GET` | `/api/jobs/{id}` | 查询单个任务 |
+| `POST` | `/api/jobs/{id}/retry` | 重试失败任务 |
+| `POST` | `/api/jobs/{id}/cancel` | 取消任务 |
+| `GET` | `/health` | 健康检查 |
+| `GET` | `/api/system` | 系统与流量诊断 |
 
-所有任务为异步执行，响应 HTTP 202；任务文件落盘到 `Y2B_DATA`，不在 Go 堆中缓存媒体。
+示例：
+
+```json
+{
+  "url": "https://youtu.be/...",
+  "sub_langs": "zh-Hans,zh,en",
+  "split_chapters": true,
+  "burn_subs": false,
+  "translate": true
+}
+```
+
+所有任务异步执行，视频不进入 Go 堆内存，文件落盘到 `Y2B_DATA`。
+
+## 安全与本地文件
+
+以下文件只保留在部署机，不提交到 Git：
+
+- `cookies.json`：B站登录 cookie
+- `youtube_cookies.txt`：YouTube cookie
+- `auth.cookie`、`test_cookie.txt`
+- `data/`、日志、频道配置和构建二进制
+
+`.gitignore` 已默认排除上述内容。请不要将 cookie 或 API key 粘贴到 issue、commit 或公开仓库。
+
+## 开发与验证
+
+```sh
+go test ./...
+go vet ./...
+go build -trimpath -ldflags='-s -w' -o y2b-go main.go
+```
+
+仓库内测试包含 Biliup 状态码解析、自修复分类、标题修复、接口回退和 `601` 限速防止端点风暴等 mock 场景。
