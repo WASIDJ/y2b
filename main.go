@@ -56,6 +56,7 @@ type Config struct {
 	UploadTimeout    time.Duration
 	QueueWaitTimeout time.Duration
 	MagnetTimeout    time.Duration
+	BTListenPort     string
 }
 
 type MonitoredChannel struct {
@@ -181,6 +182,7 @@ func loadConfig() Config {
 			magnetTimeout = parsed
 		}
 	}
+	btListenPort := env("Y2B_BT_LISTEN_PORT", "51413")
 
 	return Config{
 		Addr:             env("Y2B_ADDR", "127.0.0.1:8765"),
@@ -201,6 +203,7 @@ func loadConfig() Config {
 		UploadTimeout:    uploadTimeout,
 		QueueWaitTimeout: queueWaitTimeout,
 		MagnetTimeout:    magnetTimeout,
+		BTListenPort:     btListenPort,
 	}
 }
 
@@ -1052,14 +1055,18 @@ func (a *App) createMagnetHandler(q magnetReq) func(*Job) {
 				btTrackers := "udp://tracker.opentrackr.org:1337/announce,udp://open.tracker.cl:1337/announce,udp://tracker.openbittorrent.com:6969/announce,http://tracker.openbittorrent.com:80/announce,udp://opentracker.i2p.rocks:6969/announce,udp://open.demonii.com:1337/announce"
 				magLogs, err := a.runMagnet(nj.ctx, []string{
 					"--dir=" + d,
+					"--continue=true",
+					"--allow-overwrite=false",
 					"--seed-time=0",
 					"--file-allocation=none",
-					"--disk-cache=4M",
+					"--disk-cache=16M",
 					"--timeout=30",
 					"--connect-timeout=15",
 					"--bt-tracker-connect-timeout=15",
 					"--bt-tracker-timeout=20",
-					"--max-connection-per-server=2",
+					"--listen-port=" + a.cfg.BTListenPort,
+					"--max-connection-per-server=4",
+					"--bt-max-peers=60",
 					"--max-concurrent-downloads=1",
 					"--enable-dht=true",
 					"--enable-peer-exchange=true",
@@ -1751,14 +1758,18 @@ func (a *App) createPipelineHandler(q pipelineReq) func(*Job) {
 					btTrackers := "udp://tracker.opentrackr.org:1337/announce,udp://open.tracker.cl:1337/announce,udp://tracker.openbittorrent.com:6969/announce,http://tracker.openbittorrent.com:80/announce,udp://opentracker.i2p.rocks:6969/announce,udp://open.demonii.com:1337/announce"
 					magLogs, err := a.runMagnet(nj.ctx, []string{
 						"--dir=" + d,
+						"--continue=true",
+						"--allow-overwrite=false",
 						"--seed-time=0",
 						"--file-allocation=none",
-						"--disk-cache=4M",
+						"--disk-cache=16M",
 						"--timeout=30",
 						"--connect-timeout=15",
 						"--bt-tracker-connect-timeout=15",
 						"--bt-tracker-timeout=20",
-						"--max-connection-per-server=2",
+						"--listen-port=" + a.cfg.BTListenPort,
+						"--max-connection-per-server=4",
+						"--bt-max-peers=60",
 						"--max-concurrent-downloads=1",
 						"--enable-dht=true",
 						"--enable-peer-exchange=true",
