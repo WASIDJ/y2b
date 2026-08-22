@@ -50,6 +50,27 @@ func TestRunCmdProgressStreamsLines(t *testing.T) {
 	}
 }
 
+func TestRetryReplacesTerminalRecord(t *testing.T) {
+	a := &App{
+		cfg:  Config{DataDir: t.TempDir()},
+		jobs: map[string]*Job{},
+	}
+	old := &Job{ID: "old-job", Kind: "unknown", Status: "failed", Input: map[string]any{"url": "test"}}
+	a.jobs[old.ID] = old
+	a.order = []string{old.ID}
+
+	retried, err := a.retryJob(old.ID)
+	if err != nil {
+		t.Fatalf("retry failed: %v", err)
+	}
+	if retried.ID == old.ID || retried.Status != "queued" {
+		t.Fatalf("unexpected retried job: %+v", retried)
+	}
+	if len(a.jobs) != 1 || len(a.order) != 1 || a.jobs[old.ID] != nil || a.order[0] != retried.ID {
+		t.Fatalf("retry left a duplicate record: jobs=%d order=%v", len(a.jobs), a.order)
+	}
+}
+
 func TestMagnetValidationAndDeadSeedClassification(t *testing.T) {
 	if !validTorrentOrMagnet("magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567") {
 		t.Fatal("expected valid magnet URI")

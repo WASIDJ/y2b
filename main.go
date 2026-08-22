@@ -613,17 +613,43 @@ func (a *App) dispatchJob(j *Job) {
 	}
 }
 
-func (a *App) retryJob(id string) (*Job, error) {
-	a.mu.RLock()
-	old := a.jobs[id]
-	a.mu.RUnlock()
+func (a *App) retryJob(jobID string) (*Job, error) {
+	a.mu.Lock()
+	old := a.jobs[jobID]
 	if old == nil {
+		a.mu.Unlock()
 		return nil, errors.New("job not found")
 	}
 	if old.Status != "failed" && old.Status != "canceled" {
+		a.mu.Unlock()
 		return nil, fmt.Errorf("only failed or canceled jobs can be retried (status=%s)", old.Status)
 	}
-	j := a.add(old.Kind, old.Input)
+
+	// Replace the terminal record in-place from the queue's point of view.
+	// Creating a second record made every retry look like a duplicate task and
+	// caused "retry all" to double the visible queue. A fresh Job object keeps
+	// a canceled worker from writing its final state into the retried attempt.
+	ctx, cancel := context.WithCancel(context.Background())
+	j := &Job{
+		ID:         id(),
+		Kind:       old.Kind,
+		Status:     "queued",
+		Step:       "排队中",
+		Created:    time.Now(),
+		Input:      old.Input,
+		ctx:        ctx,
+		cancelFunc: cancel,
+	}
+	for i, oid := range a.order {
+		if oid == jobID {
+			a.order[i] = j.ID
+			break
+		}
+	}
+	delete(a.jobs, jobID)
+	a.jobs[j.ID] = j
+	a.mu.Unlock()
+	a.saveJobs()
 	a.dispatchJob(j)
 	return j, nil
 }
