@@ -316,6 +316,78 @@ func (a *App) loadJobs() {
 	}
 }
 
+func jobSourceKey(kind string, input any) string {
+	b, _ := json.Marshal(input)
+	var fields map[string]any
+	_ = json.Unmarshal(b, &fields)
+	source := ""
+	for _, key := range []string{"url", "URL", "magnet", "Magnet", "file", "File"} {
+		if value, ok := fields[key].(string); ok && strings.TrimSpace(value) != "" {
+			source = strings.TrimSpace(value)
+			break
+		}
+	}
+	if strings.HasPrefix(strings.ToLower(source), "magnet:") {
+		if parsed, err := url.Parse(source); err == nil {
+			if hash := strings.ToLower(parsed.Query().Get("xt")); hash != "" {
+				return kind + "|magnet|" + hash
+			}
+		}
+	}
+	if source != "" {
+		return kind + "|source|" + strings.TrimRight(source, "/")
+	}
+	return kind + "|input|" + string(b)
+}
+
+// compactDuplicateJobs removes terminal records created by the old retry
+// implementation. A completed record wins; otherwise the newest terminal
+// record represents the logical video. Active records are never deleted.
+func (a *App) compactDuplicateJobs() int {
+	a.mu.Lock()
+	groups := make(map[string][]*Job)
+	for _, oid := range a.order {
+		if j := a.jobs[oid]; j != nil {
+			groups[jobSourceKey(j.Kind, j.Input)] = append(groups[jobSourceKey(j.Kind, j.Input)], j)
+		}
+	}
+	remove := make(map[string]bool)
+	for _, jobs := range groups {
+		if len(jobs) < 2 {
+			continue
+		}
+		var keep *Job
+		for _, j := range jobs {
+			if j.Status == "queued" || j.Status == "running" {
+				continue
+			}
+			if keep == nil ||
+				(j.Status == "done" && keep.Status != "done") ||
+				(j.Status == keep.Status && j.Created.After(keep.Created)) {
+				keep = j
+			}
+		}
+		if keep == nil {
+			continue
+		}
+		for _, j := range jobs {
+			if j.ID != keep.ID && (j.Status == "failed" || j.Status == "canceled" || j.Status == "done") {
+				remove[j.ID] = true
+			}
+		}
+	}
+	for oid := range remove {
+		delete(a.jobs, oid)
+	}
+	a.removeJobIDsLocked(remove)
+	count := len(remove)
+	a.mu.Unlock()
+	if count > 0 {
+		a.saveJobs()
+	}
+	return count
+}
+
 func (a *App) add(kind string, input any) *Job {
 	ctx, cancel := context.WithCancel(context.Background())
 	j := &Job{
@@ -628,15 +700,14 @@ func (a *App) retryJob(jobID string) (*Job, error) {
 	// A previous version created a new record for every retry. Collapse those
 	// terminal duplicates before retrying, and never start a second copy when
 	// the same input is already queued or running.
-	oldInput, _ := json.Marshal(old.Input)
+	oldSource := jobSourceKey(old.Kind, old.Input)
 	activeDuplicate := (*Job)(nil)
 	removeIDs := make(map[string]bool)
 	for oid, candidate := range a.jobs {
 		if oid == jobID || candidate == nil || candidate.Kind != old.Kind {
 			continue
 		}
-		candidateInput, _ := json.Marshal(candidate.Input)
-		if !bytes.Equal(oldInput, candidateInput) {
+		if jobSourceKey(candidate.Kind, candidate.Input) != oldSource {
 			continue
 		}
 		if candidate.Status == "queued" || candidate.Status == "running" {
@@ -4302,6 +4373,9 @@ func main() {
 		panic(err)
 	}
 	a.loadJobs()
+	if removed := a.compactDuplicateJobs(); removed > 0 {
+		fmt.Printf("compacted %d duplicate terminal jobs\n", removed)
+	}
 	a.loadChannels()
 	a.loadStats()
 	a.startChannelWatcher(context.Background())

@@ -98,6 +98,20 @@ func TestShortVideoDisablesChapterSplitting(t *testing.T) {
 	}
 }
 
+func TestCompactDuplicateJobsKeepsOneVideoRecord(t *testing.T) {
+	a := &App{cfg: Config{DataDir: filepath.Join(t.TempDir(), "not-created")}, jobs: map[string]*Job{}}
+	input := map[string]any{"url": "https://www.youtube.com/watch?v=video-1", "tags": "one"}
+	a.jobs["failed"] = &Job{ID: "failed", Kind: "pipeline", Status: "failed", Created: time.Unix(1, 0), Input: input}
+	a.jobs["done"] = &Job{ID: "done", Kind: "pipeline", Status: "done", Created: time.Unix(2, 0), Input: map[string]any{"url": input["url"], "tags": "two"}}
+	a.order = []string{"failed", "done"}
+	if removed := a.compactDuplicateJobs(); removed != 1 {
+		t.Fatalf("expected one duplicate removed, got %d", removed)
+	}
+	if len(a.jobs) != 1 || a.jobs["done"] == nil {
+		t.Fatalf("completed record was not preserved: %+v", a.jobs)
+	}
+}
+
 func TestMagnetValidationAndDeadSeedClassification(t *testing.T) {
 	if !validTorrentOrMagnet("magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567") {
 		t.Fatal("expected valid magnet URI")

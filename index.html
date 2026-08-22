@@ -675,6 +675,28 @@ a {
 .job-row:hover td { background: #16233b; }
 .job-row.expanded td { background: #182742; border-bottom: none; }
 
+.job-select-all {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  cursor: pointer;
+}
+
+.job-select-all input,
+.job-select input {
+  width: 16px;
+  height: 16px;
+  accent-color: var(--color-primary);
+  cursor: pointer;
+}
+
+.job-select {
+  display: inline-flex;
+  align-items: center;
+  margin-right: 8px;
+  vertical-align: middle;
+}
+
 .job-main-info {
   display: flex;
   align-items: flex-start;
@@ -2078,14 +2100,13 @@ textarea.form-control { min-height: 84px; resize: vertical; }
 
           <div class="panel-controls">
             <select id="kindSelect" class="form-control" style="min-height: 34px; padding: 5px 10px; font-size: 12px; width: auto;">
-              <option value="">全部类型</option>
+              <option value="">全部来源</option>
               <option value="pipeline">⚡ 全自动流水线</option>
               <option value="youtube">YouTube</option>
-              <option value="magnet">磁力下载</option>
-              <option value="biliup">Biliup 投稿</option>
+              <option value="magnet">种子</option>
             </select>
             <div class="search-box">
-              <input type="text" id="searchInput" placeholder="搜索 ID / 链接 / 标题…" />
+              <input type="text" id="searchInput" placeholder="搜索视频 / 标签 / ID…" />
               <button class="search-clear" id="searchClear" aria-label="清除搜索">×</button>
             </div>
             <button class="btn btn-secondary btn-small" id="btnClearDone" title="清理所有已完成、失败或取消的记录">
@@ -2102,6 +2123,9 @@ textarea.form-control { min-height: 84px; resize: vertical; }
               </svg>
               <span>一键重试 <b id="retryAllCount">0</b></span>
             </button>
+            <button class="btn btn-secondary btn-small" id="btnRetrySelected" title="重试选中的失败或已取消任务" disabled>
+              <span>重试所选 <b id="retrySelectedCount">0</b></span>
+            </button>
           </div>
         </div>
 
@@ -2109,7 +2133,7 @@ textarea.form-control { min-height: 84px; resize: vertical; }
           <table class="jobs-table">
             <thead>
               <tr>
-                <th style="width: 42%;">任务内容</th>
+                <th style="width: 42%;"><label class="job-select-all"><input type="checkbox" id="selectAllJobs" aria-label="全选当前可重试任务" /> 任务内容</label></th>
                 <th style="width: 16%;">状态 / 阶段</th>
                 <th style="width: 12%;">类型</th>
                 <th style="width: 16%;">创建时间</th>
@@ -2743,6 +2767,8 @@ let searchQuery = '';
 let mediaFilter = 'all';
 let mediaSearch = '';
 let expandedJobId = null;
+let selectedJobIds = new Set();
+let visibleRetryableIds = [];
 let currentModalTab = 'pipeline';
 let currentView = 'queue';
 let authConfig = { auth_enabled: false, authenticated: false, username: 'admin' };
@@ -2855,6 +2881,12 @@ function normalizeJob(j) {
     progress: j.progress || j.Progress || null,
     _raw: j
   };
+}
+
+function jobSourceKey(j) {
+  const input = j && j.input ? j.input : {};
+  const source = input.url || input.URL || input.magnet || input.Magnet || input.file || input.File || JSON.stringify(input);
+  return `${j.kind}|${String(source).trim().replace(/\/$/, '')}`;
 }
 
 function escapeHtml(s) {
@@ -3029,7 +3061,8 @@ function renderJobs() {
       const summary = getJobSummary(j).toLowerCase();
       const id = j.id.toLowerCase();
       const err = (j.error || '').toLowerCase();
-      if (!summary.includes(q) && !id.includes(q) && !err.includes(q)) return false;
+      const inputText = JSON.stringify(j.input || {}).toLowerCase();
+      if (!summary.includes(q) && !id.includes(q) && !err.includes(q) && !inputText.includes(q)) return false;
     }
     return true;
   });
@@ -3042,7 +3075,12 @@ function renderJobs() {
     if (rankDiff !== 0) return rankDiff;
     return new Date(b.created || 0) - new Date(a.created || 0);
   });
+  visibleRetryableIds = filtered
+    .filter(j => j.status === 'failed' || j.status === 'canceled')
+    .map(j => j.id);
+  selectedJobIds = new Set([...selectedJobIds].filter(id => rawJobs.some(j => j.id === id && (j.status === 'failed' || j.status === 'canceled'))));
   updateRetryAllButton();
+  updateSelectionControls();
 
   if (!filtered.length) {
     const isFiltered = activeStatusFilter || activeKindFilter || searchQuery;
@@ -3069,6 +3107,7 @@ function renderJobs() {
     html += `
       <tr class="job-row ${isExpanded ? 'expanded' : ''}" onclick="toggleExpand('${escapeHtml(j.id)}', event)">
         <td>
+          ${(j.status === 'failed' || j.status === 'canceled') ? `<label class="job-select" onclick="event.stopPropagation()"><input type="checkbox" aria-label="选择任务 ${escapeHtml(j.id)}" ${selectedJobIds.has(j.id) ? 'checked' : ''} onchange="toggleJobSelection('${escapeHtml(j.id)}', this.checked)" /></label>` : ''}
           <div class="job-main-info">
             ${renderTypeIcon(j.kind)}
             <div style="min-width:0;">
@@ -3547,11 +3586,9 @@ function retryableJobs() {
   rawJobs
     .filter(j => j.status === 'failed' || j.status === 'canceled')
     .forEach(j => {
-      let inputKey = '';
-      try { inputKey = JSON.stringify(j.input); } catch (_) { inputKey = String(j.input); }
       // Retry one logical task once, even if old versions left many terminal
       // records behind for the same input.
-      unique.set(`${j.kind}|${inputKey}`, j);
+      unique.set(jobSourceKey(j), j);
     });
   return [...unique.values()];
 }
@@ -3565,19 +3602,42 @@ function updateRetryAllButton() {
   }
 }
 
-async function retryAllJobs() {
-  const candidates = retryableJobs();
+function updateSelectionControls() {
+  const selected = [...selectedJobIds].filter(id => visibleRetryableIds.includes(id));
+  const button = $('#btnRetrySelected');
+  if (button) {
+    button.disabled = selected.length === 0;
+    button.querySelector('span').innerHTML = `重试所选 <b id="retrySelectedCount">${selected.length}</b>`;
+  }
+  const selectAll = $('#selectAllJobs');
+  if (selectAll) {
+    selectAll.checked = visibleRetryableIds.length > 0 && selected.length === visibleRetryableIds.length;
+    selectAll.indeterminate = selected.length > 0 && selected.length < visibleRetryableIds.length;
+    selectAll.disabled = visibleRetryableIds.length === 0;
+  }
+}
+
+function toggleJobSelection(id, checked) {
+  if (checked) selectedJobIds.add(id);
+  else selectedJobIds.delete(id);
+  updateSelectionControls();
+}
+
+function toggleSelectAll(checked) {
+  visibleRetryableIds.forEach(id => {
+    if (checked) selectedJobIds.add(id);
+    else selectedJobIds.delete(id);
+  });
+  renderJobs();
+}
+
+async function retryJobs(candidates, label) {
   if (!candidates.length) {
     toast('当前没有失败或已取消的任务', 'info');
     return;
   }
-  if (!confirm(`确定重新提交全部 ${candidates.length} 个失败/已取消任务吗？`)) return;
+  if (!confirm(`确定重试${label} ${candidates.length} 个任务吗？`)) return;
 
-  const button = $('#btnRetryAll');
-  if (button) {
-    button.disabled = true;
-    button.querySelector('span').textContent = '正在重试…';
-  }
   let succeeded = 0;
   let failed = 0;
   for (const job of candidates) {
@@ -3589,9 +3649,21 @@ async function retryAllJobs() {
       failed++;
     }
   }
+  selectedJobIds.clear();
   await fetchJobs();
   await fetchMediaPackages();
-  toast(`已重新提交 ${succeeded} 个任务${failed ? `，${failed} 个失败` : ''}`, failed ? 'error' : 'success');
+  toast(`已重试 ${succeeded} 个任务${failed ? `，${failed} 个失败` : ''}`, failed ? 'error' : 'success');
+}
+
+async function retryAllJobs() {
+  await retryJobs(retryableJobs(), '全部失败/已取消');
+}
+
+async function retrySelectedJobs() {
+  const chosen = rawJobs.filter(j => selectedJobIds.has(j.id) && (j.status === 'failed' || j.status === 'canceled'));
+  const unique = new Map();
+  chosen.forEach(j => unique.set(jobSourceKey(j), j));
+  await retryJobs([...unique.values()], '所选');
 }
 
 async function clearAllFinished() {
@@ -4009,6 +4081,8 @@ document.addEventListener('DOMContentLoaded', () => {
   $('#modalClose').addEventListener('click', closeModal);
   $('#btnClearDone').addEventListener('click', clearAllFinished);
   $('#btnRetryAll').addEventListener('click', retryAllJobs);
+  $('#btnRetrySelected').addEventListener('click', retrySelectedJobs);
+  $('#selectAllJobs').addEventListener('change', e => toggleSelectAll(e.target.checked));
 
   $$('.filter-tab[data-status]').forEach(tab => {
     tab.addEventListener('click', () => {
