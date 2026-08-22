@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -163,5 +165,55 @@ fi
 	b, _ := os.ReadFile(state)
 	if strings.TrimSpace(string(b)) != "2" {
 		t.Fatalf("expected fallback attempt, calls=%q", b)
+	}
+}
+
+func TestMultiPartUploadTranslatesPartTitles(t *testing.T) {
+	bin, argsFile := writeMockBiliup(t, `
+printf '%s\n' "$@" > "$MOCK_STATE"
+echo 'code: 0 BV1AbCDeFgH1 投稿成功'
+`)
+	partDir := t.TempDir()
+	partOne := filepath.Join(partDir, "Episode 01 - The Beginning.mp4")
+	partTwo := filepath.Join(partDir, "Episode 02 - The Return.mp4")
+	for _, file := range []string{partOne, partTwo} {
+		if err := os.WriteFile(file, []byte("video"), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	llm := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"{\"title\":\"中文分P标题\",\"summary\":\"\",\"tags\":[],\"tid\":\"188\"}"}}]}`))
+	}))
+	defer llm.Close()
+
+	a := &App{cfg: Config{Biliup: bin, BiliCookies: "unused", DeepSeekKey: "test", DeepSeekURL: llm.URL}}
+	oldState := os.Getenv("MOCK_STATE")
+	if err := os.Setenv("MOCK_STATE", argsFile); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Setenv("MOCK_STATE", oldState)
+
+	out, logs, err := a.executeBiliupUpload(context.Background(), uploadReq{
+		Files:     []string{partOne, partTwo},
+		Translate: true,
+		Parts:     true,
+	})
+	if err != nil {
+		t.Fatalf("expected multi-part upload to succeed: %v; logs=%s", err, logs)
+	}
+	if out["translated_parts"] != 2 || !strings.Contains(logs, "[分P标题翻译] P1") || !strings.Contains(logs, "[分P标题翻译] P2") {
+		t.Fatalf("part translation result missing: out=%v logs=%s", out, logs)
+	}
+	args, err := os.ReadFile(argsFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(args), "P01 - 中文分P标题.mp4") || !strings.Contains(string(args), "P02 - 中文分P标题.mp4") {
+		t.Fatalf("translated part filenames were not passed to biliup: %s", args)
+	}
+	if _, err := os.Stat(partOne); err != nil {
+		t.Fatalf("original part was unexpectedly removed: %v", err)
 	}
 }

@@ -869,6 +869,42 @@ a {
   padding: 16px;
 }
 
+.media-overview {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px;
+  padding: 16px 16px 0;
+}
+
+.media-overview-card {
+  background: linear-gradient(145deg, rgba(19, 34, 58, 0.92), rgba(12, 20, 36, 0.92));
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  padding: 12px 14px;
+  min-width: 0;
+}
+
+.media-overview-label {
+  color: var(--color-text-dim);
+  font-size: 11px;
+  margin-bottom: 4px;
+}
+
+.media-overview-value {
+  color: #fff;
+  font: 700 20px/1.2 'JetBrains Mono', monospace;
+  letter-spacing: -0.04em;
+}
+
+.media-overview-note {
+  color: var(--color-text-muted);
+  font-size: 11px;
+  margin-top: 3px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 .media-item {
   background: #0e172a;
   border: 1px solid var(--color-border);
@@ -973,6 +1009,19 @@ a {
   align-items: center;
   gap: 8px;
   flex-shrink: 0;
+}
+
+.media-actions .btn-danger {
+  opacity: .72;
+}
+
+.media-item:hover .media-actions .btn-danger,
+.media-actions .btn-danger:focus-visible {
+  opacity: 1;
+}
+
+@media (max-width: 900px) {
+  .media-overview { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
 
 /* Video Player Modal */
@@ -1520,6 +1569,10 @@ textarea.form-control { min-height: 84px; resize: vertical; }
     padding: 14px;
   }
 
+  .media-overview { padding: 12px 12px 0; gap: 8px; }
+  .media-overview-card { padding: 10px 12px; }
+  .media-overview-value { font-size: 18px; }
+
   .media-thumb-box {
     width: 100%;
     height: 180px;
@@ -2060,6 +2113,28 @@ textarea.form-control { min-height: 84px; resize: vertical; }
 
     <!-- SECTION 3: CLEAN MEDIA FILE MANAGER -->
     <div id="section-files" class="view-section">
+      <div class="media-overview" aria-label="媒体库概览">
+        <article class="media-overview-card">
+          <div class="media-overview-label">媒体项目</div>
+          <div class="media-overview-value" id="mediaStatTotal">0</div>
+          <div class="media-overview-note">按媒体目录合并重复记录</div>
+        </article>
+        <article class="media-overview-card">
+          <div class="media-overview-label">可直接使用</div>
+          <div class="media-overview-value" id="mediaStatReady">0</div>
+          <div class="media-overview-note">已检测到完整视频文件</div>
+        </article>
+        <article class="media-overview-card">
+          <div class="media-overview-label">待清理</div>
+          <div class="media-overview-value" id="mediaStatIncomplete">0</div>
+          <div class="media-overview-note">临时分片或未完成目录</div>
+        </article>
+        <article class="media-overview-card">
+          <div class="media-overview-label">占用空间</div>
+          <div class="media-overview-value" id="mediaStatSize">0 B</div>
+          <div class="media-overview-note" id="mediaStatParts">0 个分 P 视频</div>
+        </article>
+      </div>
       <div class="panel">
         <div class="panel-toolbar">
           <div class="filter-tabs">
@@ -2076,7 +2151,7 @@ textarea.form-control { min-height: 84px; resize: vertical; }
               <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                 <path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83"></path>
               </svg>
-              <span>🧹 清理缓存与残留</span>
+              <span>清理残留</span>
             </button>
             <button class="btn btn-secondary btn-small" onclick="fetchMediaPackages(true)">
               <span>刷新文件</span>
@@ -3008,9 +3083,36 @@ function renderJobs() {
 // =======================================
 // RENDER CLEAN MEDIA PACKAGES (FILE MANAGER)
 // =======================================
+function formatMediaBytes(bytes) {
+  if (!bytes || bytes < 1024) return `${bytes || 0} B`;
+  const units = ['KB', 'MB', 'GB', 'TB'];
+  let value = bytes;
+  let unit = 'B';
+  for (const next of units) {
+    value /= 1024;
+    unit = next;
+    if (value < 1024) break;
+  }
+  return `${value.toFixed(value >= 10 ? 0 : 1)} ${unit}`;
+}
+
 function renderMedia() {
   const container = $('#mediaListContainer');
-  let filtered = rawMedia.filter(m => {
+  // A package is a directory, not a video file. Collapse accidental duplicate
+  // API rows by directory so refreshes never create repeated cards.
+  const unique = [...new Map(rawMedia.map(m => [m.folder || `${m.source}/${m.id}`, m])).values()]
+    .sort((a, b) => new Date(b.mod_time || 0) - new Date(a.mod_time || 0));
+  const totalBytes = unique.reduce((sum, m) => sum + (Number(m.total_size) || 0), 0);
+  const readyCount = unique.filter(m => m.status === 'ready' || m.video_file).length;
+  const incompleteCount = unique.filter(m => m.status === 'incomplete' || m.has_part).length;
+  const partCount = unique.reduce((sum, m) => sum + Math.max(Number(m.video_count) || 0, 0), 0);
+  $('#mediaStatTotal').textContent = unique.length;
+  $('#mediaStatReady').textContent = readyCount;
+  $('#mediaStatIncomplete').textContent = incompleteCount;
+  $('#mediaStatSize').textContent = formatMediaBytes(totalBytes);
+  $('#mediaStatParts').textContent = `${partCount} 个视频文件 · 已按目录归并`;
+
+  let filtered = unique.filter(m => {
     if (mediaFilter === 'youtube' && m.source !== 'youtube') return false;
     if (mediaFilter === 'magnet' && m.source !== 'magnet') return false;
     if (mediaSearch) {
@@ -3020,9 +3122,9 @@ function renderMedia() {
     return true;
   });
 
-  const ytCount = rawMedia.filter(m => m.source === 'youtube').length;
-  const magCount = rawMedia.filter(m => m.source === 'magnet').length;
-  $('#mediaCountAll').textContent = rawMedia.length;
+  const ytCount = unique.filter(m => m.source === 'youtube').length;
+  const magCount = unique.filter(m => m.source === 'magnet').length;
+  $('#mediaCountAll').textContent = unique.length;
   $('#mediaCountYt').textContent = ytCount;
   $('#mediaCountMag').textContent = magCount;
 

@@ -942,6 +942,20 @@ func purgeVideoFiles(files ...string) int64 {
 	return freed
 }
 
+func (a *App) purgeManagedVideoFiles(files ...string) int64 {
+	root := filepath.Clean(a.cfg.DataDir)
+	managed := make([]string, 0, len(files))
+	for _, file := range files {
+		clean := filepath.Clean(file)
+		rel, err := filepath.Rel(root, clean)
+		if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel) {
+			continue
+		}
+		managed = append(managed, clean)
+	}
+	return purgeVideoFiles(managed...)
+}
+
 // Magnet Downloader
 type magnetReq struct {
 	Magnet     string `json:"magnet"`
@@ -1029,6 +1043,7 @@ func (a *App) createMagnetHandler(q magnetReq) func(*Job) {
 			_ = os.MkdirAll(d, 0750)
 
 			var baseFiles []string
+			var videoFiles []string
 			var videoFile string
 			var totalLogs string
 			var downloadErr error
@@ -1088,15 +1103,17 @@ func (a *App) createMagnetHandler(q magnetReq) func(*Job) {
 					baseFiles = append(baseFiles, name)
 					ext := strings.ToLower(filepath.Ext(name))
 					if ext == ".mp4" || ext == ".mkv" || ext == ".avi" || ext == ".webm" || ext == ".mp3" {
+						videoFiles = append(videoFiles, p)
 						if videoFile == "" || ext == ".mp4" {
 							videoFile = p
 						}
 					}
 					return nil
 				})
+				sort.Strings(videoFiles)
 			}()
 
-			outMap := map[string]any{"dir": d, "files": baseFiles, "video_file": videoFile}
+			outMap := map[string]any{"dir": d, "files": baseFiles, "video_file": videoFile, "video_files": videoFiles, "is_multi_p": len(videoFiles) > 1}
 
 			if downloadErr != nil {
 				if errors.Is(downloadErr, context.Canceled) {
@@ -1108,8 +1125,8 @@ func (a *App) createMagnetHandler(q magnetReq) func(*Job) {
 			}
 
 			downBytes := int64(0)
-			if videoFile != "" {
-				downBytes = calcFilesSize([]string{videoFile})
+			if len(videoFiles) > 0 {
+				downBytes = calcFilesSize(videoFiles)
 			}
 			if downBytes == 0 {
 				downBytes = calcDirSize(d)
@@ -1117,7 +1134,7 @@ func (a *App) createMagnetHandler(q magnetReq) func(*Job) {
 			a.recordDownload(downBytes)
 
 			// If AutoUpload requested, enter Stage 2 (acquires uploadSlots)
-			if q.AutoUpload && videoFile != "" {
+			if q.AutoUpload && len(videoFiles) > 0 {
 				var uploadOut map[string]any
 				var uploadLogs string
 				var uploadErr error
@@ -1141,10 +1158,11 @@ func (a *App) createMagnetHandler(q magnetReq) func(*Job) {
 					a.setStep(nj, "B站投稿中")
 					uploadOut, uploadLogs, uploadErr = a.executeBiliupUpload(nj.ctx, uploadReq{
 						File:      videoFile,
+						Files:     videoFiles,
 						Translate: q.Translate,
 						Tid:       q.Tid,
 						Tag:       q.Tags,
-						Parts:     true,
+						Parts:     len(videoFiles) > 1,
 						Source:    m,
 					})
 					totalLogs += "\n--- BILIUP UPLOAD LOGS ---\n" + uploadLogs
@@ -1161,7 +1179,7 @@ func (a *App) createMagnetHandler(q magnetReq) func(*Job) {
 					return
 				}
 
-				upBytes := calcFilesSize([]string{videoFile})
+				upBytes := calcFilesSize(videoFiles)
 				if upBytes == 0 {
 					upBytes = downBytes
 				}
@@ -1171,7 +1189,7 @@ func (a *App) createMagnetHandler(q magnetReq) func(*Job) {
 					a.recordAiTrans()
 				}
 
-				freed := purgeVideoFiles(videoFile)
+				freed := purgeVideoFiles(videoFiles...)
 				if freed > 0 {
 					totalLogs += fmt.Sprintf("\n[自动空间清理] B站投稿成功，已自动清除原视频文件，释放磁盘空间: %s\n", formatBytes(freed))
 					outMap["cleaned_disk"] = formatBytes(freed)
@@ -1349,6 +1367,71 @@ func (a *App) sanitizeBiliCover(ctx context.Context, coverPath string) string {
 	return coverPath
 }
 
+func partTitleFromFile(file string) string {
+	name := strings.TrimSuffix(filepath.Base(file), filepath.Ext(file))
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return "分P"
+	}
+	return name
+}
+
+func safePartFilename(title string, index int, ext string) string {
+	title = strings.TrimSpace(strings.NewReplacer("/", "-", "\\", "-", ":", "：", "\x00", "").Replace(title))
+	if title == "" {
+		title = "分P"
+	}
+	runes := []rune(title)
+	if len(runes) > 150 {
+		runes = runes[:150]
+	}
+	return fmt.Sprintf("P%02d - %s%s", index+1, strings.TrimSpace(string(runes)), ext)
+}
+
+// prepareTranslatedPartFiles creates lightweight symlinks whose basenames are
+// translated. biliup uses each uploaded basename as the Bilibili P title, while
+// --title only controls the parent稿件 title. Keeping the originals untouched
+// lets retry/cleanup continue to operate on the real media files.
+func (a *App) prepareTranslatedPartFiles(ctx context.Context, files []string) ([]string, func(), int, string) {
+	translated := append([]string(nil), files...)
+	tmpDir := ""
+	translatedCount := 0
+	var logs strings.Builder
+	cleanup := func() {
+		if tmpDir != "" {
+			_ = os.RemoveAll(tmpDir)
+		}
+	}
+
+	for i, file := range files {
+		partTitle := partTitleFromFile(file)
+		result, err := a.aiEnhanceMetadata(ctx, partTitle, "")
+		if err != nil || result == nil || strings.TrimSpace(result.Title) == "" {
+			continue
+		}
+		translatedTitle := sanitizeBiliTitle(result.Title)
+		if translatedTitle == "" || translatedTitle == partTitle {
+			continue
+		}
+		if tmpDir == "" {
+			var mkErr error
+			tmpDir, mkErr = os.MkdirTemp(filepath.Dir(file), ".y2b-translated-parts-")
+			if mkErr != nil {
+				tmpDir = ""
+				continue
+			}
+		}
+		target := filepath.Join(tmpDir, safePartFilename(translatedTitle, i, filepath.Ext(file)))
+		if err := os.Symlink(file, target); err != nil {
+			continue
+		}
+		translated[i] = target
+		translatedCount++
+		logs.WriteString(fmt.Sprintf("[分P标题翻译] P%d: %s -> %s\n", i+1, partTitle, translatedTitle))
+	}
+	return translated, cleanup, translatedCount, logs.String()
+}
+
 func (a *App) executeBiliupUpload(ctx context.Context, q uploadReq) (map[string]any, string, error) {
 	if a.cfg.UploadTimeout > 0 {
 		var cancel context.CancelFunc
@@ -1361,6 +1444,14 @@ func (a *App) executeBiliupUpload(ctx context.Context, q uploadReq) (map[string]
 	}
 	if len(files) == 0 {
 		return nil, "", errors.New("no files provided for upload")
+	}
+	uploadFiles := files
+	cleanupTranslated := func() {}
+	translatedCount := 0
+	partTranslateLogs := ""
+	if q.Translate {
+		uploadFiles, cleanupTranslated, translatedCount, partTranslateLogs = a.prepareTranslatedPartFiles(ctx, files)
+		defer cleanupTranslated()
 	}
 
 	desc := sanitizeBiliDesc(q.Description)
@@ -1421,7 +1512,7 @@ func (a *App) executeBiliupUpload(ctx context.Context, q uploadReq) (map[string]
 
 	for _, ep := range submitEndpoints {
 		attempt++
-		args := append([]string{"--user-cookie", a.cfg.BiliCookies, "upload"}, files...)
+		args := append([]string{"--user-cookie", a.cfg.BiliCookies, "upload"}, uploadFiles...)
 		args = append(args, "--title", title, "--desc", desc)
 
 		if useCover && cover != "" {
@@ -1443,7 +1534,7 @@ func (a *App) executeBiliupUpload(ctx context.Context, q uploadReq) (map[string]
 			// Multi-P uploads benefit from biliup's bounded parallelism. Keep
 			// single-video uploads conservative, but use three workers for the
 			// pipeline's chapter parts unless the caller explicitly overrides it.
-			if q.Parts && len(files) > 1 {
+			if q.Parts && len(uploadFiles) > 1 {
 				limit = "3"
 			} else {
 				limit = "1"
@@ -1555,6 +1646,10 @@ finish:
 		"bvid":        bvid,
 		"bili_url":    biliURL,
 	}
+	if translatedCount > 0 {
+		totalLogs = partTranslateLogs + totalLogs
+		res["translated_parts"] = translatedCount
+	}
 	return res, totalLogs, execErr
 }
 
@@ -1574,6 +1669,24 @@ func (a *App) createUploadHandler(q uploadReq) func(*Job) {
 		go a.runWithSlot(nj, a.uploadSlots, func() (any, string, error) {
 			a.setStep(nj, "B站投稿中")
 			out, logs, err := a.executeBiliupUpload(nj.ctx, q)
+			if err == nil {
+				// Direct uploads from the media library should have the same
+				// post-success cleanup behavior as the auto pipeline. Keep
+				// metadata (cover/subtitles/description) for audit and retry
+				// context, but remove only the video files that were uploaded.
+				files := q.Files
+				if len(files) == 0 && q.File != "" {
+					files = []string{q.File}
+				}
+				if freed := a.purgeManagedVideoFiles(files...); freed > 0 {
+					if out == nil {
+						out = map[string]any{}
+					}
+					freedStr := formatBytes(freed)
+					logs += fmt.Sprintf("\n[自动空间清理] B站投稿成功，已自动删除原视频文件，释放磁盘空间: %s\n", freedStr)
+					out["cleaned_disk"] = freedStr
+				}
+			}
 			return out, logs, err
 		})
 	}
@@ -1797,6 +1910,7 @@ func (a *App) createPipelineHandler(q pipelineReq) func(*Job) {
 						}
 						return nil
 					})
+					sort.Strings(targetUploadFiles)
 				}
 			}()
 
