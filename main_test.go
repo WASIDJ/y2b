@@ -641,6 +641,66 @@ func TestAdjacentCoverContext(t *testing.T) {
 	_ = adjacentCover(ctx, filepath.Join(dir, "nonexistent.mp4"))
 }
 
+func TestConvertVttToSrtAndBccRobustness(t *testing.T) {
+	dir := t.TempDir()
+	vttContent := `WEBVTT
+
+1
+00:00:01.000 --> 00:00:04.000
+First subtitle line <c.colorCCCCCC>with tag</c>
+and second line
+
+2
+00:00:05.500 --> 00:00:08.000
+Second subtitle without gap
+00:00:08.000 --> 00:00:10.000
+Third subtitle immediate next
+`
+	vttFile := filepath.Join(dir, "video.zh-Hans.vtt")
+	if err := os.WriteFile(vttFile, []byte(vttContent), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	convertVttToSrtAndBcc(dir)
+
+	srtFile := filepath.Join(dir, "video.zh-Hans.srt")
+	srtBytes, err := os.ReadFile(srtFile)
+	if err != nil {
+		t.Fatalf("expected srt file to be generated: %v", err)
+	}
+	srtContent := string(srtBytes)
+	if !strings.Contains(srtContent, "First subtitle line with tag") || !strings.Contains(srtContent, "Second subtitle without gap") || !strings.Contains(srtContent, "Third subtitle immediate next") {
+		t.Fatalf("srt missing expected cues: %s", srtContent)
+	}
+
+	bccFile := filepath.Join(dir, "video.zh-Hans.bcc")
+	bccBytes, err := os.ReadFile(bccFile)
+	if err != nil {
+		t.Fatalf("expected bcc file to be generated: %v", err)
+	}
+	if !strings.Contains(string(bccBytes), "Third subtitle immediate next") {
+		t.Fatalf("bcc missing cues: %s", string(bccBytes))
+	}
+}
+
+func TestBuildYTDLPAndAria2ArgsHelpers(t *testing.T) {
+	ytArgs := buildYTDLPArgs("https://youtu.be/test", "1080p", "zh", "/path/to/cookies.txt", false, false, "/tmp/dir")
+	if len(ytArgs) == 0 {
+		t.Fatal("empty yt-dlp args")
+	}
+	joined := strings.Join(ytArgs, " ")
+	if !strings.Contains(joined, "--no-playlist") || !strings.Contains(joined, "--cookies /path/to/cookies.txt") {
+		t.Fatalf("unexpected yt args: %s", joined)
+	}
+
+	ariaArgs := buildAria2Args("magnet:?xt=urn:btih:123", "/tmp/dir", "1", "6881")
+	joinedAria := strings.Join(ariaArgs, " ")
+	if !strings.Contains(joinedAria, "--select-file=1") || !strings.Contains(joinedAria, "--listen-port=6881") {
+		t.Fatalf("unexpected aria args: %s", joinedAria)
+	}
+}
+
+
 
 
 

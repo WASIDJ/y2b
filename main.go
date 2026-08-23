@@ -1373,13 +1373,6 @@ func (b *limitedBuffer) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
-
 func trim200(s string) string {
 	s = strings.TrimSpace(s)
 	for len([]rune(s)) > 200 {
@@ -1474,6 +1467,114 @@ func (a *App) youtube(w http.ResponseWriter, r *http.Request) {
 	jsonResp(w, 202, j)
 }
 
+const defaultBTTrackers = "udp://tracker.opentrackr.org:1337/announce,udp://open.tracker.cl:1337/announce,udp://tracker.openbittorrent.com:6969/announce,http://tracker.openbittorrent.com:80/announce,udp://opentracker.i2p.rocks:6969/announce,udp://open.demonii.com:1337/announce"
+
+func buildYTDLPArgs(rawURL, quality, subLangs, cookiePath string, isPlaylist, splitChapters bool, destDir string) []string {
+	langs := strings.TrimSpace(subLangs)
+	if langs == "" {
+		langs = "zh-Hans,zh,en,zh-Hant"
+	}
+	args := []string{
+		"--ignore-errors",
+		"--no-abort-on-error",
+		"--buffer-size", "16K",
+		"--http-chunk-size", "10M",
+		"--concurrent-fragments", "1",
+		"--no-cache-dir",
+		"--no-plugin-dirs",
+		"--newline",
+		"--progress-template", "download:%(progress._percent_str)s|%(progress.downloaded_bytes)s|%(progress.total_bytes)s|%(progress.speed)s|%(progress.eta)s|%(info.title)s",
+		"--postprocessor-args", "ffmpeg:-threads 1",
+		"--extractor-args", "youtube:player_client=android,ios,web,tv_downgraded,default",
+	}
+	if isPlaylist {
+		args = append(args, "--yes-playlist")
+	} else {
+		args = append(args, "--no-playlist")
+	}
+	if cookiePath != "" {
+		args = append(args, "--cookies", cookiePath)
+	}
+	if langs != "none" && langs != "no" {
+		args = append(args, "--write-subs", "--sub-langs", langs)
+	}
+
+	switch quality {
+	case "audio_only":
+		args = append(args, "-x", "--audio-format", "mp3")
+	case "720p":
+		args = append(args, "-f", "22/bv*[height<=720][ext=mp4]+ba[ext=m4a]/b[height<=720][ext=mp4]/bv*[height<=720]+ba/b/18")
+	case "1080p":
+		args = append(args, "-f", "bv*[height<=1080][ext=mp4]+ba[ext=m4a]/b[height<=1080][ext=mp4]/bv*[height<=1080]+ba/b/22/18")
+	default:
+		args = append(args, "-f", "bv*[ext=mp4]+ba[ext=m4a]/bv*+ba/b[ext=mp4]/b/22/18")
+	}
+
+	if isPlaylist {
+		if splitChapters {
+			args = append(args,
+				"--split-chapters",
+				"-o", "chapter:"+filepath.Join(destDir, "P%(playlist_index|1)02d - C%(section_number)02d. %(section_title)s.%(ext)s"),
+			)
+		}
+		args = append(args,
+			"--write-thumbnail",
+			"--write-description",
+			"--embed-metadata",
+			"--merge-output-format", "mp4",
+			"-o", filepath.Join(destDir, "P%(playlist_index|1)02d. %(title)s [%(id)s].%(ext)s"),
+			rawURL,
+		)
+	} else {
+		if splitChapters {
+			args = append(args,
+				"--split-chapters",
+				"-o", "chapter:"+filepath.Join(destDir, "%(title)s - P%(section_number)02d. %(section_title)s.%(ext)s"),
+			)
+		}
+		args = append(args,
+			"--write-thumbnail",
+			"--write-description",
+			"--embed-metadata",
+			"--merge-output-format", "mp4",
+			"-o", filepath.Join(destDir, "%(title)s [%(id)s].%(ext)s"),
+			rawURL,
+		)
+	}
+	return args
+}
+
+func buildAria2Args(targetURL, destDir, selectFile, btPort string) []string {
+	magnetArgs := []string{
+		"--dir=" + destDir,
+		"--continue=true",
+		"--allow-overwrite=false",
+		"--seed-time=0",
+		"--file-allocation=none",
+		"--disk-cache=16M",
+		"--timeout=30",
+		"--connect-timeout=15",
+		"--bt-tracker-connect-timeout=15",
+		"--bt-tracker-timeout=20",
+		"--listen-port=" + btPort,
+		"--max-connection-per-server=4",
+		"--bt-max-peers=60",
+		"--max-concurrent-downloads=1",
+		"--enable-dht=true",
+		"--enable-peer-exchange=true",
+		"--bt-enable-lpd=true",
+		"--follow-torrent=mem",
+		"--bt-stop-timeout=300",
+		"--summary-interval=1",
+		"--bt-tracker=" + defaultBTTrackers,
+		targetURL,
+	}
+	if strings.TrimSpace(selectFile) != "" {
+		magnetArgs = append(magnetArgs, "--select-file="+strings.TrimSpace(selectFile))
+	}
+	return magnetArgs
+}
+
 func (a *App) createYoutubeHandler(q youtubeReq) func(*Job) {
 	return func(nj *Job) {
 		go func() {
@@ -1509,85 +1610,12 @@ func (a *App) createYoutubeHandler(q youtubeReq) func(*Job) {
 				cookiePath, cleanup, _ := prepareCookies(a.cfg.Cookies, d)
 				defer cleanup()
 
-				langs := strings.TrimSpace(q.SubLangs)
-				if langs == "" {
-					langs = "zh-Hans,zh,en,zh-Hant"
-				}
 				isPlaylist := isPlaylistURL(q.URL)
 				splitChapters, splitLog := a.chapterSplitDecision(nj.ctx, q.URL, cookiePath, q.SplitChapters)
 				if splitLog != "" {
 					totalLogs += splitLog + "\n"
 				}
-				args := []string{
-					"--ignore-errors",
-					"--no-abort-on-error",
-					"--buffer-size", "16K",
-					"--http-chunk-size", "10M",
-					"--concurrent-fragments", "1",
-					"--no-cache-dir",
-					"--no-plugin-dirs",
-					"--newline",
-					"--progress-template", "download:%(progress._percent_str)s|%(progress.downloaded_bytes)s|%(progress.total_bytes)s|%(progress.speed)s|%(progress.eta)s|%(info.title)s",
-					"--postprocessor-args", "ffmpeg:-threads 1",
-					"--extractor-args", "youtube:player_client=android,ios,web,tv_downgraded,default",
-				}
-				if isPlaylist {
-					args = append(args, "--yes-playlist")
-				} else {
-					args = append(args, "--no-playlist")
-				}
-				if cookiePath != "" {
-					args = append(args, "--cookies", cookiePath)
-				}
-				if langs != "none" && langs != "no" {
-					// Keep subtitles as sidecar files. They are submitted to Bilibili
-					// after the video gets a BVID; embedding them here caused yt-dlp
-					// to remove the source files and produced a generic data stream.
-					args = append(args, "--write-subs", "--sub-langs", langs)
-				}
-
-				switch q.Quality {
-				case "audio_only":
-					args = append(args, "-x", "--audio-format", "mp3")
-				case "720p":
-					args = append(args, "-f", "22/bv*[height<=720][ext=mp4]+ba[ext=m4a]/b[height<=720][ext=mp4]/bv*[height<=720]+ba/b/18")
-				case "1080p":
-					args = append(args, "-f", "bv*[height<=1080][ext=mp4]+ba[ext=m4a]/b[height<=1080][ext=mp4]/bv*[height<=1080]+ba/b/22/18")
-				default:
-					args = append(args, "-f", "bv*[ext=mp4]+ba[ext=m4a]/bv*+ba/b[ext=mp4]/b/22/18")
-				}
-
-				if isPlaylist {
-					if splitChapters {
-						args = append(args,
-							"--split-chapters",
-							"-o", "chapter:"+filepath.Join(d, "P%(playlist_index|1)02d - C%(section_number)02d. %(section_title)s.%(ext)s"),
-						)
-					}
-					args = append(args,
-						"--write-thumbnail",
-						"--write-description",
-						"--embed-metadata",
-						"--merge-output-format", "mp4",
-						"-o", filepath.Join(d, "P%(playlist_index|1)02d. %(title)s [%(id)s].%(ext)s"),
-						q.URL,
-					)
-				} else {
-					if splitChapters {
-						args = append(args,
-							"--split-chapters",
-							"-o", "chapter:"+filepath.Join(d, "%(title)s - P%(section_number)02d. %(section_title)s.%(ext)s"),
-						)
-					}
-					args = append(args,
-						"--write-thumbnail",
-						"--write-description",
-						"--embed-metadata",
-						"--merge-output-format", "mp4",
-						"-o", filepath.Join(d, "%(title)s [%(id)s].%(ext)s"),
-						q.URL,
-					)
-				}
+				args := buildYTDLPArgs(q.URL, q.Quality, q.SubLangs, cookiePath, isPlaylist, splitChapters, d)
 
 				ytLogs, err := runCmdProgress(nj.ctx, a.cfg.YTDLP, args, func(line string) { a.progressLine(nj, "YouTube 下载", line) })
 				totalLogs = ytLogs
@@ -2504,34 +2532,7 @@ func (a *App) createMagnetHandler(q magnetReq) func(*Job) {
 
 				a.set(nj, "running", "", nil, "")
 				a.setStep(nj, "磁力下载中")
-				btTrackers := "udp://tracker.opentrackr.org:1337/announce,udp://open.tracker.cl:1337/announce,udp://tracker.openbittorrent.com:6969/announce,http://tracker.openbittorrent.com:80/announce,udp://opentracker.i2p.rocks:6969/announce,udp://open.demonii.com:1337/announce"
-				magnetArgs := []string{
-					"--dir=" + d,
-					"--continue=true",
-					"--allow-overwrite=false",
-					"--seed-time=0",
-					"--file-allocation=none",
-					"--disk-cache=16M",
-					"--timeout=30",
-					"--connect-timeout=15",
-					"--bt-tracker-connect-timeout=15",
-					"--bt-tracker-timeout=20",
-					"--listen-port=" + a.cfg.BTListenPort,
-					"--max-connection-per-server=4",
-					"--bt-max-peers=60",
-					"--max-concurrent-downloads=1",
-					"--enable-dht=true",
-					"--enable-peer-exchange=true",
-					"--bt-enable-lpd=true",
-					"--follow-torrent=mem",
-					"--bt-stop-timeout=300",
-					"--summary-interval=1",
-					"--bt-tracker=" + btTrackers,
-					m,
-				}
-				if strings.TrimSpace(q.SelectFile) != "" {
-					magnetArgs = append(magnetArgs, "--select-file="+strings.TrimSpace(q.SelectFile))
-				}
+				magnetArgs := buildAria2Args(m, d, q.SelectFile, a.cfg.BTListenPort)
 				var magLogs string
 				var err error
 				// A streamed upload has no single review record for the whole
@@ -3307,84 +3308,12 @@ func (a *App) createPipelineHandler(q pipelineReq) func(*Job) {
 					cookiePath, cleanup, _ := prepareCookies(a.cfg.Cookies, d)
 					defer cleanup()
 
-					langs := strings.TrimSpace(q.SubLangs)
-					if langs == "" {
-						langs = "zh-Hans,zh,en,zh-Hant"
-					}
 					isPlaylist := isPlaylistURL(q.URL)
 					splitChapters, splitLog := a.chapterSplitDecision(nj.ctx, q.URL, cookiePath, q.SplitChapters)
 					if splitLog != "" {
 						totalLogs += splitLog + "\n"
 					}
-					args := []string{
-						"--ignore-errors",
-						"--no-abort-on-error",
-						"--buffer-size", "16K",
-						"--http-chunk-size", "10M",
-						"--concurrent-fragments", "1",
-						"--no-cache-dir",
-						"--no-plugin-dirs",
-						"--newline",
-						"--progress-template", "download:%(progress._percent_str)s|%(progress.downloaded_bytes)s|%(progress.total_bytes)s|%(progress.speed)s|%(progress.eta)s|%(info.title)s",
-						"--postprocessor-args", "ffmpeg:-threads 1",
-						"--extractor-args", "youtube:player_client=android,ios,web,tv_downgraded,default",
-					}
-					if isPlaylist {
-						args = append(args, "--yes-playlist")
-					} else {
-						args = append(args, "--no-playlist")
-					}
-					if cookiePath != "" {
-						args = append(args, "--cookies", cookiePath)
-					}
-					if langs != "none" && langs != "no" {
-						// Preserve the downloaded subtitle sidecars for the post-upload
-						// Bilibili subtitle submission step.
-						args = append(args, "--write-subs", "--sub-langs", langs)
-					}
-
-					switch q.Quality {
-					case "audio_only":
-						args = append(args, "-x", "--audio-format", "mp3")
-					case "720p":
-						args = append(args, "-f", "22/bv*[height<=720][ext=mp4]+ba[ext=m4a]/b[height<=720][ext=mp4]/bv*[height<=720]+ba/b/18")
-					case "1080p":
-						args = append(args, "-f", "bv*[height<=1080][ext=mp4]+ba[ext=m4a]/b[height<=1080][ext=mp4]/bv*[height<=1080]+ba/b/22/18")
-					default:
-						args = append(args, "-f", "bv*[ext=mp4]+ba[ext=m4a]/bv*+ba/b[ext=mp4]/b/22/18")
-					}
-
-					if isPlaylist {
-						if splitChapters {
-							args = append(args,
-								"--split-chapters",
-								"-o", "chapter:"+filepath.Join(d, "P%(playlist_index|1)02d - C%(section_number)02d. %(section_title)s.%(ext)s"),
-							)
-						}
-						args = append(args,
-							"--write-thumbnail",
-							"--write-description",
-							"--embed-metadata",
-							"--merge-output-format", "mp4",
-							"-o", filepath.Join(d, "P%(playlist_index|1)02d. %(title)s [%(id)s].%(ext)s"),
-							q.URL,
-						)
-					} else {
-						if splitChapters {
-							args = append(args,
-								"--split-chapters",
-								"-o", "chapter:"+filepath.Join(d, "%(title)s - P%(section_number)02d. %(section_title)s.%(ext)s"),
-							)
-						}
-						args = append(args,
-							"--write-thumbnail",
-							"--write-description",
-							"--embed-metadata",
-							"--merge-output-format", "mp4",
-							"-o", filepath.Join(d, "%(title)s [%(id)s].%(ext)s"),
-							q.URL,
-						)
-					}
+					args := buildYTDLPArgs(q.URL, q.Quality, q.SubLangs, cookiePath, isPlaylist, splitChapters, d)
 
 					ytLogs, err := runCmdProgress(nj.ctx, a.cfg.YTDLP, args, func(line string) { a.progressLine(nj, "YouTube 下载", line) })
 					totalLogs += "[YouTube Download Logs]\n" + ytLogs + "\n"
@@ -3430,34 +3359,7 @@ func (a *App) createPipelineHandler(q pipelineReq) func(*Job) {
 					}
 					_ = os.MkdirAll(d, 0750)
 					targetDir = d
-					btTrackers := "udp://tracker.opentrackr.org:1337/announce,udp://open.tracker.cl:1337/announce,udp://tracker.openbittorrent.com:6969/announce,http://tracker.openbittorrent.com:80/announce,udp://opentracker.i2p.rocks:6969/announce,udp://open.demonii.com:1337/announce"
-					magnetArgs := []string{
-						"--dir=" + d,
-						"--continue=true",
-						"--allow-overwrite=false",
-						"--seed-time=0",
-						"--file-allocation=none",
-						"--disk-cache=16M",
-						"--timeout=30",
-						"--connect-timeout=15",
-						"--bt-tracker-connect-timeout=15",
-						"--bt-tracker-timeout=20",
-						"--listen-port=" + a.cfg.BTListenPort,
-						"--max-connection-per-server=4",
-						"--bt-max-peers=60",
-						"--max-concurrent-downloads=1",
-						"--enable-dht=true",
-						"--enable-peer-exchange=true",
-						"--bt-enable-lpd=true",
-						"--follow-torrent=mem",
-						"--bt-stop-timeout=300",
-						"--summary-interval=1",
-						"--bt-tracker=" + btTrackers,
-						q.URL,
-					}
-					if strings.TrimSpace(q.SelectFile) != "" {
-						magnetArgs = append(magnetArgs, "--select-file="+strings.TrimSpace(q.SelectFile))
-					}
+					magnetArgs := buildAria2Args(q.URL, d, q.SelectFile, a.cfg.BTListenPort)
 					var magLogs string
 					var err error
 					if isSingleAriaSelectFile(q.SelectFile) {
@@ -3629,7 +3531,7 @@ func freeTranslate(text, targetLang string) (string, error) {
 	}
 	urlStr := fmt.Sprintf("https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=%s&dt=t&q=%s",
 		targetLang, url.QueryEscape(text))
-	client := &http.Client{Timeout: 8 * time.Second}
+	client := &http.Client{Timeout: 5 * time.Second}
 	res, err := client.Get(urlStr)
 	if err != nil {
 		return "", err
@@ -4894,14 +4796,14 @@ type cookieEnvelope struct {
 
 func prepareCookies(src, dir string) (string, func(), error) {
 	candidates := []string{src}
-	if src != "/srv/y2b/youtube_cookies.txt" {
-		candidates = append(candidates,
-			"/srv/y2b/youtube_cookies.txt",
-			"/srv/y2b/youtube_cookies.json",
-			"/srv/y2b/cookies.txt",
-			"/srv/y2b/yt_cookies.txt",
-			"/srv/y2b/yt_cookies.json",
-		)
+	if src != "" {
+		cookieDir := filepath.Dir(src)
+		for _, name := range []string{"youtube_cookies.txt", "youtube_cookies.json", "cookies.txt", "yt_cookies.txt", "yt_cookies.json"} {
+			cand := filepath.Join(cookieDir, name)
+			if cand != src {
+				candidates = append(candidates, cand)
+			}
+		}
 	}
 	for _, cand := range candidates {
 		if cand == "" {
@@ -5242,17 +5144,18 @@ func convertVttToSrtAndBcc(dir string) {
 		var bccItems []bccItem
 		idx := 1
 
-		for i := 0; i < len(lines); i++ {
+		i := 0
+		for i < len(lines) {
 			line := strings.TrimSpace(lines[i])
 			if m := reTime.FindStringSubmatch(line); len(m) == 3 {
 				fromSec := parseTimeToSeconds(m[1])
 				toSec := parseTimeToSeconds(m[2])
 
 				var textLines []string
-				for j := i + 1; j < len(lines); j++ {
+				j := i + 1
+				for j < len(lines) {
 					tLine := strings.TrimSpace(lines[j])
 					if tLine == "" || reTime.MatchString(tLine) {
-						i = j - 1
 						break
 					}
 					cleanText := reTag.ReplaceAllString(tLine, "")
@@ -5260,9 +5163,7 @@ func convertVttToSrtAndBcc(dir string) {
 					if cleanText != "" {
 						textLines = append(textLines, cleanText)
 					}
-					if j == len(lines)-1 {
-						i = j
-					}
+					j++
 				}
 
 				if len(textLines) > 0 {
@@ -5279,6 +5180,9 @@ func convertVttToSrtAndBcc(dir string) {
 					srtLines = append(srtLines, fmt.Sprintf("%d\n%s --> %s\n%s\n", idx, srtFrom, srtTo, text))
 					idx++
 				}
+				i = j
+			} else {
+				i++
 			}
 		}
 
