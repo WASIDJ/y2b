@@ -915,6 +915,10 @@ func (a *App) deleteJob(id string) error {
 		a.mu.Unlock()
 		return errors.New("queued or running jobs cannot be deleted")
 	}
+	if j.Status == "done" && j.ReviewState != "" && j.ReviewState != "passed" {
+		a.mu.Unlock()
+		return errors.New("cannot delete job while awaiting review approval (source files protected)")
+	}
 	delete(a.jobs, id)
 	newOrder := make([]string, 0, len(a.order))
 	for _, oid := range a.order {
@@ -934,7 +938,9 @@ func (a *App) clearFinishedJobs() int {
 	newOrder := make([]string, 0, len(a.order))
 	for _, oid := range a.order {
 		j := a.jobs[oid]
-		if j != nil && (j.Status == "done" || j.Status == "failed" || j.Status == "canceled") {
+		// Retain finished jobs that are still pending Bilibili review approval so
+		// that the review watcher can verify moderation and safely purge source media.
+		if j != nil && (j.Status == "failed" || j.Status == "canceled" || (j.Status == "done" && (j.ReviewState == "" || j.ReviewState == "passed"))) {
 			delete(a.jobs, oid)
 			count++
 		} else if j != nil {
@@ -4076,12 +4082,11 @@ func (a *App) loadChannels() {
 	a.channelOrder = nil
 
 	data, err := os.ReadFile(a.channelsFilePath())
-	if err != nil {
-		return
-	}
 	var list []*MonitoredChannel
-	if err := json.Unmarshal(data, &list); err != nil {
-		return
+	if err != nil || json.Unmarshal(data, &list) != nil {
+		if backup, backupErr := os.ReadFile(a.channelsFilePath() + ".bak"); backupErr == nil {
+			_ = json.Unmarshal(backup, &list)
+		}
 	}
 	for _, ch := range list {
 		if ch == nil || ch.ID == "" {
@@ -4107,11 +4112,7 @@ func (a *App) saveChannelsLocked() {
 	if err != nil {
 		return
 	}
-	filePath := a.channelsFilePath()
-	tmp := filePath + ".tmp"
-	if err := os.WriteFile(tmp, data, 0640); err == nil {
-		_ = os.Rename(tmp, filePath)
-	}
+	_ = writeAtomic(a.channelsFilePath(), data, 0640)
 }
 
 func (a *App) saveChannels() {
@@ -4639,10 +4640,11 @@ func (a *App) loadStats() {
 	defer a.smu.Unlock()
 
 	b, err := os.ReadFile(a.statsFile())
-	if err == nil {
-		if json.Unmarshal(b, &a.stats) == nil {
-			return
-		}
+	if err == nil && json.Unmarshal(b, &a.stats) == nil {
+		return
+	}
+	if backup, backupErr := os.ReadFile(a.statsFile() + ".bak"); backupErr == nil && json.Unmarshal(backup, &a.stats) == nil {
+		return
 	}
 
 	// Bootstrap from existing files in DataDir
@@ -4671,7 +4673,7 @@ func (a *App) saveStatsLocked() {
 	a.stats.LastUpdated = time.Now().Format(time.RFC3339)
 	b, err := json.MarshalIndent(a.stats, "", "  ")
 	if err == nil {
-		_ = os.WriteFile(a.statsFile(), b, 0640)
+		_ = writeAtomic(a.statsFile(), b, 0640)
 	}
 }
 

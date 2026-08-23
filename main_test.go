@@ -515,3 +515,85 @@ func TestLoadOrCreateSecretKey(t *testing.T) {
 	}
 }
 
+func TestChannelsPersistenceBakRecovery(t *testing.T) {
+	dataDir := t.TempDir()
+	a := &App{
+		cfg:          Config{DataDir: dataDir},
+		channels:     map[string]*MonitoredChannel{},
+		channelOrder: nil,
+	}
+	ch := &MonitoredChannel{ID: "ch1", URL: "https://www.youtube.com/@test", Title: "Test Channel"}
+	a.channels[ch.ID] = ch
+	a.channelOrder = []string{ch.ID}
+	a.saveChannels()
+
+	// Trigger second save with valid content to create .bak containing the valid previous version
+	ch.Title = "Updated Title"
+	a.saveChannels()
+
+	// Corrupt channels.json
+	channelsFile := a.channelsFilePath()
+	if err := os.WriteFile(channelsFile, []byte("{corrupted json"), 0640); err != nil {
+		t.Fatal(err)
+	}
+
+	// Load should recover from .bak
+	a2 := &App{cfg: Config{DataDir: dataDir}}
+	a2.loadChannels()
+	if len(a2.channels) != 1 || a2.channels["ch1"] == nil {
+		t.Fatalf("channels not recovered from .bak: %+v", a2.channels)
+	}
+}
+
+func TestStatsPersistenceBakRecovery(t *testing.T) {
+	dataDir := t.TempDir()
+	a := &App{cfg: Config{DataDir: dataDir}}
+	a.recordDownload(1024)
+	a.recordUpload(2048)
+
+	// Save once more to create .bak
+	a.recordDownload(512)
+
+	// Corrupt main stats.json
+	if err := os.WriteFile(a.statsFile(), []byte("not valid json"), 0640); err != nil {
+		t.Fatal(err)
+	}
+
+	a2 := &App{cfg: Config{DataDir: dataDir}}
+	a2.loadStats()
+	if a2.stats.TotalDownloadedBytes == 0 && a2.stats.TotalUploadedBytes == 0 {
+		t.Fatalf("stats not recovered from .bak: %+v", a2.stats)
+	}
+}
+
+func TestClearFinishedJobsProtectsPendingReview(t *testing.T) {
+	a := &App{
+		cfg:  Config{DataDir: t.TempDir()},
+		jobs: map[string]*Job{},
+	}
+	jNormal := &Job{ID: "j1", Status: "done", ReviewState: ""}
+	jPassed := &Job{ID: "j2", Status: "done", ReviewState: "passed"}
+	jPending := &Job{ID: "j3", Status: "done", ReviewState: "pending"}
+	jFailed := &Job{ID: "j4", Status: "failed"}
+
+	a.jobs[jNormal.ID] = jNormal
+	a.jobs[jPassed.ID] = jPassed
+	a.jobs[jPending.ID] = jPending
+	a.jobs[jFailed.ID] = jFailed
+	a.order = []string{jNormal.ID, jPassed.ID, jPending.ID, jFailed.ID}
+
+	cleared := a.clearFinishedJobs()
+	if cleared != 3 {
+		t.Fatalf("expected 3 jobs cleared, got %d", cleared)
+	}
+	if len(a.jobs) != 1 || a.jobs["j3"] == nil {
+		t.Fatalf("pending review job was not preserved: %+v", a.jobs)
+	}
+
+	// Also verify deleteJob prevents deleting pending review job
+	if err := a.deleteJob("j3"); err == nil {
+		t.Fatal("expected error deleting job awaiting review approval")
+	}
+}
+
+
