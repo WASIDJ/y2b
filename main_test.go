@@ -758,6 +758,64 @@ func TestScanMediaPackagesCaching(t *testing.T) {
 	}
 }
 
+func TestCleanupOrphanedMedia(t *testing.T) {
+	dir := t.TempDir()
+	a := &App{
+		cfg: Config{DataDir: dir},
+		jobs: map[string]*Job{
+			"active1": {ID: "active1", Status: "running"},
+		},
+	}
+
+	// 1. Active directory
+	activeDir := filepath.Join(dir, "magnet", "active1")
+	_ = os.MkdirAll(activeDir, 0750)
+	_ = os.WriteFile(filepath.Join(activeDir, "video.mp4"), []byte("active data"), 0600)
+
+	// 2. Orphan directory
+	orphanDir := filepath.Join(dir, "magnet", "orphan99")
+	_ = os.MkdirAll(orphanDir, 0750)
+	_ = os.WriteFile(filepath.Join(orphanDir, "video.mp4"), []byte("orphan data"), 0600)
+
+	freed := a.cleanupOrphanedMedia()
+	if freed == 0 {
+		t.Fatalf("expected freed bytes > 0, got %d", freed)
+	}
+
+	// Verify orphan was deleted
+	if _, err := os.Stat(orphanDir); !os.IsNotExist(err) {
+		t.Fatalf("expected orphan dir to be deleted, but still exists: %v", err)
+	}
+	// Verify active dir was preserved
+	if _, err := os.Stat(activeDir); os.IsNotExist(err) {
+		t.Fatalf("expected active dir to be preserved, but was deleted: %v", err)
+	}
+}
+
+func TestEnsureSafeDisk(t *testing.T) {
+	dir := t.TempDir()
+	a := &App{
+		cfg: Config{
+			DataDir:       dir,
+			MinFreeDiskGB: 0.001, // Small threshold that current filesystem satisfies
+		},
+		jobs: map[string]*Job{},
+	}
+
+	if err := a.ensureSafeDisk(context.Background()); err != nil {
+		t.Fatalf("expected disk check to pass on normal fs, got error: %v", err)
+	}
+
+	// Test with impossibly high min free disk requirement
+	a.cfg.MinFreeDiskGB = 999999.0
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	if err := a.ensureSafeDisk(ctx); err == nil {
+		t.Fatalf("expected error when disk space requirement is impossibly large")
+	}
+}
+
+
 
 
 

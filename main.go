@@ -62,6 +62,7 @@ type Config struct {
 	AutoRetryBase    time.Duration
 	ReviewInterval   time.Duration
 	ReviewRepairMax  int
+	MinFreeDiskGB    float64
 }
 
 type MonitoredChannel struct {
@@ -286,6 +287,12 @@ func loadConfig() Config {
 			reviewRepairMax = parsed
 		}
 	}
+	minFreeDiskGB := 3.0
+	if raw := os.Getenv("Y2B_MIN_FREE_GIB"); raw != "" {
+		if parsed, err := strconv.ParseFloat(raw, 64); err == nil && parsed > 0 {
+			minFreeDiskGB = parsed
+		}
+	}
 
 	return Config{
 		Addr:             env("Y2B_ADDR", "127.0.0.1:8765"),
@@ -311,6 +318,7 @@ func loadConfig() Config {
 		AutoRetryBase:    autoRetryBase,
 		ReviewInterval:   reviewInterval,
 		ReviewRepairMax:  reviewRepairMax,
+		MinFreeDiskGB:    minFreeDiskGB,
 	}
 }
 
@@ -801,6 +809,79 @@ func (a *App) ensureSafeMemory(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+func (a *App) cleanupOrphanedMedia() int64 {
+	a.mu.RLock()
+	activeIDs := make(map[string]bool, len(a.jobs))
+	for id, j := range a.jobs {
+		if j == nil {
+			continue
+		}
+		activeIDs[id] = true
+		if j.ReviewState != "passed" {
+			if out := outputMap(j.Output); out != nil {
+				if d, ok := out["dir"].(string); ok && d != "" {
+					activeIDs[filepath.Base(d)] = true
+				}
+			}
+		}
+	}
+	a.mu.RUnlock()
+
+	var freed int64
+	for _, sub := range []string{"magnet", "youtube"} {
+		parent := filepath.Join(a.cfg.DataDir, sub)
+		entries, err := os.ReadDir(parent)
+		if err != nil {
+			continue
+		}
+		for _, e := range entries {
+			if !e.IsDir() {
+				continue
+			}
+			folderID := e.Name()
+			if !activeIDs[folderID] {
+				folderPath := filepath.Join(parent, folderID)
+				size := calcDirSize(folderPath)
+				if err := os.RemoveAll(folderPath); err == nil {
+					freed += size
+				}
+			}
+		}
+	}
+	return freed
+}
+
+func (a *App) ensureSafeDisk(ctx context.Context) error {
+	minFree := a.cfg.MinFreeDiskGB
+	if minFree <= 0 {
+		minFree = 2.0
+	}
+
+	for i := 0; i < 15; i++ {
+		disk := getDiskInfo(a.cfg.DataDir)
+		if disk.TotalGB == 0 || disk.FreeGB >= minFree {
+			return nil
+		}
+		// Free space is low! Trigger cleanups to recover space
+		a.cleanupCompletedJobMedia()
+		a.cleanupOrphanedMedia()
+
+		disk = getDiskInfo(a.cfg.DataDir)
+		if disk.FreeGB >= minFree {
+			return nil
+		}
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(1 * time.Second):
+		}
+	}
+
+	disk := getDiskInfo(a.cfg.DataDir)
+	return fmt.Errorf("磁盘空间不足 (可用空间仅 %.1f GB，安全门限 >= %.1f GB)，暂停下载以防写满磁盘", disk.FreeGB, minFree)
 }
 
 func startMemoryWatchdog() {
@@ -1616,6 +1697,10 @@ func (a *App) createYoutubeHandler(q youtubeReq) func(*Job) {
 				}()
 
 				if err := a.ensureSafeMemory(nj.ctx); err != nil {
+					downloadErr = err
+					return
+				}
+				if err := a.ensureSafeDisk(nj.ctx); err != nil {
 					downloadErr = err
 					return
 				}
@@ -2544,6 +2629,10 @@ func (a *App) createMagnetHandler(q magnetReq) func(*Job) {
 					downloadErr = err
 					return
 				}
+				if err := a.ensureSafeDisk(nj.ctx); err != nil {
+					downloadErr = err
+					return
+				}
 
 				a.set(nj, "running", "", nil, "")
 				a.setStep(nj, "磁力下载中")
@@ -3310,6 +3399,10 @@ func (a *App) createPipelineHandler(q pipelineReq) func(*Job) {
 					downloadErr = err
 					return
 				}
+				if err := a.ensureSafeDisk(nj.ctx); err != nil {
+					downloadErr = err
+					return
+				}
 
 				a.set(nj, "running", "", nil, "")
 				if isYT {
@@ -4000,6 +4093,8 @@ func (a *App) cleanTempHandler(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+
+	freedBytes += a.cleanupOrphanedMedia()
 
 	jsonResp(w, 200, map[string]any{
 		"ok":            true,
@@ -5776,6 +5871,9 @@ func main() {
 	go a.retryWatchdog(context.Background())
 	if freed := a.cleanupCompletedJobMedia(); freed > 0 {
 		fmt.Printf("cleaned %s from completed pipeline jobs\n", formatBytes(freed))
+	}
+	if freed := a.cleanupOrphanedMedia(); freed > 0 {
+		fmt.Printf("cleaned %s from orphaned media directories\n", formatBytes(freed))
 	}
 	a.loadChannels()
 	a.loadStats()
