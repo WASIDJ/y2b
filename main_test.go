@@ -623,5 +623,24 @@ func TestMagnetCleanupOnReviewApproval(t *testing.T) {
 	}
 }
 
+func TestAdjacentCoverContext(t *testing.T) {
+	dir := t.TempDir()
+	videoFile := filepath.Join(dir, "sample.mp4")
+	_ = os.WriteFile(videoFile, []byte("video"), 0600)
+
+	// Case 1: JPG cover exists
+	jpgCover := filepath.Join(dir, "sample.jpg")
+	_ = os.WriteFile(jpgCover, []byte("jpg-data"), 0600)
+	if got := adjacentCover(context.Background(), videoFile); got != jpgCover {
+		t.Errorf("expected jpg cover %s, got %s", jpgCover, got)
+	}
+
+	// Case 2: Canceled context does not hang
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_ = adjacentCover(ctx, filepath.Join(dir, "nonexistent.mp4"))
+}
+
+
 
 

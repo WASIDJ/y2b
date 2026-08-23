@@ -729,6 +729,8 @@ func (a *App) recoverInterruptedJobs() {
 			if _, err := a.retryJob(jobID); err != nil {
 				fmt.Printf("startup recovery skipped job %s: %v\n", jobID, err)
 			}
+			// Space out job resumes to prevent contention on download/upload slots
+			time.Sleep(2 * time.Second)
 		}
 	}()
 	fmt.Printf("scheduled %d interrupted jobs for automatic recovery\n", len(ids))
@@ -788,11 +790,14 @@ func (a *App) ensureSafeMemory(ctx context.Context) error {
 
 func startMemoryWatchdog() {
 	go func() {
-		ticker := time.NewTicker(10 * time.Second)
+		ticker := time.NewTicker(30 * time.Second)
 		defer ticker.Stop()
 		for range ticker.C {
-			runtime.GC()
-			debug.FreeOSMemory()
+			mem := getMemoryInfo()
+			if mem.TotalMB > 0 && mem.AvailableMB < 80 {
+				runtime.GC()
+				debug.FreeOSMemory()
+			}
 		}
 	}()
 }
@@ -3002,7 +3007,7 @@ func (a *App) executeBiliupUpload(ctx context.Context, q uploadReq) (map[string]
 
 	cover := q.Cover
 	if cover == "" {
-		cover = adjacentCover(files[0])
+		cover = adjacentCover(ctx, files[0])
 	}
 	if q.Progress != nil {
 		q.Progress("[ffmpeg] 正在优化投稿封面")
@@ -3292,7 +3297,7 @@ func (a *App) createPipelineHandler(q pipelineReq) func(*Job) {
 
 				a.set(nj, "running", "", nil, "")
 				if isYT {
-					a.setStep(nj, "[1/3] YouTube 视频解析与下载")
+					a.setStep(nj, "[1/2] YouTube 视频解析与下载")
 					d := q.ResumeDir
 					if d == "" {
 						d = filepath.Join(a.cfg.DataDir, "youtube", nj.ID)
@@ -3411,14 +3416,14 @@ func (a *App) createPipelineHandler(q pipelineReq) func(*Job) {
 
 					convertVttToSrtAndBcc(d)
 					if q.BurnSubs && len(targetUploadFiles) > 0 {
-						a.setStep(nj, "[1/3] 正在压制中英硬字幕...")
+						a.setStep(nj, "[1/2] 正在压制中英硬字幕...")
 						a.setProgress(nj, JobProgress{Detail: "ffmpeg 字幕压制"})
 						burned, bLogs, _ := burnSubtitlesToVideos(nj.ctx, d, targetUploadFiles, func(line string) { a.progressLine(nj, "ffmpeg 字幕压制", line) })
 						targetUploadFiles = burned
 						totalLogs += "\n[字幕压制日志]\n" + bLogs
 					}
 				} else {
-					a.setStep(nj, "[1/3] 磁力高速抓取中")
+					a.setStep(nj, "[1/2] 磁力高速抓取中")
 					d := q.ResumeDir
 					if d == "" {
 						d = filepath.Join(a.cfg.DataDir, "magnet", nj.ID)
@@ -3461,7 +3466,7 @@ func (a *App) createPipelineHandler(q pipelineReq) func(*Job) {
 								return err
 							}
 							defer func() { <-a.uploadSlots }()
-							a.setStep(nj, "[2/3] B站边下载边投稿")
+							a.setStep(nj, "[2/2] B站边下载边投稿")
 							a.setProgress(nj, JobProgress{Detail: "B站上传: " + filepath.Base(file)})
 							result, logs, uploadErr := a.executeBiliupUpload(nj.ctx, uploadReq{
 								File: file, Translate: q.Translate, Tid: q.Tid, Tag: q.Tags,
@@ -3560,8 +3565,7 @@ func (a *App) createPipelineHandler(q pipelineReq) func(*Job) {
 					return
 				}
 
-				a.setStep(nj, "[2/3] AI 生成元数据与本地优化")
-				a.setStep(nj, "[3/3] B站自动化并发投稿")
+				a.setStep(nj, "[2/2] B站自动化投稿")
 				a.setProgress(nj, JobProgress{Detail: "B站上传"})
 				uploadOut, uploadLogs, uploadErr = a.executeBiliupUpload(nj.ctx, uploadReq{
 					Files:     targetUploadFiles,
@@ -4366,6 +4370,8 @@ func (a *App) startChannelWatcher(ctx context.Context) {
 	ticker := time.NewTicker(60 * time.Second)
 	go func() {
 		defer ticker.Stop()
+		// Perform initial check on startup so channels don't wait a full interval after restart
+		a.checkAllChannels(ctx)
 		for {
 			select {
 			case <-ctx.Done():
@@ -5372,7 +5378,7 @@ func adjacentText(file, suffix string) string {
 	return ""
 }
 
-func adjacentCover(file string) string {
+func adjacentCover(ctx context.Context, file string) string {
 	base := strings.TrimSuffix(file, filepath.Ext(file))
 	for _, ext := range []string{".jpg", ".jpeg", ".png"} {
 		p := base + ext
@@ -5380,14 +5386,17 @@ func adjacentCover(file string) string {
 			return p
 		}
 	}
-	// If webp exists, convert to jpg for Bilibili compatibility
+	// If webp exists, convert to jpg for Bilibili compatibility with context timeout
+	convCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+
 	webp := base + ".webp"
 	if _, err := os.Stat(webp); err == nil {
 		jpg := base + ".cover.jpg"
 		if _, err := os.Stat(jpg); err == nil {
 			return jpg
 		}
-		_ = exec.Command("ffmpeg", "-y", "-i", webp, jpg).Run()
+		_ = exec.CommandContext(convCtx, "ffmpeg", "-y", "-i", webp, jpg).Run()
 		if _, err := os.Stat(jpg); err == nil {
 			return jpg
 		}
@@ -5405,7 +5414,7 @@ func adjacentCover(file string) string {
 		if _, err := os.Stat(jpgFile); err == nil {
 			return jpgFile
 		}
-		_ = exec.Command("ffmpeg", "-y", "-i", webpFile, jpgFile).Run()
+		_ = exec.CommandContext(convCtx, "ffmpeg", "-y", "-i", webpFile, jpgFile).Run()
 		if _, err := os.Stat(jpgFile); err == nil {
 			return jpgFile
 		}
@@ -5795,7 +5804,7 @@ func main() {
 		Handler:           http.HandlerFunc(a.handler),
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       60 * time.Second,
-		WriteTimeout:      60 * time.Second,
+		WriteTimeout:      0, // Disabled so streaming large video files via /files/ is not cut off
 		IdleTimeout:       120 * time.Second,
 	}
 	fmt.Printf("y2b-go listening on %s (data: %s)\n", a.cfg.Addr, a.cfg.DataDir)
