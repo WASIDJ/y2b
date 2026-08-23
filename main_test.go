@@ -820,6 +820,64 @@ func TestEnsureSafeDisk(t *testing.T) {
 	}
 }
 
+func TestResumableJobUploadPreservesFilesAndVID(t *testing.T) {
+	dir := t.TempDir()
+	v1 := filepath.Join(dir, "P01 - Lecture 1.mp4")
+	v2 := filepath.Join(dir, "P02 - Lecture 2.mp4")
+	_ = os.WriteFile(v1, []byte("vid1"), 0600)
+	_ = os.WriteFile(v2, []byte("vid2"), 0600)
+
+	// Case 1: Failed pipeline with completed media and existing BVID
+	failedJob := &Job{
+		ID:     "pipe123",
+		Kind:   "pipeline",
+		Status: "failed",
+		Input: pipelineReq{
+			URL:       "https://youtu.be/test",
+			Translate: true,
+			Tid:       "188",
+			Tags:      "AI,Tutorial",
+		},
+		Output: map[string]any{
+			"dir":         dir,
+			"video_files": []string{v1, v2},
+			"upload": map[string]any{
+				"bvid":        "BV1xx411c7mD",
+				"title":       "My Custom Title",
+				"description": "My Custom Desc",
+			},
+		},
+	}
+
+	req, ok := resumableJobUpload(failedJob)
+	if !ok {
+		t.Fatalf("expected resumableJobUpload to return true")
+	}
+	if len(req.Files) != 2 || req.VID != "BV1xx411c7mD" || !req.Translate || req.Title != "My Custom Title" {
+		t.Fatalf("unexpected uploadReq from resumableJobUpload: %+v", req)
+	}
+
+	// Case 2: retryJob converts pipeline into biliup with resume state
+	a := &App{
+		jobs: map[string]*Job{
+			failedJob.ID: failedJob,
+		},
+		order: []string{failedJob.ID},
+	}
+	newJob, err := a.retryJob(failedJob.ID)
+	if err != nil {
+		t.Fatalf("retryJob failed: %v", err)
+	}
+	if newJob.Kind != "biliup" {
+		t.Fatalf("expected retryJob to convert completed media into biliup kind, got %s", newJob.Kind)
+	}
+	upInput, ok := newJob.Input.(uploadReq)
+	if !ok || len(upInput.Files) != 2 || upInput.VID != "BV1xx411c7mD" {
+		t.Fatalf("unexpected newJob input: %+v", newJob.Input)
+	}
+}
+
+
 
 
 

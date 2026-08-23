@@ -1099,12 +1099,10 @@ func (a *App) dispatchJob(j *Job) {
 	}
 }
 
-// resumablePipelineUpload converts a failed pipeline into an upload-only
-// retry when its local media is complete. This is deliberately conservative:
-// any aria2 control file causes the normal pipeline retry so partial torrent
-// files are never submitted as finished videos.
-func resumablePipelineUpload(j *Job) (uploadReq, bool) {
-	if j == nil || j.Kind != "pipeline" || j.Output == nil {
+// resumableJobUpload converts a failed/canceled job with completed media into an upload-only
+// retry, preserving already-downloaded local video files and existing BVIDs.
+func resumableJobUpload(j *Job) (uploadReq, bool) {
+	if j == nil || j.Output == nil {
 		return uploadReq{}, false
 	}
 	out := outputMap(j.Output)
@@ -1112,31 +1110,43 @@ func resumablePipelineUpload(j *Job) (uploadReq, bool) {
 		return uploadReq{}, false
 	}
 	dir, _ := out["dir"].(string)
-	if dir == "" {
-		return uploadReq{}, false
-	}
-	incomplete := false
-	_ = filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
-		if err == nil && info != nil && !info.IsDir() && strings.HasSuffix(info.Name(), ".aria2") {
-			incomplete = true
-			return filepath.SkipDir
+	if dir != "" {
+		incomplete := false
+		_ = filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
+			if err == nil && info != nil && !info.IsDir() && (strings.HasSuffix(info.Name(), ".aria2") || strings.HasSuffix(info.Name(), ".part") || strings.HasSuffix(info.Name(), ".ytdl")) {
+				incomplete = true
+				return filepath.SkipDir
+			}
+			return nil
+		})
+		if incomplete {
+			return uploadReq{}, false
 		}
-		return nil
-	})
-	if incomplete {
-		return uploadReq{}, false
 	}
 
 	var files []string
+	var bvid string
 	if upload, ok := out["upload"].(map[string]any); ok {
 		files = stringSlice(upload["files"])
+		if bv, ok := upload["bvid"].(string); ok && bv != "" {
+			bvid = bv
+		}
 	}
 	if len(files) == 0 {
 		files = stringSlice(out["video_files"])
 	}
+	if len(files) == 0 && dir != "" {
+		_ = filepath.Walk(dir, func(p string, info os.FileInfo, err error) error {
+			if err == nil && info != nil && !info.IsDir() && isVideoFilePath(info.Name()) {
+				files = append(files, p)
+			}
+			return nil
+		})
+	}
 	if len(files) == 0 {
 		return uploadReq{}, false
 	}
+
 	complete := make([]string, 0, len(files))
 	for _, file := range uniqueMediaFiles(files) {
 		st, err := os.Stat(file)
@@ -1147,16 +1157,71 @@ func resumablePipelineUpload(j *Job) (uploadReq, bool) {
 	if len(complete) == 0 {
 		return uploadReq{}, false
 	}
+	sort.Strings(complete)
 
-	var pipeline pipelineReq
-	if b, err := json.Marshal(j.Input); err == nil {
-		_ = json.Unmarshal(b, &pipeline)
+	req := uploadReq{
+		Files: complete,
+		Parts: len(complete) > 1,
+		VID:   bvid,
 	}
-	req := uploadReq{Files: complete, Parts: len(complete) > 1, Source: pipeline.URL, Tid: pipeline.Tid, Tag: pipeline.Tags, Translate: false}
+
+	if j.Kind == "pipeline" {
+		var pipeline pipelineReq
+		if b, err := json.Marshal(j.Input); err == nil {
+			_ = json.Unmarshal(b, &pipeline)
+		}
+		req.Source = pipeline.URL
+		req.Tid = pipeline.Tid
+		req.Tag = pipeline.Tags
+		req.Translate = pipeline.Translate
+	} else if j.Kind == "youtube" {
+		var y youtubeReq
+		if b, err := json.Marshal(j.Input); err == nil {
+			_ = json.Unmarshal(b, &y)
+		}
+		req.Source = y.URL
+		req.Tid = y.Tid
+		req.Tag = y.Tags
+		req.Translate = y.Translate
+	} else if j.Kind == "magnet" {
+		var m magnetReq
+		if b, err := json.Marshal(j.Input); err == nil {
+			_ = json.Unmarshal(b, &m)
+		}
+		req.Source = m.URL
+		if req.Source == "" {
+			req.Source = m.Magnet
+		}
+		req.Tid = m.Tid
+		req.Tag = m.Tags
+		req.Translate = m.Translate
+	} else if j.Kind == "biliup" {
+		var up uploadReq
+		if b, err := json.Marshal(j.Input); err == nil {
+			_ = json.Unmarshal(b, &up)
+		}
+		req.Title = up.Title
+		req.Description = up.Description
+		req.Cover = up.Cover
+		req.Tag = up.Tag
+		req.Tid = up.Tid
+		req.Source = up.Source
+		req.Translate = up.Translate
+		if req.VID == "" {
+			req.VID = up.VID
+		}
+	}
+
 	if upload, ok := out["upload"].(map[string]any); ok {
-		req.Title, _ = upload["title"].(string)
-		req.Description, _ = upload["description"].(string)
-		req.Cover, _ = upload["cover"].(string)
+		if t, ok := upload["title"].(string); ok && t != "" {
+			req.Title = t
+		}
+		if d, ok := upload["description"].(string); ok && d != "" {
+			req.Description = d
+		}
+		if c, ok := upload["cover"].(string); ok && c != "" {
+			req.Cover = c
+		}
 		if tid, ok := upload["tid"].(string); ok && tid != "" {
 			req.Tid = tid
 		}
@@ -1193,25 +1258,22 @@ func (a *App) retryJob(jobID string) (*Job, error) {
 		return nil, fmt.Errorf("only failed or canceled jobs can be retried (status=%s)", old.Status)
 	}
 
-	// If a pipeline already finished downloading its media and only the
-	// Bilibili stage failed, resume from the local files instead of starting
-	// the torrent/YouTube download again. An .aria2 control file means the
-	// torrent is still incomplete, so that case remains a normal pipeline
-	// retry.
 	retryKind := old.Kind
 	retryInput := old.Input
-	if old.Kind == "pipeline" && (old.Status == "failed" || old.Status == "canceled") {
-		if req, ok := resumablePipelineUpload(old); ok {
+	if old.Status == "failed" || old.Status == "canceled" {
+		if req, ok := resumableJobUpload(old); ok {
 			retryKind = "biliup"
 			retryInput = req
 		} else if out := outputMap(old.Output); out != nil {
 			if dir, ok := out["dir"].(string); ok && dir != "" {
-				var pipeline pipelineReq
-				if b, err := json.Marshal(old.Input); err == nil {
-					_ = json.Unmarshal(b, &pipeline)
+				if old.Kind == "pipeline" {
+					var pipeline pipelineReq
+					if b, err := json.Marshal(old.Input); err == nil {
+						_ = json.Unmarshal(b, &pipeline)
+					}
+					pipeline.ResumeDir = dir
+					retryInput = pipeline
 				}
-				pipeline.ResumeDir = dir
-				retryInput = pipeline
 			}
 		}
 	}
@@ -2826,6 +2888,7 @@ type uploadReq struct {
 	Source      string       `json:"source"`
 	Translate   bool         `json:"translate"`
 	Parts       bool         `json:"parts"`
+	VID         string       `json:"vid,omitempty"`
 	Progress    func(string) `json:"-"`
 }
 
@@ -3136,21 +3199,26 @@ func (a *App) executeBiliupUpload(ctx context.Context, q uploadReq) (map[string]
 
 	for _, ep := range submitEndpoints {
 		attempt++
-		args := append([]string{"--user-cookie", a.cfg.BiliCookies, "upload"}, uploadFiles...)
-		args = append(args, "--title", title, "--desc", desc)
-
-		if useCover && cover != "" {
-			args = append(args, "--cover", cover)
-		}
-		if tags != "" {
-			args = append(args, "--tag", tags)
-		}
-		args = append(args, "--tid", tid)
-
-		if q.Source != "" {
-			args = append(args, "--copyright", "2", "--source", q.Source)
+		var args []string
+		if q.VID != "" {
+			args = append([]string{"--user-cookie", a.cfg.BiliCookies, "append", "--vid", q.VID}, uploadFiles...)
 		} else {
-			args = append(args, "--copyright", "1")
+			args = append([]string{"--user-cookie", a.cfg.BiliCookies, "upload"}, uploadFiles...)
+			args = append(args, "--title", title, "--desc", desc)
+
+			if useCover && cover != "" {
+				args = append(args, "--cover", cover)
+			}
+			if tags != "" {
+				args = append(args, "--tag", tags)
+			}
+			args = append(args, "--tid", tid)
+
+			if q.Source != "" {
+				args = append(args, "--copyright", "2", "--source", q.Source)
+			} else {
+				args = append(args, "--copyright", "1")
+			}
 		}
 
 		limit := q.Limit
