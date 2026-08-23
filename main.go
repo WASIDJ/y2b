@@ -565,6 +565,11 @@ func (a *App) set(j *Job, status, err string, out any, logs string) {
 	} else if status == "done" {
 		j.Finished = time.Now()
 		j.Step = "已完成"
+		if outMap, ok := out.(map[string]any); ok {
+			if rs, hasRS := outMap["review_state"].(string); hasRS && j.ReviewState == "" {
+				j.ReviewState = rs
+			}
+		}
 	} else if status == "failed" {
 		j.Finished = time.Now()
 		j.Step = "失败"
@@ -1747,7 +1752,7 @@ func (a *App) cleanupCompletedJobMedia() int64 {
 	a.mu.RLock()
 	jobs := make([]*Job, 0, len(a.jobs))
 	for _, j := range a.jobs {
-		if j != nil && j.Status == "done" && j.Kind == "pipeline" && j.ReviewState == "passed" {
+		if j != nil && j.Status == "done" && j.ReviewState == "passed" {
 			copy := *j
 			jobs = append(jobs, &copy)
 		}
@@ -2019,7 +2024,7 @@ func (a *App) reviewUploadRequest(j *Job, files []string, previous map[string]an
 	return q
 }
 
-func (a *App) reviewJob(jobID string) {
+func (a *App) reviewJob(ctx context.Context, jobID string) {
 	a.mu.RLock()
 	original := a.jobs[jobID]
 	if original == nil || original.Status != "done" || original.ReviewState == "passed" {
@@ -2033,6 +2038,44 @@ func (a *App) reviewJob(jobID string) {
 	if out == nil {
 		return
 	}
+
+	// Handle streamed magnet upload case where out["upload"] is a slice of maps
+	if uploadList, isList := out["upload"].([]any); isList && len(uploadList) > 0 {
+		allPassed := true
+		now := time.Now()
+		for _, item := range uploadList {
+			if itemMap, isMap := item.(map[string]any); isMap {
+				if bvid, _ := itemMap["bvid"].(string); bvid != "" {
+					result, _, err := a.fetchBiliReview(ctx, bvid)
+					if err == nil {
+						st := biliReviewState(result)
+						itemMap["review_state"] = st
+						if st != "passed" {
+							allPassed = false
+						}
+					} else {
+						allPassed = false
+					}
+				}
+			}
+		}
+		a.mu.Lock()
+		if current := a.jobs[jobID]; current != nil {
+			current.ReviewCheckedAt = now
+			if allPassed {
+				current.ReviewState = "passed"
+				current.ReviewError = ""
+				if dir, ok := out["dir"].(string); ok && dir != "" {
+					purgeVideoFilesInDir(dir)
+				}
+			}
+			current.Output = out
+		}
+		a.mu.Unlock()
+		a.saveJobs()
+		return
+	}
+
 	upload, ok := out["upload"].(map[string]any)
 	if !ok {
 		// Direct /api/biliup/upload jobs store the upload result at the
@@ -2046,7 +2089,7 @@ func (a *App) reviewJob(jobID string) {
 	if bvid == "" {
 		return
 	}
-	result, showLogs, err := a.fetchBiliReview(job.ctx, bvid)
+	result, showLogs, err := a.fetchBiliReview(ctx, bvid)
 	now := time.Now()
 	if err != nil {
 		a.mu.Lock()
@@ -2117,7 +2160,7 @@ func (a *App) reviewJob(jobID string) {
 	}
 	reason := result.Archive.RejectReason + " " + result.Archive.ProblemDesc + " " + result.Archive.ModifyAdvice
 	repairDir := filepath.Join(filepath.Dir(files[0]), ".y2b-review-repair-"+bvid+"-"+strconv.FormatInt(now.Unix(), 10))
-	repaired, repairLogs, repairErr := a.reviewUploadFiles(job.ctx, files, reason, repairDir)
+	repaired, repairLogs, repairErr := a.reviewUploadFiles(ctx, files, reason, repairDir)
 	if repairErr != nil {
 		a.mu.Lock()
 		if current := a.jobs[jobID]; current != nil {
@@ -2131,12 +2174,12 @@ func (a *App) reviewJob(jobID string) {
 	}
 
 	if cap := a.uploadSlots; cap != nil {
-		if slotErr := a.acquireSlot(job.ctx, cap); slotErr != nil {
+		if slotErr := a.acquireSlot(ctx, cap); slotErr != nil {
 			return
 		}
 		defer func() { <-cap }()
 	}
-	newUpload, uploadLogs, uploadErr := a.executeBiliupUpload(job.ctx, a.reviewUploadRequest(&job, repaired, upload))
+	newUpload, uploadLogs, uploadErr := a.executeBiliupUpload(ctx, a.reviewUploadRequest(&job, repaired, upload))
 	a.mu.Lock()
 	if current := a.jobs[jobID]; current != nil {
 		current.ReviewRepairs++
@@ -2178,7 +2221,7 @@ func (a *App) startReviewWatcher(ctx context.Context) {
 			}
 			a.mu.RUnlock()
 			for _, id := range ids {
-				a.reviewJob(id)
+				a.reviewJob(ctx, id)
 			}
 			a.reviewMu.Unlock()
 			select {

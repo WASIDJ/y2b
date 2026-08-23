@@ -596,4 +596,32 @@ func TestClearFinishedJobsProtectsPendingReview(t *testing.T) {
 	}
 }
 
+func TestMagnetCleanupOnReviewApproval(t *testing.T) {
+	dir := t.TempDir()
+	video := filepath.Join(dir, "torrent_video.mkv")
+	if err := os.WriteFile(video, []byte("torrent-content"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	a := &App{jobs: map[string]*Job{"mag1": {
+		ID: "mag1", Kind: "magnet", Status: "done", ReviewState: "pending",
+		Output: map[string]any{"dir": dir, "stream_upload": true},
+	}}, order: []string{"mag1"}}
+
+	if freed := a.cleanupCompletedJobMedia(); freed != 0 {
+		t.Fatalf("pending magnet review must not clean media: freed=%d", freed)
+	}
+	if _, err := os.Stat(video); err != nil {
+		t.Fatalf("pending magnet media was removed prematurely: %v", err)
+	}
+
+	a.jobs["mag1"].ReviewState = "passed"
+	if freed := a.cleanupCompletedJobMedia(); freed != int64(len("torrent-content")) {
+		t.Fatalf("approved magnet review should clean media: freed=%d", freed)
+	}
+	if _, err := os.Stat(video); !os.IsNotExist(err) {
+		t.Fatalf("magnet video file should have been deleted: %v", err)
+	}
+}
+
+
 
