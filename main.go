@@ -565,7 +565,7 @@ func (a *App) set(j *Job, status, err string, out any, logs string) {
 	if status == "failed" {
 		j.FailureCategory = classifyFailure(err, logs)
 		if j.FailureCategory == "upload_rate_limit" {
-			cooldownUntil := time.Now().Add(15 * time.Minute)
+			cooldownUntil := time.Now().Add(30 * time.Minute)
 			if cooldownUntil.After(a.uploadCooldownUntil) {
 				a.uploadCooldownUntil = cooldownUntil
 			}
@@ -595,7 +595,11 @@ func (a *App) set(j *Job, status, err string, out any, logs string) {
 		}
 	} else if status == "failed" {
 		j.Finished = time.Now()
-		j.Step = "失败"
+		if j.FailureCategory == "upload_rate_limit" {
+			j.Step = "等待B站限流/风控解除 (可人工验证或次日自动刷新)"
+		} else {
+			j.Step = "失败"
+		}
 	} else if status == "canceled" {
 		j.Finished = time.Now()
 		j.Step = "已取消"
@@ -613,18 +617,14 @@ func (a *App) retryDelayFor(category string, retryNo int) time.Duration {
 	}
 	base := a.cfg.AutoRetryBase
 	if category == "upload_rate_limit" {
-		// Bilibili's 406 cooldown is much longer than a normal network retry.
-		// Retrying every 30 seconds only makes the account stay throttled.
-		base = 15 * time.Minute
+		// Rate limiting: pause for 30 minutes between attempts so operator can
+		// verify on Bilibili or next-day quota refreshes automatically.
+		return 30 * time.Minute
 	}
 	if retryNo > 5 {
 		retryNo = 5
 	}
-	delay := base * time.Duration(1<<(retryNo-1))
-	if category == "upload_rate_limit" && delay > 4*time.Hour {
-		return 4 * time.Hour
-	}
-	return delay
+	return base * time.Duration(1<<(retryNo-1))
 }
 
 // classifyFailure turns noisy external-tool output into a stable category that
@@ -635,9 +635,14 @@ func classifyFailure(err, logs string) string {
 	case strings.Contains(s, "队列等待超时"), strings.Contains(s, "queue wait timeout"):
 		return "queue_timeout"
 	case strings.Contains(s, "code 406"), strings.Contains(s, `"code":406`),
-		strings.Contains(s, "上传视频过快"), strings.Contains(s, "upload too fast"):
-		return "upload_rate_limit"
-	case strings.Contains(s, "code 601"), strings.Contains(s, "upload rate limit"):
+		strings.Contains(s, "code 601"), strings.Contains(s, `"code":601`),
+		strings.Contains(s, "code 21564"), strings.Contains(s, `"code":21564`),
+		strings.Contains(s, "code 21085"), strings.Contains(s, `"code":21085`),
+		strings.Contains(s, "上传视频过快"), strings.Contains(s, "upload too fast"),
+		strings.Contains(s, "上传频次"), strings.Contains(s, "投稿频次"),
+		strings.Contains(s, "验证码"), strings.Contains(s, "geetest"),
+		strings.Contains(s, "限流"), strings.Contains(s, "风控"),
+		strings.Contains(s, "upload rate limit"), strings.Contains(s, "biliup rate limit"):
 		return "upload_rate_limit"
 	case strings.Contains(s, "magnet_timeout"):
 		return "magnet_timeout"
@@ -655,10 +660,10 @@ func isAutoRetryableCategory(category string) bool {
 }
 
 func autoRetryAllowed(max, count int, category string) bool {
-	// Do not keep hammering a Bilibili account after repeated 406 cooldowns.
-	// A later retry must be an explicit operator action.
-	if category == "upload_rate_limit" && count >= 5 {
-		return false
+	// Rate limiting is NOT a permanent failure: keep task pending with periodic retries
+	// indefinitely until manually verified or refreshed next day.
+	if category == "upload_rate_limit" {
+		return true
 	}
 	return (max <= 0 || count < max) && isAutoRetryableCategory(category)
 }
@@ -2852,7 +2857,7 @@ func biliRepairActionFor(code int) biliRepairAction {
 	switch code {
 	case 0:
 		return biliRepairSuccess
-	case -101, 21016, 21017, 21018, 21070, 21071, 21564:
+	case -101, 21016, 21017, 21018, 21070, 21071:
 		return biliRepairStop
 	case 21020, 21021, 21022:
 		return biliRepairTitle
@@ -2868,7 +2873,7 @@ func biliRepairActionFor(code int) biliRepairAction {
 		// biliup's own Python implementation treats this as web-submit
 		// incompatibility and falls back to the client endpoint.
 		return biliRepairSwitch
-	case 406, 601:
+	case 406, 601, 21564, 21085:
 		return biliRepairRateLimit
 	default:
 		return biliRepairUnknown
@@ -3178,19 +3183,14 @@ func (a *App) executeBiliupUpload(ctx context.Context, q uploadReq) (map[string]
 		case biliRepairStop:
 			if res.Code == 21070 || res.Code == 21071 {
 				execErr = fmt.Errorf("B站提示：检测到重复稿件或相同视频正在审核中 (code %d: %s)", res.Code, res.Message)
-			} else if res.Code == 21564 {
-				execErr = fmt.Errorf("B站账号今日投稿频次已达限制 (code %d: %s)，已自动保护队列", res.Code, res.Message)
 			} else {
 				execErr = fmt.Errorf("B站登录凭证失效 (code %d: %s)，请在控制台更新 cookies.json", res.Code, res.Message)
 			}
 			goto finish
 
 		case biliRepairRateLimit:
-			// 406/601 are server-side upload throttles. Switching endpoints or
-			// immediately retrying only amplifies the throttle, so stop this
-			// attempt and let the queue retry after an operator/chill-down period.
-			totalLogs += fmt.Sprintf("[自动化自愈] B站上传限速 (code %d)，停止快速切换线路，保留本地文件等待冷却后重试。\n", res.Code)
-			execErr = fmt.Errorf("B站上传限速 (code %d: %s)，请等待冷却后重试", res.Code, res.Message)
+			totalLogs += fmt.Sprintf("[风控/限流保护] B站提示限流或需人工验证 (code %d: %s)。这不是错误，停止快速切换线路，本地视频已完整保留，任务将自动挂起等待人工在B站完成验证或次日自动刷新重试。\n", res.Code, res.Message)
+			execErr = fmt.Errorf("B站投稿限流/需验证 (code %d: %s)，任务已挂起等待人工验证或次日刷新", res.Code, res.Message)
 			goto finish
 
 		case biliRepairTitle:

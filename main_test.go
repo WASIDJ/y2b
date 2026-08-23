@@ -239,9 +239,10 @@ func TestBiliRepairActionMatrix(t *testing.T) {
 		21030: biliRepairTags, 21031: biliRepairTags, 21033: biliRepairTags,
 		21040: biliRepairTID, 21041: biliRepairTID, 21042: biliRepairTID,
 		21050: biliRepairCover, 21051: biliRepairCover, 21052: biliRepairCover,
-		21070: biliRepairStop, 21071: biliRepairStop, 21564: biliRepairStop,
+		21070: biliRepairStop, 21071: biliRepairStop,
 		21138: biliRepairSwitch,
-		601:   biliRepairRateLimit, 99999: biliRepairUnknown,
+		406:   biliRepairRateLimit, 601: biliRepairRateLimit, 21564: biliRepairRateLimit, 21085: biliRepairRateLimit,
+		99999: biliRepairUnknown,
 	}
 	for code, want := range cases {
 		if got := biliRepairActionFor(code); got != want {
@@ -371,6 +372,10 @@ func TestFailureCategoriesOnlyRetryTransientErrors(t *testing.T) {
 	}
 	if !isAutoRetryableCategory("queue_timeout") || !isAutoRetryableCategory("upload_rate_limit") {
 		t.Fatal("transient categories should be auto-retryable")
+	}
+	// Rate limit retries must not be capped
+	if !autoRetryAllowed(5, 10, "upload_rate_limit") {
+		t.Fatal("upload_rate_limit must remain auto-retryable indefinitely")
 	}
 }
 
