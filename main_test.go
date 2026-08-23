@@ -875,6 +875,27 @@ func TestResumableJobUploadPreservesFilesAndVID(t *testing.T) {
 	if !ok || len(upInput.Files) != 2 || upInput.VID != "BV1xx411c7mD" {
 		t.Fatalf("unexpected newJob input: %+v", newJob.Input)
 	}
+
+	// Case 3: When local files are deleted, retryJob automatically falls back to pipeline
+	_ = os.Remove(v1)
+	_ = os.Remove(v2)
+	fallbackApp := &App{
+		jobs: map[string]*Job{
+			failedJob.ID: failedJob,
+		},
+		order: []string{failedJob.ID},
+	}
+	fallbackJob, err := fallbackApp.retryJob(failedJob.ID)
+	if err != nil {
+		t.Fatalf("retryJob fallback failed: %v", err)
+	}
+	if fallbackJob.Kind != "pipeline" {
+		t.Fatalf("expected fallback to pipeline when media files are missing, got %s", fallbackJob.Kind)
+	}
+	pipeInput, ok := fallbackJob.Input.(pipelineReq)
+	if !ok || pipeInput.URL != "https://youtu.be/test" {
+		t.Fatalf("unexpected fallback pipeline input: %+v", fallbackJob.Input)
+	}
 }
 
 

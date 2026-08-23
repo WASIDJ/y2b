@@ -824,10 +824,42 @@ func (a *App) cleanupOrphanedMedia() int64 {
 			continue
 		}
 		activeIDs[id] = true
-		if j.ReviewState != "passed" {
+
+		// Never delete directories of jobs that are not completed and passed
+		if j.ReviewState != "passed" || j.Status != "done" {
+			// Check Output
 			if out := outputMap(j.Output); out != nil {
 				if d, ok := out["dir"].(string); ok && d != "" {
 					activeIDs[filepath.Base(d)] = true
+				}
+				for _, f := range stringSlice(out["video_files"]) {
+					activeIDs[filepath.Base(filepath.Dir(f))] = true
+				}
+			}
+			// Check Input
+			if j.Input != nil {
+				if b, err := json.Marshal(j.Input); err == nil {
+					var p struct {
+						ResumeDir string   `json:"resume_dir"`
+						File      string   `json:"file"`
+						Files     []string `json:"files"`
+					}
+					_ = json.Unmarshal(b, &p)
+					if p.ResumeDir != "" {
+						activeIDs[filepath.Base(p.ResumeDir)] = true
+					}
+					if p.File != "" {
+						activeIDs[filepath.Base(filepath.Dir(p.File))] = true
+					}
+					for _, f := range p.Files {
+						activeIDs[filepath.Base(filepath.Dir(f))] = true
+						if rel, err := filepath.Rel(a.cfg.DataDir, f); err == nil {
+							parts := strings.Split(rel, string(filepath.Separator))
+							if len(parts) >= 2 {
+								activeIDs[parts[1]] = true
+							}
+						}
+					}
 				}
 			}
 		}
@@ -1264,15 +1296,77 @@ func (a *App) retryJob(jobID string) (*Job, error) {
 		if req, ok := resumableJobUpload(old); ok {
 			retryKind = "biliup"
 			retryInput = req
-		} else if out := outputMap(old.Output); out != nil {
-			if dir, ok := out["dir"].(string); ok && dir != "" {
-				if old.Kind == "pipeline" {
-					var pipeline pipelineReq
+		} else {
+			sourceURL := ""
+			tid := "188"
+			tags := ""
+			translate := false
+			if old.Kind == "biliup" {
+				if up, ok := old.Input.(uploadReq); ok {
+					sourceURL = up.Source
+					tid = up.Tid
+					tags = up.Tag
+					translate = up.Translate
+				} else {
+					var up uploadReq
 					if b, err := json.Marshal(old.Input); err == nil {
-						_ = json.Unmarshal(b, &pipeline)
+						_ = json.Unmarshal(b, &up)
+						sourceURL = up.Source
+						tid = up.Tid
+						tags = up.Tag
+						translate = up.Translate
 					}
-					pipeline.ResumeDir = dir
-					retryInput = pipeline
+				}
+			} else if old.Kind == "pipeline" {
+				var p pipelineReq
+				if b, err := json.Marshal(old.Input); err == nil {
+					_ = json.Unmarshal(b, &p)
+					sourceURL = p.URL
+					tid = p.Tid
+					tags = p.Tags
+					translate = p.Translate
+				}
+			} else if old.Kind == "youtube" {
+				var y youtubeReq
+				if b, err := json.Marshal(old.Input); err == nil {
+					_ = json.Unmarshal(b, &y)
+					sourceURL = y.URL
+					tid = y.Tid
+					tags = y.Tags
+					translate = y.Translate
+				}
+			} else if old.Kind == "magnet" {
+				var m magnetReq
+				if b, err := json.Marshal(old.Input); err == nil {
+					_ = json.Unmarshal(b, &m)
+					sourceURL = m.URL
+					if sourceURL == "" {
+						sourceURL = m.Magnet
+					}
+					tid = m.Tid
+					tags = m.Tags
+					translate = m.Translate
+				}
+			}
+
+			if sourceURL != "" && (validYouTube(sourceURL) || validTorrentOrMagnet(sourceURL)) {
+				retryKind = "pipeline"
+				retryInput = pipelineReq{
+					URL:       sourceURL,
+					Tid:       tid,
+					Tags:      tags,
+					Translate: translate,
+				}
+			} else if out := outputMap(old.Output); out != nil {
+				if dir, ok := out["dir"].(string); ok && dir != "" {
+					if old.Kind == "pipeline" {
+						var pipeline pipelineReq
+						if b, err := json.Marshal(old.Input); err == nil {
+							_ = json.Unmarshal(b, &pipeline)
+						}
+						pipeline.ResumeDir = dir
+						retryInput = pipeline
+					}
 				}
 			}
 		}
