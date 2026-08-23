@@ -147,6 +147,26 @@ func env(k, d string) string {
 	return d
 }
 
+// loadOrCreateSecretKey reads the HMAC signing key from <dataDir>/.secret_key.
+// If the file does not exist, a cryptographically random 32-byte key is
+// generated and stored so it survives service restarts. This avoids shipping a
+// fixed default key in the source code while keeping tokens valid across
+// process restarts.
+func loadOrCreateSecretKey(dataDir string) string {
+	keyFile := filepath.Join(dataDir, ".secret_key")
+	if b, err := os.ReadFile(keyFile); err == nil && len(b) >= 32 {
+		return strings.TrimSpace(string(b))
+	}
+	raw := make([]byte, 32)
+	if _, err := rand.Read(raw); err != nil {
+		return hex.EncodeToString([]byte(fmt.Sprintf("y2b-auto-%d", time.Now().UnixNano())))
+	}
+	key := hex.EncodeToString(raw)
+	_ = os.MkdirAll(dataDir, 0750)
+	_ = os.WriteFile(keyFile, []byte(key), 0600)
+	return key
+}
+
 func loadEnvFile(path string) {
 	b, err := os.ReadFile(path)
 	if err != nil {
@@ -172,6 +192,7 @@ func loadEnvFile(path string) {
 func loadConfig() Config {
 	loadEnvFile("/etc/y2b.env")
 
+	dataDir := env("Y2B_DATA", "/srv/y2b/data")
 	key := os.Getenv("DEEPSEEK_API_KEY")
 	if key == "" {
 		key = os.Getenv("Y2B_LLM_API_KEY")
@@ -188,9 +209,16 @@ func loadConfig() Config {
 	adminUser := env("WEB_USER", "admin")
 	adminPass := os.Getenv("WEB_PASSWORD")
 	if adminPass == "" {
-		adminPass = env("Y2B_ADMIN_PASSWORD", "y2b@vibe2026")
+		adminPass = os.Getenv("Y2B_ADMIN_PASSWORD")
 	}
-	secretKey := env("WEB_SECRET_KEY", "y2b_jwt_secret_token_key_2026_x86")
+	if adminPass == "" {
+		fmt.Fprintln(os.Stderr, "[y2b] WARNING: WEB_PASSWORD is not set. Authentication is DISABLED. "+
+			"Set WEB_PASSWORD or Y2B_ADMIN_PASSWORD in /etc/y2b.env to protect the web console.")
+	}
+	secretKey := os.Getenv("WEB_SECRET_KEY")
+	if secretKey == "" {
+		secretKey = loadOrCreateSecretKey(dataDir)
+	}
 	uploadTimeout := 4 * time.Hour
 	if raw := os.Getenv("Y2B_UPLOAD_TIMEOUT"); raw != "" {
 		if parsed, err := time.ParseDuration(raw); err == nil && parsed > 0 {
@@ -4005,16 +4033,17 @@ func (a *App) deleteMediaHandler(w http.ResponseWriter, r *http.Request) {
 		jsonResp(w, 400, map[string]string{"error": "folder path required"})
 		return
 	}
-	clean := filepath.Clean(q.Folder)
-	if !strings.HasPrefix(clean, a.cfg.DataDir) {
+	root, _ := filepath.Abs(a.cfg.DataDir)
+	target, _ := filepath.Abs(q.Folder)
+	if target == root || !strings.HasPrefix(target, root+string(os.PathSeparator)) {
 		jsonResp(w, 403, map[string]string{"error": "forbidden path outside data dir"})
 		return
 	}
-	if err := os.RemoveAll(clean); err != nil {
+	if err := os.RemoveAll(target); err != nil {
 		jsonResp(w, 500, map[string]string{"error": err.Error()})
 		return
 	}
-	jsonResp(w, 200, map[string]any{"ok": true, "folder": clean})
+	jsonResp(w, 200, map[string]any{"ok": true, "folder": target})
 }
 
 // ==========================================

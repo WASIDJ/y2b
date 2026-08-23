@@ -473,3 +473,45 @@ echo 'code: 0 BV1AbCDeFgH1 投稿成功'
 		t.Fatalf("original part was unexpectedly removed: %v", err)
 	}
 }
+
+func TestDeleteMediaHandlerPathTraversal(t *testing.T) {
+	dataDir := t.TempDir()
+	a := &App{cfg: Config{DataDir: dataDir}}
+
+	cases := []struct {
+		folder string
+		want   int
+	}{
+		{folder: dataDir + "/youtube/abc", want: 200},
+		{folder: dataDir, want: 403},
+		{folder: dataDir + "-evil", want: 403},
+		{folder: "/etc/passwd", want: 403},
+		{folder: dataDir + "/../etc", want: 403},
+	}
+
+	_ = os.MkdirAll(dataDir+"/youtube/abc", 0750)
+
+	for _, tc := range cases {
+		body := strings.NewReader(`{"folder":"` + tc.folder + `"}`)
+		req := httptest.NewRequest("DELETE", "/api/media", body)
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		a.deleteMediaHandler(w, req)
+		if w.Code != tc.want {
+			t.Errorf("folder %q: got HTTP %d, want %d", tc.folder, w.Code, tc.want)
+		}
+	}
+}
+
+func TestLoadOrCreateSecretKey(t *testing.T) {
+	dir := t.TempDir()
+	key1 := loadOrCreateSecretKey(dir)
+	if len(key1) < 32 {
+		t.Fatalf("generated key too short: %q", key1)
+	}
+	key2 := loadOrCreateSecretKey(dir)
+	if key1 != key2 {
+		t.Fatalf("key changed between calls: %q vs %q", key1, key2)
+	}
+}
+
