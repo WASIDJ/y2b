@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -123,6 +124,16 @@ type JobProgress struct {
 	UpdatedAt  time.Time `json:"updated_at"`
 }
 
+type loginAttempt struct {
+	count    int
+	lockedTo time.Time
+}
+
+type mediaScanCache struct {
+	cachedAt time.Time
+	pkgs     []MediaPackage
+}
+
 type App struct {
 	cfg                 Config
 	mu                  sync.RWMutex
@@ -138,6 +149,10 @@ type App struct {
 	stats               AppStats
 	netStats            NetworkStats
 	reviewMu            sync.Mutex
+	loginMu             sync.Mutex
+	loginAttempts       map[string]*loginAttempt
+	mediaCacheMu        sync.Mutex
+	mediaCache          mediaScanCache
 }
 
 func env(k, d string) string {
@@ -3815,6 +3830,14 @@ func calcDirSize(dir string) int64 {
 }
 
 func (a *App) scanMediaPackages() []MediaPackage {
+	a.mediaCacheMu.Lock()
+	if time.Since(a.mediaCache.cachedAt) < 3*time.Second && a.mediaCache.pkgs != nil {
+		cached := a.mediaCache.pkgs
+		a.mediaCacheMu.Unlock()
+		return cached
+	}
+	a.mediaCacheMu.Unlock()
+
 	root := a.cfg.DataDir
 	sources := []string{"youtube", "magnet"}
 	pkgs := make([]MediaPackage, 0)
@@ -3916,6 +3939,12 @@ func (a *App) scanMediaPackages() []MediaPackage {
 		}
 	}
 
+	a.mediaCacheMu.Lock()
+	a.mediaCache = mediaScanCache{
+		cachedAt: time.Now(),
+		pkgs:     pkgs,
+	}
+	a.mediaCacheMu.Unlock()
 	return pkgs
 }
 
@@ -5390,6 +5419,23 @@ func (a *App) isAuthorized(r *http.Request) bool {
 	return false
 }
 
+func getClientIP(r *http.Request) string {
+	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+		parts := strings.Split(xff, ",")
+		if len(parts) > 0 && strings.TrimSpace(parts[0]) != "" {
+			return strings.TrimSpace(parts[0])
+		}
+	}
+	if xri := r.Header.Get("X-Real-IP"); xri != "" {
+		return strings.TrimSpace(xri)
+	}
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err == nil {
+		return host
+	}
+	return r.RemoteAddr
+}
+
 type loginReq struct {
 	Username string `json:"username"`
 	Password string `json:"password"`
@@ -5400,6 +5446,25 @@ func (a *App) loginHandler(w http.ResponseWriter, r *http.Request) {
 		jsonResp(w, 405, map[string]string{"error": "method not allowed"})
 		return
 	}
+
+	ip := getClientIP(r)
+	now := time.Now()
+
+	a.loginMu.Lock()
+	if a.loginAttempts == nil {
+		a.loginAttempts = make(map[string]*loginAttempt)
+	}
+	attempt := a.loginAttempts[ip]
+	if attempt != nil && now.Before(attempt.lockedTo) {
+		a.loginMu.Unlock()
+		remaining := int(attempt.lockedTo.Sub(now).Seconds()) + 1
+		jsonResp(w, 429, map[string]any{
+			"error": fmt.Sprintf("登录失败次数过多，已被临时锁定，请在 %d 秒后再试", remaining),
+		})
+		return
+	}
+	a.loginMu.Unlock()
+
 	var req loginReq
 	if decode(r, &req) != nil {
 		jsonResp(w, 400, map[string]string{"error": "invalid JSON"})
@@ -5412,9 +5477,24 @@ func (a *App) loginHandler(w http.ResponseWriter, r *http.Request) {
 	passMatch := subtle.ConstantTimeCompare([]byte(req.Password), []byte(expectedPass)) == 1
 
 	if !userMatch || !passMatch {
+		a.loginMu.Lock()
+		if a.loginAttempts[ip] == nil {
+			a.loginAttempts[ip] = &loginAttempt{}
+		}
+		att := a.loginAttempts[ip]
+		att.count++
+		if att.count >= 5 {
+			att.lockedTo = now.Add(5 * time.Minute)
+			att.count = 0
+		}
+		a.loginMu.Unlock()
 		jsonResp(w, 401, map[string]string{"error": "账号或密码错误"})
 		return
 	}
+
+	a.loginMu.Lock()
+	delete(a.loginAttempts, ip)
+	a.loginMu.Unlock()
 
 	token := a.createToken(req.Username)
 	http.SetCookie(w, &http.Cookie{

@@ -700,6 +700,65 @@ func TestBuildYTDLPAndAria2ArgsHelpers(t *testing.T) {
 	}
 }
 
+func TestLoginRateLimiting(t *testing.T) {
+	a := &App{
+		cfg: Config{
+			AdminUser: "admin",
+			AdminPass: "correct-password",
+			SecretKey: "secret-key-123456789012345678901234",
+		},
+	}
+
+	badBody := `{"username":"admin","password":"wrong-password"}`
+	for i := 0; i < 5; i++ {
+		req := httptest.NewRequest("POST", "/api/login", strings.NewReader(badBody))
+		w := httptest.NewRecorder()
+		a.loginHandler(w, req)
+		if w.Code != 401 {
+			t.Fatalf("attempt %d: expected 401, got %d", i+1, w.Code)
+		}
+	}
+
+	// 6th attempt should be locked out with 429 Too Many Requests
+	req := httptest.NewRequest("POST", "/api/login", strings.NewReader(badBody))
+	w := httptest.NewRecorder()
+	a.loginHandler(w, req)
+	if w.Code != 429 {
+		t.Fatalf("expected 429 Too Many Requests after 5 failed attempts, got %d", w.Code)
+	}
+
+	// Even correct password is locked out
+	goodBody := `{"username":"admin","password":"correct-password"}`
+	req2 := httptest.NewRequest("POST", "/api/login", strings.NewReader(goodBody))
+	w2 := httptest.NewRecorder()
+	a.loginHandler(w2, req2)
+	if w2.Code != 429 {
+		t.Fatalf("expected locked IP to be rejected with 429 even with correct password, got %d", w2.Code)
+	}
+}
+
+func TestScanMediaPackagesCaching(t *testing.T) {
+	dir := t.TempDir()
+	a := &App{cfg: Config{DataDir: dir}}
+
+	// First scan
+	pkgs1 := a.scanMediaPackages()
+	if len(pkgs1) != 0 {
+		t.Fatalf("expected empty packages, got %d", len(pkgs1))
+	}
+
+	// Add a new package directory
+	_ = os.MkdirAll(filepath.Join(dir, "youtube", "vid1"), 0750)
+	_ = os.WriteFile(filepath.Join(dir, "youtube", "vid1", "vid.mp4"), []byte("data"), 0600)
+
+	// Immediate second scan should hit cache
+	pkgs2 := a.scanMediaPackages()
+	if len(pkgs2) != 0 {
+		t.Fatalf("expected cached empty result within 3s, got %d", len(pkgs2))
+	}
+}
+
+
 
 
 
