@@ -59,6 +59,8 @@ type Config struct {
 	BTListenPort     string
 	AutoRetryMax     int
 	AutoRetryBase    time.Duration
+	ReviewInterval   time.Duration
+	ReviewRepairMax  int
 }
 
 type MonitoredChannel struct {
@@ -98,6 +100,11 @@ type Job struct {
 	Progress        *JobProgress `json:"progress,omitempty"`
 	FailureCategory string       `json:"failure_category,omitempty"`
 	AutoRetryCount  int          `json:"auto_retry_count,omitempty"`
+	NextRetryAt     time.Time    `json:"next_retry_at,omitempty"`
+	ReviewState     string       `json:"review_state,omitempty"`
+	ReviewError     string       `json:"review_error,omitempty"`
+	ReviewCheckedAt time.Time    `json:"review_checked_at,omitempty"`
+	ReviewRepairs   int          `json:"review_repairs,omitempty"`
 	ctx             context.Context
 	cancelFunc      context.CancelFunc
 	retry           func(*Job)
@@ -117,18 +124,20 @@ type JobProgress struct {
 }
 
 type App struct {
-	cfg           Config
-	mu            sync.RWMutex
-	jobs          map[string]*Job
-	order         []string
-	downloadSlots chan struct{}
-	uploadSlots   chan struct{}
-	cmu           sync.RWMutex
-	channels      map[string]*MonitoredChannel
-	channelOrder  []string
-	smu           sync.RWMutex
-	stats         AppStats
-	netStats      NetworkStats
+	cfg                 Config
+	mu                  sync.RWMutex
+	jobs                map[string]*Job
+	order               []string
+	downloadSlots       chan struct{}
+	uploadSlots         chan struct{}
+	uploadCooldownUntil time.Time
+	cmu                 sync.RWMutex
+	channels            map[string]*MonitoredChannel
+	channelOrder        []string
+	smu                 sync.RWMutex
+	stats               AppStats
+	netStats            NetworkStats
+	reviewMu            sync.Mutex
 }
 
 func env(k, d string) string {
@@ -188,20 +197,29 @@ func loadConfig() Config {
 			uploadTimeout = parsed
 		}
 	}
-	queueWaitTimeout := 2 * time.Hour
+	// A queued job must not be discarded merely because another large torrent
+	// is downloading. The queue is intentionally serialized on this host.
+	// Zero means wait until the job is explicitly canceled or the process
+	// context ends; queue length must not turn into a false download failure.
+	queueWaitTimeout := time.Duration(0)
 	if raw := os.Getenv("Y2B_QUEUE_WAIT_TIMEOUT"); raw != "" {
 		if parsed, err := time.ParseDuration(raw); err == nil && parsed > 0 {
 			queueWaitTimeout = parsed
 		}
 	}
-	magnetTimeout := 30 * time.Minute
+	// Torrent metadata/peer discovery can legitimately take longer than a
+	// short HTTP request. Keep this bounded, but do not fail large jobs after
+	// the old 30-minute window.
+	magnetTimeout := 6 * time.Hour
 	if raw := os.Getenv("Y2B_MAGNET_TIMEOUT"); raw != "" {
 		if parsed, err := time.ParseDuration(raw); err == nil && parsed > 0 {
 			magnetTimeout = parsed
 		}
 	}
 	btListenPort := env("Y2B_BT_LISTEN_PORT", "51413")
-	autoRetryMax := 3
+	// Zero means unlimited automatic retries. A transient Bilibili cooldown or
+	// a slow/dead torrent must not turn into a permanently abandoned job.
+	autoRetryMax := 0
 	if raw := os.Getenv("Y2B_AUTO_RETRY_MAX"); raw != "" {
 		if parsed, err := strconv.Atoi(raw); err == nil && parsed >= 0 && parsed <= 10 {
 			autoRetryMax = parsed
@@ -211,6 +229,18 @@ func loadConfig() Config {
 	if raw := os.Getenv("Y2B_AUTO_RETRY_BASE"); raw != "" {
 		if parsed, err := time.ParseDuration(raw); err == nil && parsed > 0 {
 			autoRetryBase = parsed
+		}
+	}
+	reviewInterval := 10 * time.Minute
+	if raw := os.Getenv("Y2B_REVIEW_INTERVAL"); raw != "" {
+		if parsed, err := time.ParseDuration(raw); err == nil && parsed > 0 {
+			reviewInterval = parsed
+		}
+	}
+	reviewRepairMax := 2
+	if raw := os.Getenv("Y2B_REVIEW_REPAIR_MAX"); raw != "" {
+		if parsed, err := strconv.Atoi(raw); err == nil && parsed >= 0 && parsed <= 5 {
+			reviewRepairMax = parsed
 		}
 	}
 
@@ -236,6 +266,8 @@ func loadConfig() Config {
 		BTListenPort:     btListenPort,
 		AutoRetryMax:     autoRetryMax,
 		AutoRetryBase:    autoRetryBase,
+		ReviewInterval:   reviewInterval,
+		ReviewRepairMax:  reviewRepairMax,
 	}
 }
 
@@ -281,6 +313,11 @@ func (a *App) saveJobs() {
 		Progress        *JobProgress `json:"progress,omitempty"`
 		FailureCategory string       `json:"failure_category,omitempty"`
 		AutoRetryCount  int          `json:"auto_retry_count,omitempty"`
+		NextRetryAt     time.Time    `json:"next_retry_at,omitempty"`
+		ReviewState     string       `json:"review_state,omitempty"`
+		ReviewError     string       `json:"review_error,omitempty"`
+		ReviewCheckedAt time.Time    `json:"review_checked_at,omitempty"`
+		ReviewRepairs   int          `json:"review_repairs,omitempty"`
 	}
 
 	list := make([]persistedJob, 0, len(a.order))
@@ -301,6 +338,11 @@ func (a *App) saveJobs() {
 				Progress:        j.Progress,
 				FailureCategory: j.FailureCategory,
 				AutoRetryCount:  j.AutoRetryCount,
+				NextRetryAt:     j.NextRetryAt,
+				ReviewState:     j.ReviewState,
+				ReviewError:     j.ReviewError,
+				ReviewCheckedAt: j.ReviewCheckedAt,
+				ReviewRepairs:   j.ReviewRepairs,
 			})
 		}
 	}
@@ -328,6 +370,7 @@ func (a *App) loadJobs() {
 		if j == nil || j.ID == "" {
 			continue
 		}
+		j.ctx, j.cancelFunc = context.WithCancel(context.Background())
 		if j.Status == "running" || j.Status == "queued" {
 			j.Status = "canceled"
 			j.Error = "服务重启中断"
@@ -470,10 +513,17 @@ func (a *App) set(j *Job, status, err string, out any, logs string) {
 	}
 	if status == "failed" {
 		j.FailureCategory = classifyFailure(err, logs)
-		if a.cfg.AutoRetryMax > j.AutoRetryCount && isAutoRetryableCategory(j.FailureCategory) {
+		if j.FailureCategory == "upload_rate_limit" {
+			cooldownUntil := time.Now().Add(15 * time.Minute)
+			if cooldownUntil.After(a.uploadCooldownUntil) {
+				a.uploadCooldownUntil = cooldownUntil
+			}
+		}
+		if autoRetryAllowed(a.cfg.AutoRetryMax, j.AutoRetryCount, j.FailureCategory) {
 			j.AutoRetryCount++
 			shouldAutoRetry = true
-			retryDelay = a.cfg.AutoRetryBase * time.Duration(1<<(j.AutoRetryCount-1))
+			retryDelay = a.retryDelayFor(j.FailureCategory, j.AutoRetryCount)
+			j.NextRetryAt = time.Now().Add(retryDelay)
 		}
 	}
 	if status == "running" {
@@ -499,6 +549,26 @@ func (a *App) set(j *Job, status, err string, out any, logs string) {
 	if shouldAutoRetry {
 		a.scheduleAutoRetry(j, retryDelay)
 	}
+}
+
+func (a *App) retryDelayFor(category string, retryNo int) time.Duration {
+	if retryNo < 1 {
+		retryNo = 1
+	}
+	base := a.cfg.AutoRetryBase
+	if category == "upload_rate_limit" {
+		// Bilibili's 406 cooldown is much longer than a normal network retry.
+		// Retrying every 30 seconds only makes the account stay throttled.
+		base = 15 * time.Minute
+	}
+	if retryNo > 5 {
+		retryNo = 5
+	}
+	delay := base * time.Duration(1<<(retryNo-1))
+	if category == "upload_rate_limit" && delay > 4*time.Hour {
+		return 4 * time.Hour
+	}
+	return delay
 }
 
 // classifyFailure turns noisy external-tool output into a stable category that
@@ -528,6 +598,15 @@ func isAutoRetryableCategory(category string) bool {
 	return category == "queue_timeout" || category == "upload_rate_limit" || category == "magnet_timeout"
 }
 
+func autoRetryAllowed(max, count int, category string) bool {
+	// Do not keep hammering a Bilibili account after repeated 406 cooldowns.
+	// A later retry must be an explicit operator action.
+	if category == "upload_rate_limit" && count >= 5 {
+		return false
+	}
+	return (max <= 0 || count < max) && isAutoRetryableCategory(category)
+}
+
 func (a *App) scheduleAutoRetry(j *Job, delay time.Duration) {
 	if delay <= 0 {
 		delay = time.Second
@@ -545,30 +624,114 @@ func (a *App) scheduleAutoRetry(j *Job, delay time.Duration) {
 // recoverTransientJobs is called after loading persisted state so failures
 // from before this recovery logic existed also get one bounded retry policy.
 func (a *App) recoverTransientJobs() {
-	if a.cfg.AutoRetryMax <= 0 {
-		return
-	}
+	// Do not resurrect an entire old backlog on every service restart. That
+	// creates a retry storm (and immediately triggers Bilibili's 406 limit).
+	// Jobs that failed recently are safe to recover; older jobs keep their
+	// local media and can be retried deliberately after the cooldown.
+	now := time.Now()
+	recoveryCutoff := now.Add(-30 * time.Minute)
 	a.mu.RLock()
-	failed := make([]*Job, 0)
+	type recovery struct {
+		job   *Job
+		delay time.Duration
+		bump  bool
+	}
+	failed := make([]recovery, 0)
 	for _, oid := range a.order {
 		j := a.jobs[oid]
-		if j != nil && j.Status == "failed" {
+		if j != nil && j.Status == "failed" && !j.Finished.IsZero() && (j.Finished.After(recoveryCutoff) || !j.NextRetryAt.IsZero()) {
 			category := classifyFailure(j.Error, j.Logs)
-			if j.AutoRetryCount < a.cfg.AutoRetryMax && isAutoRetryableCategory(category) {
-				failed = append(failed, j)
+			if autoRetryAllowed(a.cfg.AutoRetryMax, j.AutoRetryCount, category) {
+				retryNo := j.AutoRetryCount
+				if retryNo < 1 {
+					retryNo = 1
+				}
+				delay := a.retryDelayFor(category, retryNo)
+				bump := false
+				if !j.NextRetryAt.IsZero() {
+					delay = time.Until(j.NextRetryAt)
+					if delay < 0 {
+						delay = 0
+					}
+					bump = false
+				}
+				failed = append(failed, recovery{job: j, delay: delay, bump: bump})
 			}
 		}
 	}
 	a.mu.RUnlock()
-	for i, j := range failed {
-		a.mu.Lock()
-		j.AutoRetryCount++
-		a.mu.Unlock()
-		a.scheduleAutoRetry(j, a.cfg.AutoRetryBase*time.Duration(i+1))
+	for _, item := range failed {
+		if item.bump {
+			a.mu.Lock()
+			item.job.AutoRetryCount++
+			item.job.NextRetryAt = time.Now().Add(item.delay)
+			a.mu.Unlock()
+		}
+		a.scheduleAutoRetry(item.job, item.delay)
 	}
 	if len(failed) > 0 {
 		a.saveJobs()
 		fmt.Printf("scheduled %d transient failed jobs for bounded recovery\n", len(failed))
+	}
+}
+
+// recoverInterruptedJobs resumes work that was interrupted by a service
+// restart. Intentional user cancellations do not use this error marker.
+func (a *App) recoverInterruptedJobs() {
+	a.mu.RLock()
+	ids := make([]string, 0)
+	for _, oid := range a.order {
+		j := a.jobs[oid]
+		if j != nil && j.Status == "canceled" && j.Error == "服务重启中断" {
+			ids = append(ids, j.ID)
+		}
+	}
+	a.mu.RUnlock()
+	if len(ids) == 0 {
+		return
+	}
+	go func() {
+		time.Sleep(10 * time.Second)
+		for _, jobID := range ids {
+			if _, err := a.retryJob(jobID); err != nil {
+				fmt.Printf("startup recovery skipped job %s: %v\n", jobID, err)
+			}
+		}
+	}()
+	fmt.Printf("scheduled %d interrupted jobs for automatic recovery\n", len(ids))
+}
+
+// retryWatchdog is the durable backstop for in-memory retry timers. It makes
+// a due retry self-healing even if a timer was lost during a restart or a
+// transient runtime failure.
+func (a *App) retryWatchdog(ctx context.Context) {
+	ticker := time.NewTicker(time.Minute)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			now := time.Now()
+			a.mu.RLock()
+			ids := make([]string, 0)
+			for _, oid := range a.order {
+				j := a.jobs[oid]
+				category := ""
+				if j != nil {
+					category = classifyFailure(j.Error, j.Logs)
+				}
+				if j != nil && j.Status == "failed" && !j.NextRetryAt.IsZero() && !j.NextRetryAt.After(now) && autoRetryAllowed(a.cfg.AutoRetryMax, j.AutoRetryCount, category) {
+					ids = append(ids, j.ID)
+				}
+			}
+			a.mu.RUnlock()
+			for _, jobID := range ids {
+				if _, err := a.retryJob(jobID); err != nil {
+					fmt.Printf("retry watchdog skipped job %s: %v\n", jobID, err)
+				}
+			}
+		}
 	}
 }
 
@@ -791,6 +954,88 @@ func (a *App) dispatchJob(j *Job) {
 	}
 }
 
+// resumablePipelineUpload converts a failed pipeline into an upload-only
+// retry when its local media is complete. This is deliberately conservative:
+// any aria2 control file causes the normal pipeline retry so partial torrent
+// files are never submitted as finished videos.
+func resumablePipelineUpload(j *Job) (uploadReq, bool) {
+	if j == nil || j.Kind != "pipeline" || j.Output == nil {
+		return uploadReq{}, false
+	}
+	out := outputMap(j.Output)
+	if out == nil {
+		return uploadReq{}, false
+	}
+	dir, _ := out["dir"].(string)
+	if dir == "" {
+		return uploadReq{}, false
+	}
+	incomplete := false
+	_ = filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
+		if err == nil && info != nil && !info.IsDir() && strings.HasSuffix(info.Name(), ".aria2") {
+			incomplete = true
+			return filepath.SkipDir
+		}
+		return nil
+	})
+	if incomplete {
+		return uploadReq{}, false
+	}
+
+	var files []string
+	if upload, ok := out["upload"].(map[string]any); ok {
+		files = stringSlice(upload["files"])
+	}
+	if len(files) == 0 {
+		files = stringSlice(out["video_files"])
+	}
+	if len(files) == 0 {
+		return uploadReq{}, false
+	}
+	complete := make([]string, 0, len(files))
+	for _, file := range uniqueMediaFiles(files) {
+		st, err := os.Stat(file)
+		if err == nil && st.Size() > 0 {
+			complete = append(complete, file)
+		}
+	}
+	if len(complete) == 0 {
+		return uploadReq{}, false
+	}
+
+	var pipeline pipelineReq
+	if b, err := json.Marshal(j.Input); err == nil {
+		_ = json.Unmarshal(b, &pipeline)
+	}
+	req := uploadReq{Files: complete, Parts: len(complete) > 1, Source: pipeline.URL, Tid: pipeline.Tid, Tag: pipeline.Tags, Translate: false}
+	if upload, ok := out["upload"].(map[string]any); ok {
+		req.Title, _ = upload["title"].(string)
+		req.Description, _ = upload["description"].(string)
+		req.Cover, _ = upload["cover"].(string)
+		if tid, ok := upload["tid"].(string); ok && tid != "" {
+			req.Tid = tid
+		}
+		if tags, ok := upload["tags"].(string); ok && tags != "" {
+			req.Tag = tags
+		}
+	}
+	return req, true
+}
+
+func stringSlice(value any) []string {
+	items, ok := value.([]any)
+	if !ok {
+		return nil
+	}
+	out := make([]string, 0, len(items))
+	for _, item := range items {
+		if s, ok := item.(string); ok && s != "" {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
 func (a *App) retryJob(jobID string) (*Job, error) {
 	a.mu.Lock()
 	old := a.jobs[jobID]
@@ -803,14 +1048,37 @@ func (a *App) retryJob(jobID string) (*Job, error) {
 		return nil, fmt.Errorf("only failed or canceled jobs can be retried (status=%s)", old.Status)
 	}
 
+	// If a pipeline already finished downloading its media and only the
+	// Bilibili stage failed, resume from the local files instead of starting
+	// the torrent/YouTube download again. An .aria2 control file means the
+	// torrent is still incomplete, so that case remains a normal pipeline
+	// retry.
+	retryKind := old.Kind
+	retryInput := old.Input
+	if old.Kind == "pipeline" && (old.Status == "failed" || old.Status == "canceled") {
+		if req, ok := resumablePipelineUpload(old); ok {
+			retryKind = "biliup"
+			retryInput = req
+		} else if out := outputMap(old.Output); out != nil {
+			if dir, ok := out["dir"].(string); ok && dir != "" {
+				var pipeline pipelineReq
+				if b, err := json.Marshal(old.Input); err == nil {
+					_ = json.Unmarshal(b, &pipeline)
+				}
+				pipeline.ResumeDir = dir
+				retryInput = pipeline
+			}
+		}
+	}
+
 	// A previous version created a new record for every retry. Collapse those
 	// terminal duplicates before retrying, and never start a second copy when
 	// the same input is already queued or running.
-	oldSource := jobSourceKey(old.Kind, old.Input)
+	oldSource := jobSourceKey(retryKind, retryInput)
 	activeDuplicate := (*Job)(nil)
 	removeIDs := make(map[string]bool)
 	for oid, candidate := range a.jobs {
-		if oid == jobID || candidate == nil || candidate.Kind != old.Kind {
+		if oid == jobID || candidate == nil || candidate.Kind != retryKind {
 			continue
 		}
 		if jobSourceKey(candidate.Kind, candidate.Input) != oldSource {
@@ -840,11 +1108,11 @@ func (a *App) retryJob(jobID string) (*Job, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	j := &Job{
 		ID:             id(),
-		Kind:           old.Kind,
+		Kind:           retryKind,
 		Status:         "queued",
 		Step:           "排队中",
 		Created:        time.Now(),
-		Input:          old.Input,
+		Input:          retryInput,
 		ctx:            ctx,
 		cancelFunc:     cancel,
 		AutoRetryCount: old.AutoRetryCount,
@@ -1228,7 +1496,10 @@ func (a *App) createYoutubeHandler(q youtubeReq) func(*Job) {
 					args = append(args, "--cookies", cookiePath)
 				}
 				if langs != "none" && langs != "no" {
-					args = append(args, "--write-subs", "--sub-langs", langs, "--embed-subs")
+					// Keep subtitles as sidecar files. They are submitted to Bilibili
+					// after the video gets a BVID; embedding them here caused yt-dlp
+					// to remove the source files and produced a generic data stream.
+					args = append(args, "--write-subs", "--sub-langs", langs)
 				}
 
 				switch q.Quality {
@@ -1284,8 +1555,7 @@ func (a *App) createYoutubeHandler(q youtubeReq) func(*Job) {
 				for _, f := range files {
 					name := filepath.Base(f)
 					baseFiles = append(baseFiles, name)
-					ext := strings.ToLower(filepath.Ext(name))
-					if ext == ".mp4" || ext == ".mkv" || ext == ".webm" || ext == ".mp3" {
+					if isVideoFilePath(name) {
 						if strings.Contains(name, " - P") || strings.Contains(name, " - C") {
 							chapterFiles = append(chapterFiles, f)
 						} else {
@@ -1295,8 +1565,11 @@ func (a *App) createYoutubeHandler(q youtubeReq) func(*Job) {
 				}
 				targetUploadFiles = videoFiles
 				if len(chapterFiles) > 0 {
-					targetUploadFiles = chapterFiles
+					// A playlist may contain both chapter-split videos and
+					// ordinary videos. Keep both in the same multi-P submission.
+					targetUploadFiles = append(videoFiles, chapterFiles...)
 				}
+				targetUploadFiles = uniqueMediaFiles(targetUploadFiles)
 
 				convertVttToSrtAndBcc(d)
 				if q.BurnSubs && len(targetUploadFiles) > 0 {
@@ -1393,12 +1666,9 @@ func (a *App) createYoutubeHandler(q youtubeReq) func(*Job) {
 					a.recordAiTrans()
 				}
 
-				// Auto-Clean downloaded raw video files after successful Bilibili upload
-				freed := purgeVideoFilesInDir(d)
-				if freed > 0 {
-					totalLogs += fmt.Sprintf("\n[自动空间清理] B站投稿成功，已自动删除原视频文件，释放磁盘空间: %s\n", formatBytes(freed))
-					outMap["cleaned_disk"] = formatBytes(freed)
-				}
+				// Keep source media until the asynchronous Bilibili review passes.
+				outMap["review_state"] = "pending"
+				totalLogs += "\n[审核保护] 投稿接口返回成功，源视频暂不删除，等待B站审核通过。\n"
 			}
 
 			a.set(nj, "done", "", outMap, totalLogs)
@@ -1431,8 +1701,7 @@ func purgeVideoFilesInDir(dir string) int64 {
 		if err != nil || info == nil || info.IsDir() {
 			return nil
 		}
-		switch strings.ToLower(filepath.Ext(info.Name())) {
-		case ".mp4", ".mkv", ".avi", ".webm", ".mp3", ".m4v", ".mov":
+		if isVideoFilePath(info.Name()) {
 			videos = append(videos, path)
 		}
 		return nil
@@ -1444,7 +1713,7 @@ func (a *App) cleanupCompletedJobMedia() int64 {
 	a.mu.RLock()
 	jobs := make([]*Job, 0, len(a.jobs))
 	for _, j := range a.jobs {
-		if j != nil && j.Status == "done" && j.Kind == "pipeline" {
+		if j != nil && j.Status == "done" && j.Kind == "pipeline" && j.ReviewState == "passed" {
 			copy := *j
 			jobs = append(jobs, &copy)
 		}
@@ -1477,10 +1746,421 @@ func (a *App) purgeManagedVideoFiles(files ...string) int64 {
 	return purgeVideoFiles(managed...)
 }
 
+// Biliup exposes the moderation result through `biliup show <BV>`. Keep the
+// parser independent from the CLI's tracing logs so it also works with older
+// biliup versions that print logs before the JSON document.
+type biliReviewResult struct {
+	Archive struct {
+		State        int    `json:"state"`
+		StateDesc    string `json:"state_desc"`
+		HadPassed    bool   `json:"had_passed"`
+		RejectReason string `json:"reject_reason"`
+		ProblemDesc  string `json:"problem_description"`
+		ModifyAdvice string `json:"modify_advise"`
+	} `json:"archive"`
+}
+
+func parseBiliReviewOutput(raw string) (biliReviewResult, error) {
+	var result biliReviewResult
+	start := strings.IndexByte(raw, '{')
+	if start < 0 {
+		return result, errors.New("biliup show 未返回审核 JSON")
+	}
+	if err := json.Unmarshal([]byte(raw[start:]), &result); err != nil {
+		return result, fmt.Errorf("解析B站审核结果失败: %w", err)
+	}
+	return result, nil
+}
+
+func biliReviewState(result biliReviewResult) string {
+	desc := strings.TrimSpace(result.Archive.StateDesc)
+	switch {
+	case strings.Contains(desc, "退回"), strings.Contains(desc, "不通过"), strings.Contains(desc, "驳回"):
+		return "rejected"
+	case result.Archive.HadPassed,
+		strings.Contains(desc, "通过"), strings.Contains(desc, "已发布"), strings.Contains(desc, "开放浏览"):
+		return "passed"
+	default:
+		return "pending"
+	}
+}
+
+func (a *App) fetchBiliReview(ctx context.Context, bvid string) (biliReviewResult, string, error) {
+	args := []string{"-u", a.cfg.BiliCookies, "show", bvid}
+	logs, err := runCmdProgress(ctx, a.cfg.Biliup, args, nil)
+	if err != nil {
+		return biliReviewResult{}, logs, fmt.Errorf("查询B站审核失败: %w", err)
+	}
+	result, parseErr := parseBiliReviewOutput(logs)
+	return result, logs, parseErr
+}
+
+type reviewViolation struct {
+	Part  int
+	Whole bool
+	Start float64
+	End   float64
+}
+
+func parseReviewTimestamp(s string) float64 {
+	parts := strings.Split(s, ":")
+	if len(parts) != 2 && len(parts) != 3 {
+		return -1
+	}
+	var values []float64
+	for _, part := range parts {
+		v, err := strconv.ParseFloat(strings.TrimSpace(part), 64)
+		if err != nil {
+			return -1
+		}
+		values = append(values, v)
+	}
+	if len(values) == 2 {
+		return values[0]*60 + values[1]
+	}
+	return values[0]*3600 + values[1]*60 + values[2]
+}
+
+func parseReviewViolations(reason string) []reviewViolation {
+	re := regexp.MustCompile(`(?i)P(\d+)(?:\(?(\d{1,2}:\d{2}(?::\d{2})?)-(\d{1,2}:\d{2}(?::\d{2})?)\)?|内容全程)`)
+	matches := re.FindAllStringSubmatch(reason, -1)
+	violations := make([]reviewViolation, 0, len(matches))
+	for _, match := range matches {
+		part, err := strconv.Atoi(match[1])
+		if err != nil || part < 1 {
+			continue
+		}
+		if strings.Contains(match[0], "内容全程") {
+			violations = append(violations, reviewViolation{Part: part, Whole: true})
+			continue
+		}
+		start, end := parseReviewTimestamp(match[2]), parseReviewTimestamp(match[3])
+		if start >= 0 && end > start {
+			violations = append(violations, reviewViolation{Part: part, Start: start, End: end})
+		}
+	}
+	return violations
+}
+
+func asStringSlice(value any) []string {
+	items, ok := value.([]any)
+	if !ok {
+		return nil
+	}
+	result := make([]string, 0, len(items))
+	for _, item := range items {
+		if s, ok := item.(string); ok && s != "" {
+			result = append(result, s)
+		}
+	}
+	return result
+}
+
+func (a *App) reviewUploadFiles(ctx context.Context, files []string, reason, repairDir string) ([]string, string, error) {
+	violations := parseReviewViolations(reason)
+	if len(violations) == 0 {
+		return nil, "", errors.New("审核退回原因未包含可自动修复的分P或时间点")
+	}
+	byPart := make(map[int][]reviewViolation)
+	for _, violation := range violations {
+		byPart[violation.Part] = append(byPart[violation.Part], violation)
+	}
+	if err := os.MkdirAll(repairDir, 0750); err != nil {
+		return nil, "", err
+	}
+	result := make([]string, 0, len(files))
+	var logs strings.Builder
+	for index, file := range files {
+		part := index + 1
+		violationsForPart := byPart[part]
+		if len(violationsForPart) == 0 {
+			name := safePartFilename(partTitleFromFile(file), index, filepath.Ext(file))
+			target := filepath.Join(repairDir, name)
+			if err := os.Symlink(file, target); err != nil && !os.IsExist(err) {
+				return nil, logs.String(), err
+			}
+			result = append(result, target)
+			continue
+		}
+		whole := false
+		for _, violation := range violationsForPart {
+			whole = whole || violation.Whole
+		}
+		if whole {
+			logs.WriteString(fmt.Sprintf("[审核修复] 删除 P%d 全部内容\n", part))
+			continue
+		}
+		target := filepath.Join(repairDir, safePartFilename(partTitleFromFile(file)+"（审核修复）", index, filepath.Ext(file)))
+		if err := trimReviewVideo(ctx, file, target, violationsForPart); err != nil {
+			return nil, logs.String(), fmt.Errorf("修复 P%d 失败: %w", part, err)
+		}
+		logs.WriteString(fmt.Sprintf("[审核修复] P%d 已移除 %d 个违规时间段\n", part, len(violationsForPart)))
+		result = append(result, target)
+	}
+	if len(result) == 0 {
+		return nil, logs.String(), errors.New("审核修复后没有可投稿的视频")
+	}
+	return result, logs.String(), nil
+}
+
+func trimReviewVideo(ctx context.Context, input, output string, violations []reviewViolation) error {
+	durationRaw, err := runCmdProgress(ctx, "ffprobe", []string{"-v", "error", "-show_entries", "format=duration", "-of", "default=nw=1:nk=1", input}, nil)
+	if err != nil {
+		return err
+	}
+	duration, err := strconv.ParseFloat(strings.TrimSpace(durationRaw), 64)
+	if err != nil || duration <= 0 {
+		return fmt.Errorf("无法读取视频时长")
+	}
+	sort.Slice(violations, func(i, j int) bool { return violations[i].Start < violations[j].Start })
+	type segment struct{ start, end float64 }
+	segments := make([]segment, 0, len(violations)+1)
+	cursor := 0.0
+	for _, violation := range violations {
+		start, end := math.Max(0, violation.Start), math.Min(duration, violation.End)
+		if start > cursor {
+			segments = append(segments, segment{cursor, start})
+		}
+		if end > cursor {
+			cursor = end
+		}
+	}
+	if cursor < duration {
+		segments = append(segments, segment{cursor, duration})
+	}
+	if len(segments) == 0 {
+		return errors.New("违规时间段覆盖了整个视频")
+	}
+	filters := make([]string, 0, len(segments)*2)
+	concatInputs := make([]string, 0, len(segments)*2)
+	for i, segment := range segments {
+		filters = append(filters,
+			fmt.Sprintf("[0:v]trim=start=%f:end=%f,setpts=PTS-STARTPTS[v%d]", segment.start, segment.end, i),
+			fmt.Sprintf("[0:a]atrim=start=%f:end=%f,asetpts=PTS-STARTPTS[a%d]", segment.start, segment.end, i))
+		concatInputs = append(concatInputs, fmt.Sprintf("[v%d][a%d]", i, i))
+	}
+	filters = append(filters, strings.Join(concatInputs, "")+fmt.Sprintf("concat=n=%d:v=1:a=1[v][a]", len(segments)))
+	args := []string{"-y", "-i", input, "-filter_complex", strings.Join(filters, ";"), "-map", "[v]", "-map", "[a]", "-c:v", "libx264", "-preset", "veryfast", "-crf", "18", "-c:a", "aac", "-movflags", "+faststart", output}
+	_, err = runCmdProgress(ctx, "ffmpeg", args, nil)
+	return err
+}
+
+func outputMap(value any) map[string]any {
+	b, err := json.Marshal(value)
+	if err != nil {
+		return nil
+	}
+	var result map[string]any
+	if json.Unmarshal(b, &result) != nil {
+		return nil
+	}
+	return result
+}
+
+func (a *App) reviewUploadRequest(j *Job, files []string, previous map[string]any) uploadReq {
+	q := uploadReq{Files: files, Parts: len(files) > 1}
+	if j.Kind == "pipeline" {
+		var p pipelineReq
+		if b, err := json.Marshal(j.Input); err == nil {
+			_ = json.Unmarshal(b, &p)
+		}
+		q.Translate, q.Tid, q.Tag, q.Source = p.Translate, p.Tid, p.Tags, p.URL
+	} else if b, err := json.Marshal(j.Input); err == nil {
+		_ = json.Unmarshal(b, &q)
+	}
+	if previous != nil {
+		if value, ok := previous["title"].(string); ok {
+			q.Title = value
+		}
+		if value, ok := previous["description"].(string); ok {
+			q.Description = value
+		}
+		if value, ok := previous["tags"].(string); ok {
+			q.Tag = value
+		}
+		if value, ok := previous["tid"].(string); ok {
+			q.Tid = value
+		}
+	}
+	return q
+}
+
+func (a *App) reviewJob(jobID string) {
+	a.mu.RLock()
+	original := a.jobs[jobID]
+	if original == nil || original.Status != "done" || original.ReviewState == "passed" {
+		a.mu.RUnlock()
+		return
+	}
+	job := *original
+	a.mu.RUnlock()
+
+	out := outputMap(job.Output)
+	if out == nil {
+		return
+	}
+	upload, ok := out["upload"].(map[string]any)
+	if !ok {
+		// Direct /api/biliup/upload jobs store the upload result at the
+		// top-level instead of under pipeline.output.upload.
+		if _, hasBVID := out["bvid"].(string); !hasBVID {
+			return
+		}
+		upload = out
+	}
+	bvid, _ := upload["bvid"].(string)
+	if bvid == "" {
+		return
+	}
+	result, showLogs, err := a.fetchBiliReview(job.ctx, bvid)
+	now := time.Now()
+	if err != nil {
+		a.mu.Lock()
+		if current := a.jobs[jobID]; current != nil {
+			current.ReviewState = "pending"
+			current.ReviewError = err.Error()
+			current.ReviewCheckedAt = now
+		}
+		a.mu.Unlock()
+		a.saveJobs()
+		return
+	}
+	state := biliReviewState(result)
+	a.mu.Lock()
+	if current := a.jobs[jobID]; current != nil {
+		current.ReviewState = state
+		current.ReviewError = ""
+		current.ReviewCheckedAt = now
+	}
+	a.mu.Unlock()
+	a.saveJobs()
+
+	if state == "pending" {
+		return
+	}
+	if state == "passed" {
+		files := asStringSlice(upload["files"])
+		if dir, ok := out["dir"].(string); ok && dir != "" {
+			purgeVideoFilesInDir(dir)
+		} else {
+			a.purgeManagedVideoFiles(files...)
+		}
+		if repairDir, ok := upload["review_repair_dir"].(string); ok && repairDir != "" {
+			purgeVideoFilesInDir(repairDir)
+		}
+		upload["review_state"] = "passed"
+		a.mu.Lock()
+		if current := a.jobs[jobID]; current != nil {
+			current.Output = out
+			current.ReviewError = ""
+		}
+		a.mu.Unlock()
+		a.saveJobs()
+		return
+	}
+
+	if job.ReviewRepairs >= a.cfg.ReviewRepairMax {
+		a.mu.Lock()
+		if current := a.jobs[jobID]; current != nil {
+			current.ReviewState = "rejected"
+			current.ReviewError = "审核退回，已达到自动修复次数上限"
+		}
+		a.mu.Unlock()
+		a.saveJobs()
+		return
+	}
+
+	files := asStringSlice(upload["files"])
+	if len(files) == 0 {
+		a.mu.Lock()
+		if current := a.jobs[jobID]; current != nil {
+			current.ReviewState = "rejected"
+			current.ReviewError = "审核退回但找不到原始视频文件，无法自动修复"
+		}
+		a.mu.Unlock()
+		a.saveJobs()
+		return
+	}
+	reason := result.Archive.RejectReason + " " + result.Archive.ProblemDesc + " " + result.Archive.ModifyAdvice
+	repairDir := filepath.Join(filepath.Dir(files[0]), ".y2b-review-repair-"+bvid+"-"+strconv.FormatInt(now.Unix(), 10))
+	repaired, repairLogs, repairErr := a.reviewUploadFiles(job.ctx, files, reason, repairDir)
+	if repairErr != nil {
+		a.mu.Lock()
+		if current := a.jobs[jobID]; current != nil {
+			current.ReviewState = "rejected"
+			current.ReviewError = repairErr.Error()
+			current.Logs += "\n[审核查询]\n" + showLogs + "\n[审核修复]\n" + repairLogs
+		}
+		a.mu.Unlock()
+		a.saveJobs()
+		return
+	}
+
+	if cap := a.uploadSlots; cap != nil {
+		if slotErr := a.acquireSlot(job.ctx, cap); slotErr != nil {
+			return
+		}
+		defer func() { <-cap }()
+	}
+	newUpload, uploadLogs, uploadErr := a.executeBiliupUpload(job.ctx, a.reviewUploadRequest(&job, repaired, upload))
+	a.mu.Lock()
+	if current := a.jobs[jobID]; current != nil {
+		current.ReviewRepairs++
+		current.ReviewCheckedAt = now
+		current.ReviewState = "pending"
+		current.ReviewError = ""
+		current.Logs += "\n[审核查询]\n" + showLogs + "\n[审核修复]\n" + repairLogs + "\n[自动重新投稿]\n" + uploadLogs
+		if uploadErr == nil {
+			newUpload["previous_bvid"] = bvid
+			newUpload["review_state"] = "pending"
+			newUpload["review_repair_dir"] = repairDir
+			current.Output = out
+			current.Output.(map[string]any)["upload"] = newUpload
+		} else {
+			current.ReviewState = "rejected"
+			current.ReviewError = uploadErr.Error()
+		}
+	}
+	a.mu.Unlock()
+	a.saveJobs()
+}
+
+func (a *App) startReviewWatcher(ctx context.Context) {
+	interval := a.cfg.ReviewInterval
+	if interval <= 0 {
+		interval = 10 * time.Minute
+	}
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			a.reviewMu.Lock()
+			a.mu.RLock()
+			ids := make([]string, 0, len(a.order))
+			for _, id := range a.order {
+				if j := a.jobs[id]; j != nil && j.Status == "done" && j.ReviewState != "passed" {
+					ids = append(ids, id)
+				}
+			}
+			a.mu.RUnlock()
+			for _, id := range ids {
+				a.reviewJob(id)
+			}
+			a.reviewMu.Unlock()
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+			}
+		}
+	}()
+}
+
 // Magnet Downloader
 type magnetReq struct {
 	Magnet     string `json:"magnet"`
 	URL        string `json:"url"`
+	SelectFile string `json:"select_file"` // aria2 torrent file index/range, e.g. "3" or "3,7-9"
 	AutoUpload bool   `json:"auto_upload"`
 	Tid        string `json:"tid"`
 	Tags       string `json:"tags"`
@@ -1495,6 +2175,15 @@ func validTorrentOrMagnet(s string) bool {
 		return err == nil && strings.EqualFold(u.Scheme, "magnet") && u.Query().Get("xt") != ""
 	}
 	return strings.HasPrefix(lower, "http://") || strings.HasPrefix(lower, "https://")
+}
+
+func validAriaSelectFile(s string) bool {
+	s = strings.TrimSpace(s)
+	return s == "" || regexp.MustCompile(`^[0-9]+([,-][0-9]+)*$`).MatchString(s)
+}
+
+func isSingleAriaSelectFile(s string) bool {
+	return regexp.MustCompile(`^[0-9]+$`).MatchString(strings.TrimSpace(s))
 }
 
 func isDeadSeedOutput(logs string) bool {
@@ -1641,17 +2330,47 @@ func (a *App) runMagnetStreamingUpload(ctx context.Context, args []string, dir s
 
 func isVideoFilePath(path string) bool {
 	switch strings.ToLower(filepath.Ext(path)) {
-	case ".mp4", ".mkv", ".avi", ".webm", ".mp3", ".m4v", ".mov":
+	case ".mp4", ".mkv", ".avi", ".webm", ".mp3", ".m4v", ".mov",
+		".flv", ".ts", ".mts", ".m2ts", ".3gp", ".ogv", ".f4v",
+		".mpg", ".mpeg", ".wmv", ".asf", ".rm", ".rmvb", ".mxf",
+		".m4a", ".aac", ".wav", ".flac", ".ogg", ".opus":
 		return true
 	default:
 		return false
 	}
 }
 
+// uniqueMediaFiles prevents the same path being counted/uploaded twice when
+// a derived list is combined with its source list or when a directory walk
+// encounters a path through multiple branches.
+func uniqueMediaFiles(files []string) []string {
+	out := make([]string, 0, len(files))
+	seen := make(map[string]struct{}, len(files))
+	for _, file := range files {
+		if strings.TrimSpace(file) == "" || !isVideoFilePath(file) {
+			continue
+		}
+		key := filepath.Clean(file)
+		if abs, err := filepath.Abs(key); err == nil {
+			key = abs
+		}
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, file)
+	}
+	return out
+}
+
 func (a *App) magnet(w http.ResponseWriter, r *http.Request) {
 	var q magnetReq
 	if decode(r, &q) != nil {
 		jsonResp(w, 400, map[string]string{"error": "JSON required"})
+		return
+	}
+	if !validAriaSelectFile(q.SelectFile) {
+		jsonResp(w, 400, map[string]string{"error": "select_file must be aria2 file indexes, e.g. 3 or 3,7-9"})
 		return
 	}
 	m := q.Magnet
@@ -1683,7 +2402,6 @@ func (a *App) createMagnetHandler(q magnetReq) func(*Job) {
 			var totalLogs string
 			var downloadErr error
 			var streamedUploads []map[string]any
-			var streamedFreed int64
 
 			// Stage 1: Magnet Download (acquires downloadSlots)
 			func() {
@@ -1729,9 +2447,19 @@ func (a *App) createMagnetHandler(q magnetReq) func(*Job) {
 					"--bt-tracker=" + btTrackers,
 					m,
 				}
+				if strings.TrimSpace(q.SelectFile) != "" {
+					magnetArgs = append(magnetArgs, "--select-file="+strings.TrimSpace(q.SelectFile))
+				}
 				var magLogs string
 				var err error
-				if q.AutoUpload {
+				// A streamed upload has no single review record for the whole
+				// manuscript. Keep auto-upload in the reviewed batch path so every
+				// source file remains available until its submission is approved.
+				// A single selected torrent file can be uploaded as soon as it
+				// is complete. Multi-file selections remain a batch so Biliup
+				// can preserve the intended multi-P submission.
+				streamUpload := q.AutoUpload && isSingleAriaSelectFile(q.SelectFile)
+				if q.AutoUpload && streamUpload {
 					magLogs, _, err = a.runMagnetStreamingUpload(nj.ctx, magnetArgs, d, func(line string) { a.progressLine(nj, "BT 下载", line) }, func(file string) error {
 						if err := a.acquireSlot(nj.ctx, a.uploadSlots); err != nil {
 							return err
@@ -1752,7 +2480,6 @@ func (a *App) createMagnetHandler(q magnetReq) func(*Job) {
 							a.recordUpload(fileSize)
 							a.recordDownload(fileSize)
 						}
-						streamedFreed += purgeVideoFiles(file)
 						streamedUploads = append(streamedUploads, result)
 						videoFiles = append(videoFiles, file)
 						if videoFile == "" {
@@ -1773,7 +2500,7 @@ func (a *App) createMagnetHandler(q magnetReq) func(*Job) {
 					name := info.Name()
 					baseFiles = append(baseFiles, name)
 					ext := strings.ToLower(filepath.Ext(name))
-					if ext == ".mp4" || ext == ".mkv" || ext == ".avi" || ext == ".webm" || ext == ".mp3" {
+					if isVideoFilePath(name) {
 						videoFiles = append(videoFiles, p)
 						if videoFile == "" || ext == ".mp4" {
 							videoFile = p
@@ -1781,6 +2508,7 @@ func (a *App) createMagnetHandler(q magnetReq) func(*Job) {
 					}
 					return nil
 				})
+				videoFiles = uniqueMediaFiles(videoFiles)
 				sort.Strings(videoFiles)
 			}()
 
@@ -1797,7 +2525,7 @@ func (a *App) createMagnetHandler(q magnetReq) func(*Job) {
 
 			// Streaming uploads have already been committed and cleaned as each
 			// file completed. Do not run the old second upload pass.
-			if q.AutoUpload {
+			if q.AutoUpload && len(streamedUploads) > 0 {
 				if len(streamedUploads) == 0 {
 					a.set(nj, "failed", "no video files found after download", outMap, totalLogs)
 					return
@@ -1808,8 +2536,8 @@ func (a *App) createMagnetHandler(q magnetReq) func(*Job) {
 				}
 				outMap["upload"] = streamedUploads
 				outMap["stream_upload"] = true
-				outMap["cleaned_disk"] = formatBytes(streamedFreed)
-				totalLogs += fmt.Sprintf("\n[自动空间清理] 已按文件上传成功即删除，释放磁盘空间: %s\n", formatBytes(streamedFreed))
+				outMap["review_state"] = "pending"
+				totalLogs += "\n[审核保护] 投稿接口返回成功，源视频暂不删除，等待B站审核通过。\n"
 				a.set(nj, "done", "", outMap, totalLogs)
 				return
 			}
@@ -2130,6 +2858,9 @@ func (a *App) prepareTranslatedPartFiles(ctx context.Context, files []string) ([
 }
 
 func (a *App) executeBiliupUpload(ctx context.Context, q uploadReq) (map[string]any, string, error) {
+	if err := a.waitUploadCooldown(ctx); err != nil {
+		return nil, "", err
+	}
 	if a.cfg.UploadTimeout > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, a.cfg.UploadTimeout)
@@ -2206,6 +2937,7 @@ func (a *App) executeBiliupUpload(ctx context.Context, q uploadReq) (map[string]
 	var totalLogs string
 	var execErr error
 	var bvid string
+	var subtitleLogs string
 
 	attempt := 0
 	useCover := (cover != "")
@@ -2328,6 +3060,12 @@ func (a *App) executeBiliupUpload(ctx context.Context, q uploadReq) (map[string]
 	}
 
 finish:
+	// Repair branches continue with the next endpoint. If all bounded attempts
+	// are exhausted without a BVID, preserve the failure instead of returning
+	// a false success with a nil error.
+	if bvid == "" && execErr == nil {
+		execErr = fmt.Errorf("B站投稿失败：已尝试 %d 个提交通道，自动修复后仍未成功", attempt)
+	}
 	if bvid == "" {
 		re := regexp.MustCompile(`BV[a-zA-Z0-9]{10}`)
 		if m := re.FindString(totalLogs); m != "" {
@@ -2339,6 +3077,12 @@ finish:
 	biliURL := ""
 	if bvid != "" {
 		biliURL = "https://www.bilibili.com/video/" + bvid
+		if logs, err := a.uploadYouTubeSubtitles(ctx, bvid, filepath.Dir(files[0])); err != nil {
+			subtitleLogs = fmt.Sprintf("[字幕上传失败] %v\n%s", err, logs)
+		} else if logs != "" {
+			subtitleLogs = "[字幕上传]\n" + logs
+		}
+		totalLogs += "\n" + subtitleLogs
 	}
 
 	res := map[string]any{
@@ -2351,11 +3095,32 @@ finish:
 		"bvid":        bvid,
 		"bili_url":    biliURL,
 	}
+	if subtitleLogs != "" {
+		res["subtitle_upload"] = subtitleLogs
+	}
 	if translatedCount > 0 {
 		totalLogs = partTranslateLogs + totalLogs
 		res["translated_parts"] = translatedCount
 	}
 	return res, totalLogs, execErr
+}
+
+func (a *App) waitUploadCooldown(ctx context.Context) error {
+	for {
+		a.mu.RLock()
+		wait := time.Until(a.uploadCooldownUntil)
+		a.mu.RUnlock()
+		if wait <= 0 {
+			return nil
+		}
+		timer := time.NewTimer(wait)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
 }
 
 func (a *App) upload(w http.ResponseWriter, r *http.Request) {
@@ -2377,22 +3142,7 @@ func (a *App) createUploadHandler(q uploadReq) func(*Job) {
 			q.Progress = func(line string) { a.progressLine(nj, "B站上传", line) }
 			out, logs, err := a.executeBiliupUpload(nj.ctx, q)
 			if err == nil {
-				// Direct uploads from the media library should have the same
-				// post-success cleanup behavior as the auto pipeline. Keep
-				// metadata (cover/subtitles/description) for audit and retry
-				// context, but remove only the video files that were uploaded.
-				files := q.Files
-				if len(files) == 0 && q.File != "" {
-					files = []string{q.File}
-				}
-				if freed := a.purgeManagedVideoFiles(files...); freed > 0 {
-					if out == nil {
-						out = map[string]any{}
-					}
-					freedStr := formatBytes(freed)
-					logs += fmt.Sprintf("\n[自动空间清理] B站投稿成功，已自动删除原视频文件，释放磁盘空间: %s\n", freedStr)
-					out["cleaned_disk"] = freedStr
-				}
+				logs += "\n[审核保护] 投稿接口返回成功，源视频暂不删除，等待B站审核通过。\n"
 			}
 			return out, logs, err
 		})
@@ -2402,6 +3152,8 @@ func (a *App) createUploadHandler(q uploadReq) func(*Job) {
 // One-Click End-to-End Pipeline
 type pipelineReq struct {
 	URL           string `json:"url"` // YouTube or Magnet
+	ResumeDir     string `json:"resume_dir,omitempty"`
+	SelectFile    string `json:"select_file"` // aria2 torrent file index/range for Magnet URLs
 	SubLangs      string `json:"sub_langs"`
 	Quality       string `json:"quality"`
 	Translate     bool   `json:"translate"`
@@ -2415,6 +3167,10 @@ func (a *App) pipeline(w http.ResponseWriter, r *http.Request) {
 	var q pipelineReq
 	if decode(r, &q) != nil || q.URL == "" {
 		jsonResp(w, 400, map[string]string{"error": "target URL or Magnet required"})
+		return
+	}
+	if !validAriaSelectFile(q.SelectFile) {
+		jsonResp(w, 400, map[string]string{"error": "select_file must be aria2 file indexes, e.g. 3 or 3,7-9"})
 		return
 	}
 	j := a.add("pipeline", q)
@@ -2438,6 +3194,7 @@ func (a *App) createPipelineHandler(q pipelineReq) func(*Job) {
 			var targetUploadFiles []string
 			var mainVideoFile string
 			var downloadErr error
+			var streamedUploads []map[string]any
 
 			// Stage 1: Download stage (acquires downloadSlots)
 			func() {
@@ -2459,7 +3216,10 @@ func (a *App) createPipelineHandler(q pipelineReq) func(*Job) {
 				a.set(nj, "running", "", nil, "")
 				if isYT {
 					a.setStep(nj, "[1/3] YouTube 视频解析与下载")
-					d := filepath.Join(a.cfg.DataDir, "youtube", nj.ID)
+					d := q.ResumeDir
+					if d == "" {
+						d = filepath.Join(a.cfg.DataDir, "youtube", nj.ID)
+					}
 					_ = os.MkdirAll(d, 0750)
 					targetDir = d
 					cookiePath, cleanup, _ := prepareCookies(a.cfg.Cookies, d)
@@ -2496,7 +3256,9 @@ func (a *App) createPipelineHandler(q pipelineReq) func(*Job) {
 						args = append(args, "--cookies", cookiePath)
 					}
 					if langs != "none" && langs != "no" {
-						args = append(args, "--write-subs", "--sub-langs", langs, "--embed-subs")
+						// Preserve the downloaded subtitle sidecars for the post-upload
+						// Bilibili subtitle submission step.
+						args = append(args, "--write-subs", "--sub-langs", langs)
 					}
 
 					switch q.Quality {
@@ -2555,8 +3317,7 @@ func (a *App) createPipelineHandler(q pipelineReq) func(*Job) {
 					var chapterFiles []string
 					for _, f := range files {
 						name := filepath.Base(f)
-						ext := strings.ToLower(filepath.Ext(name))
-						if ext == ".mp4" || ext == ".mkv" || ext == ".webm" || ext == ".mp3" {
+						if isVideoFilePath(name) {
 							if strings.Contains(name, " - P") || strings.Contains(name, " - C") {
 								chapterFiles = append(chapterFiles, f)
 							} else {
@@ -2566,8 +3327,10 @@ func (a *App) createPipelineHandler(q pipelineReq) func(*Job) {
 					}
 					targetUploadFiles = videoFiles
 					if len(chapterFiles) > 0 {
-						targetUploadFiles = chapterFiles
+						// Do not drop playlist items that have no chapter markers.
+						targetUploadFiles = append(videoFiles, chapterFiles...)
 					}
+					targetUploadFiles = uniqueMediaFiles(targetUploadFiles)
 
 					convertVttToSrtAndBcc(d)
 					if q.BurnSubs && len(targetUploadFiles) > 0 {
@@ -2579,11 +3342,14 @@ func (a *App) createPipelineHandler(q pipelineReq) func(*Job) {
 					}
 				} else {
 					a.setStep(nj, "[1/3] 磁力高速抓取中")
-					d := filepath.Join(a.cfg.DataDir, "magnet", nj.ID)
+					d := q.ResumeDir
+					if d == "" {
+						d = filepath.Join(a.cfg.DataDir, "magnet", nj.ID)
+					}
 					_ = os.MkdirAll(d, 0750)
 					targetDir = d
 					btTrackers := "udp://tracker.opentrackr.org:1337/announce,udp://open.tracker.cl:1337/announce,udp://tracker.openbittorrent.com:6969/announce,http://tracker.openbittorrent.com:80/announce,udp://opentracker.i2p.rocks:6969/announce,udp://open.demonii.com:1337/announce"
-					magLogs, err := a.runMagnetProgress(nj.ctx, []string{
+					magnetArgs := []string{
 						"--dir=" + d,
 						"--continue=true",
 						"--allow-overwrite=false",
@@ -2606,7 +3372,40 @@ func (a *App) createPipelineHandler(q pipelineReq) func(*Job) {
 						"--summary-interval=1",
 						"--bt-tracker=" + btTrackers,
 						q.URL,
-					}, func(line string) { a.progressLine(nj, "BT 下载", line) })
+					}
+					if strings.TrimSpace(q.SelectFile) != "" {
+						magnetArgs = append(magnetArgs, "--select-file="+strings.TrimSpace(q.SelectFile))
+					}
+					var magLogs string
+					var err error
+					if isSingleAriaSelectFile(q.SelectFile) {
+						magLogs, targetUploadFiles, err = a.runMagnetStreamingUpload(nj.ctx, magnetArgs, d, func(line string) { a.progressLine(nj, "BT 下载", line) }, func(file string) error {
+							if err := a.acquireSlot(nj.ctx, a.uploadSlots); err != nil {
+								return err
+							}
+							defer func() { <-a.uploadSlots }()
+							a.setStep(nj, "[2/3] B站边下载边投稿")
+							a.setProgress(nj, JobProgress{Detail: "B站上传: " + filepath.Base(file)})
+							result, logs, uploadErr := a.executeBiliupUpload(nj.ctx, uploadReq{
+								File: file, Translate: q.Translate, Tid: q.Tid, Tag: q.Tags,
+								Parts: false, Source: q.URL,
+								Progress: func(line string) { a.progressLine(nj, "B站上传", line) },
+							})
+							totalLogs += "\n[Biliup Streaming Upload Logs]\n" + logs
+							if uploadErr != nil {
+								return uploadErr
+							}
+							fileSize := calcFilesSize([]string{file})
+							if fileSize > 0 {
+								a.recordDownload(fileSize)
+								a.recordUpload(fileSize)
+							}
+							streamedUploads = append(streamedUploads, result)
+							return nil
+						})
+					} else {
+						magLogs, err = a.runMagnetProgress(nj.ctx, magnetArgs, func(line string) { a.progressLine(nj, "BT 下载", line) })
+					}
 					totalLogs += "[Magnet Download Logs]\n" + magLogs + "\n"
 					downloadErr = err
 					if downloadErr != nil {
@@ -2618,12 +3417,12 @@ func (a *App) createPipelineHandler(q pipelineReq) func(*Job) {
 							return nil
 						}
 						name := info.Name()
-						ext := strings.ToLower(filepath.Ext(name))
-						if ext == ".mp4" || ext == ".mkv" || ext == ".avi" || ext == ".webm" || ext == ".mp3" {
+						if isVideoFilePath(name) {
 							targetUploadFiles = append(targetUploadFiles, p)
 						}
 						return nil
 					})
+					targetUploadFiles = uniqueMediaFiles(targetUploadFiles)
 					sort.Strings(targetUploadFiles)
 				}
 			}()
@@ -2639,6 +3438,19 @@ func (a *App) createPipelineHandler(q pipelineReq) func(*Job) {
 
 			if len(targetUploadFiles) == 0 {
 				a.set(nj, "failed", "no video files found after download", map[string]any{"dir": targetDir}, totalLogs)
+				return
+			}
+			if len(streamedUploads) > 0 {
+				mainVideoFile = targetUploadFiles[0]
+				a.recordPipelineSuccess()
+				if q.Translate {
+					a.recordAiTrans()
+				}
+				a.set(nj, "done", "", map[string]any{
+					"dir": targetDir, "video_file": mainVideoFile, "video_files": targetUploadFiles,
+					"is_multi_p": false, "upload": streamedUploads, "stream_upload": true,
+					"review_state": "pending",
+				}, totalLogs+"\n[审核保护] 流式投稿成功，源视频暂不删除，等待B站审核通过。\n")
 				return
 			}
 
@@ -2706,13 +3518,8 @@ func (a *App) createPipelineHandler(q pipelineReq) func(*Job) {
 				a.recordAiTrans()
 			}
 
-			// Auto-Clean downloaded raw video files after successful Bilibili upload
-			freed := purgeVideoFilesInDir(targetDir)
-			freedStr := ""
-			if freed > 0 {
-				freedStr = formatBytes(freed)
-				totalLogs += fmt.Sprintf("\n[自动空间清理] B站投稿成功，已自动清除原视频文件，释放磁盘空间: %s\n", freedStr)
-			}
+			// Keep source media until the asynchronous Bilibili review passes.
+			totalLogs += "\n[审核保护] 投稿接口返回成功，源视频暂不删除，等待B站审核通过。\n"
 
 			a.set(nj, "done", "", map[string]any{
 				"dir":          targetDir,
@@ -2720,7 +3527,7 @@ func (a *App) createPipelineHandler(q pipelineReq) func(*Job) {
 				"video_files":  targetUploadFiles,
 				"is_multi_p":   len(targetUploadFiles) > 1,
 				"upload":       uploadOut,
-				"cleaned_disk": freedStr,
+				"review_state": "pending",
 			}, totalLogs)
 		}()
 	}
@@ -2996,7 +3803,16 @@ func formatSpeed(bps float64) string {
 
 func calcFilesSize(files []string) int64 {
 	var total int64
+	seen := make(map[string]struct{}, len(files))
 	for _, f := range files {
+		key := filepath.Clean(f)
+		if abs, err := filepath.Abs(key); err == nil {
+			key = abs
+		}
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
 		if fi, err := os.Stat(f); err == nil && !fi.IsDir() {
 			total += fi.Size()
 		}
@@ -3063,7 +3879,7 @@ func (a *App) scanMediaPackages() []MediaPackage {
 				}
 
 				relFile, _ := filepath.Rel(root, p)
-				if ext == ".mp4" || ext == ".mkv" || ext == ".avi" || ext == ".mp3" || ext == ".webm" {
+				if isVideoFilePath(name) {
 					pkg.VideoFiles = append(pkg.VideoFiles, p)
 					pkg.VideoCount++
 					if videoPath == "" || ext == ".mp4" {
@@ -3161,8 +3977,7 @@ func (a *App) cleanTempHandler(w http.ResponseWriter, r *http.Request) {
 				if err != nil || info.IsDir() {
 					return nil
 				}
-				ext := strings.ToLower(filepath.Ext(info.Name()))
-				if ext == ".mp4" || ext == ".mkv" || ext == ".avi" || ext == ".mp3" || ext == ".webm" {
+				if isVideoFilePath(info.Name()) {
 					hasMedia = true
 				}
 				return nil
@@ -4106,6 +4921,205 @@ type bccItem struct {
 	Content  string  `json:"content"`
 }
 
+type biliSubtitleVideoResponse struct {
+	Code    int    `json:"code"`
+	Message string `json:"message"`
+	Data    struct {
+		Videos []struct {
+			CID int64 `json:"cid"`
+			AID int64 `json:"aid"`
+		} `json:"videos"`
+	} `json:"data"`
+}
+
+type biliSubtitleSaveResponse struct {
+	Code    int    `json:"code"`
+	Message string `json:"message"`
+}
+
+// uploadYouTubeSubtitles submits the sidecar SRT files after the video has a
+// BVID. Biliup's open_subtitle flag only enables the feature; it does not
+// upload subtitle text by itself.
+func (a *App) uploadYouTubeSubtitles(ctx context.Context, bvid, dir string) (string, error) {
+	if bvid == "" || dir == "" {
+		return "", nil
+	}
+	paths, _ := filepath.Glob(filepath.Join(dir, "*.srt"))
+	if len(paths) == 0 {
+		return "未找到保留的 SRT 字幕文件\n", nil
+	}
+	cookies, csrf, err := loadBiliCookieHeader(a.cfg.BiliCookies)
+	if err != nil {
+		return "", err
+	}
+
+	infoURL := "https://member.bilibili.com/x/vupre/web/archive/view?bvid=" + url.QueryEscape(bvid)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, infoURL, nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Cookie", cookies)
+	req.Header.Set("User-Agent", "Mozilla/5.0")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("获取 BVID/CID 失败: %w", err)
+	}
+	body, readErr := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if readErr != nil {
+		return "", readErr
+	}
+	if resp.StatusCode/100 != 2 {
+		return "", fmt.Errorf("获取 BVID/CID 返回 HTTP %d", resp.StatusCode)
+	}
+	var info biliSubtitleVideoResponse
+	if err := json.Unmarshal(body, &info); err != nil {
+		return "", fmt.Errorf("解析 BVID/CID 失败: %w", err)
+	}
+	if info.Code != 0 || len(info.Data.Videos) == 0 {
+		return "", fmt.Errorf("获取 BVID/CID 失败: code=%d %s", info.Code, info.Message)
+	}
+
+	// A split-chapter YouTube download has one source subtitle timeline. Bind
+	// it to the first uploaded part rather than falsely attaching the same
+	// unshifted timeline to every chapter.
+	cid := info.Data.Videos[0].CID
+	aid := info.Data.Videos[0].AID
+	var logs []string
+	seen := map[string]bool{}
+	for _, path := range paths {
+		lang := subtitleLanguageFromPath(path)
+		if seen[lang] {
+			continue
+		}
+		seen[lang] = true
+		bcc, err := srtFileToBCC(path)
+		if err != nil {
+			logs = append(logs, filepath.Base(path)+": "+err.Error())
+			continue
+		}
+		data, _ := json.Marshal(bcc)
+		form := url.Values{}
+		form.Set("lan", lang)
+		form.Set("submit", "true")
+		form.Set("csrf", csrf)
+		form.Set("sign", "false")
+		form.Set("bvid", bvid)
+		form.Set("type", "1")
+		form.Set("oid", strconv.FormatInt(cid, 10))
+		form.Set("data", string(data))
+		saveReq, err := http.NewRequestWithContext(ctx, http.MethodPost,
+			"https://api.bilibili.com/x/v2/dm/subtitle/draft/save", strings.NewReader(form.Encode()))
+		if err != nil {
+			return strings.Join(logs, "\n"), err
+		}
+		saveReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		saveReq.Header.Set("Cookie", cookies)
+		saveReq.Header.Set("User-Agent", "Mozilla/5.0")
+		saveReq.Header.Set("Origin", "https://account.bilibili.com")
+		saveReq.Header.Set("Referer", fmt.Sprintf("https://account.bilibili.com/subtitle/edit/#/editor?bvid=%s&cid=%d", bvid, cid))
+		saveResp, err := http.DefaultClient.Do(saveReq)
+		if err != nil {
+			logs = append(logs, filepath.Base(path)+": "+err.Error())
+			continue
+		}
+		saveBody, readErr := io.ReadAll(saveResp.Body)
+		saveResp.Body.Close()
+		if readErr != nil {
+			logs = append(logs, filepath.Base(path)+": "+readErr.Error())
+			continue
+		}
+		var result biliSubtitleSaveResponse
+		if err := json.Unmarshal(saveBody, &result); err != nil || result.Code != 0 {
+			logs = append(logs, fmt.Sprintf("%s: code=%d %s", filepath.Base(path), result.Code, result.Message))
+			continue
+		}
+		logs = append(logs, fmt.Sprintf("%s -> %s (aid=%d cid=%d)", filepath.Base(path), lang, aid, cid))
+	}
+	return strings.Join(logs, "\n") + "\n", nil
+}
+
+func loadBiliCookieHeader(path string) (string, string, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return "", "", err
+	}
+	var env cookieEnvelope
+	if err := json.Unmarshal(b, &env); err != nil {
+		return "", "", fmt.Errorf("解析 B 站 cookies 失败: %w", err)
+	}
+	cs := env.Cookies
+	if len(cs) == 0 {
+		cs = env.CookieInfo.Cookies
+	}
+	var parts []string
+	csrf := ""
+	for _, c := range cs {
+		if c.Name == "" || c.Value == "" {
+			continue
+		}
+		parts = append(parts, c.Name+"="+c.Value)
+		if c.Name == "bili_jct" {
+			csrf = c.Value
+		}
+	}
+	if len(parts) == 0 || csrf == "" {
+		return "", "", errors.New("B 站 cookies 缺少登录态或 bili_jct")
+	}
+	return strings.Join(parts, "; "), csrf, nil
+}
+
+func subtitleLanguageFromPath(path string) string {
+	base := strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
+	parts := strings.Split(base, ".")
+	lang := "zh"
+	if len(parts) > 1 {
+		candidate := parts[len(parts)-1]
+		if candidate != "" && regexp.MustCompile(`^[A-Za-z]{2,3}(?:-[A-Za-z]{2,4})?$`).MatchString(candidate) {
+			lang = candidate
+		}
+	}
+	switch strings.ToLower(lang) {
+	case "zh-hans", "zh-cn", "cmn-hans":
+		return "zh"
+	case "zh-hant", "zh-tw", "cmn-hant":
+		return "zh-TW"
+	case "en-us":
+		return "en-US"
+	default:
+		return strings.ToLower(lang)
+	}
+}
+
+func srtFileToBCC(path string) (bccHeader, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return bccHeader{}, err
+	}
+	reTime := regexp.MustCompile(`(\d{1,2}:\d{2}:\d{2}[\.,]\d{3}|\d{2}:\d{2}[\.,]\d{3})\s*-->\s*(\d{1,2}:\d{2}:\d{2}[\.,]\d{3}|\d{2}:\d{2}[\.,]\d{3})`)
+	lines := strings.Split(strings.ReplaceAll(string(b), "\r\n", "\n"), "\n")
+	var body []bccItem
+	for i := 0; i < len(lines); i++ {
+		line := strings.TrimSpace(lines[i])
+		if !reTime.MatchString(line) {
+			continue
+		}
+		m := reTime.FindStringSubmatch(line)
+		var text []string
+		for j := i + 1; j < len(lines) && strings.TrimSpace(lines[j]) != ""; j++ {
+			text = append(text, strings.TrimSpace(lines[j]))
+			i = j
+		}
+		if len(text) > 0 {
+			body = append(body, bccItem{From: parseTimeToSeconds(m[1]), To: parseTimeToSeconds(m[2]), Location: 2, Content: strings.Join(text, " ")})
+		}
+	}
+	if len(body) == 0 {
+		return bccHeader{}, errors.New("字幕内容为空或 SRT 格式无效")
+	}
+	return bccHeader{FontSize: 0.4, FontColor: "#FFFFFF", BackgroundAlpha: 0.5, BackgroundColor: "#9C27B0", Stroke: "none", Body: body}, nil
+}
+
 func parseTimeToSeconds(s string) float64 {
 	s = strings.TrimSpace(s)
 	parts := strings.Split(s, ":")
@@ -4691,6 +5705,8 @@ func main() {
 		fmt.Printf("compacted %d duplicate terminal jobs\n", removed)
 	}
 	a.recoverTransientJobs()
+	a.recoverInterruptedJobs()
+	go a.retryWatchdog(context.Background())
 	if freed := a.cleanupCompletedJobMedia(); freed > 0 {
 		fmt.Printf("cleaned %s from completed pipeline jobs\n", formatBytes(freed))
 	}
@@ -4698,6 +5714,7 @@ func main() {
 	a.loadStats()
 	a.startChannelWatcher(context.Background())
 	a.startNetworkSampler(context.Background())
+	a.startReviewWatcher(context.Background())
 
 	s := &http.Server{
 		Addr:              a.cfg.Addr,

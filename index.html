@@ -2459,6 +2459,11 @@ textarea.form-control { min-height: 84px; resize: vertical; }
       <div class="form-hint">支持 YouTube 视频/Shorts 或 Magnet 种子链接。</div>
     </div>
     <div class="form-group">
+      <label class="form-label" for="plSelectFile">磁力文件索引（可选）</label>
+      <input type="text" id="plSelectFile" name="select_file" class="form-control mono" placeholder="留空：整条磁力链接自动作为一个多P稿件" />
+      <div class="form-hint">默认会识别磁力链接中的全部视频并作为一个B站多P稿件上传；只有需要筛选单个文件时才填写索引。</div>
+    </div>
+    <div class="form-group">
       <label class="form-label" for="plTid">B站投稿目标分区</label>
       <select id="plTid" name="tid" class="form-control">
         <option value="188">科技 · 软件应用 / 数码 (TID: 188)</option>
@@ -2553,6 +2558,11 @@ textarea.form-control { min-height: 84px; resize: vertical; }
       <label class="form-label" for="magnetUri">Magnet 磁力链接 <span style="color: var(--color-failed)">*</span></label>
       <textarea id="magnetUri" name="magnet" required class="form-control mono" placeholder="magnet:?xt=urn:btih:..."></textarea>
       <div class="form-hint">Aria2c 将在后台无缓冲高速落盘至数据目录。</div>
+    </div>
+    <div class="form-group">
+      <label class="form-label" for="magSelectFile">只下载指定文件索引（可选）</label>
+      <input type="text" id="magSelectFile" name="select_file" class="form-control mono" placeholder="留空：整条磁力链接；例如 3 或 3,7-9" />
+      <div class="form-hint">自动投稿默认把整条磁力链接识别到的媒体作为一个多P稿件；填写索引才会筛选文件。</div>
     </div>
     <div class="form-group">
       <label class="form-check">
@@ -3988,6 +3998,7 @@ async function handleJobSubmit(e, endpoint) {
   if (endpoint.includes('pipeline')) {
     body = {
       url: $('#plUrl').value.trim(),
+      select_file: $('#plSelectFile') ? $('#plSelectFile').value.trim() : '',
       tid: $('#plTid').value,
       tags: $('#plTags').value.trim(),
       sub_langs: $('#plSub') ? $('#plSub').value.trim() : 'zh-Hans,zh,en,zh-Hant',
@@ -4007,6 +4018,7 @@ async function handleJobSubmit(e, endpoint) {
   } else if (endpoint.includes('magnet')) {
     body = {
       magnet: $('#magnetUri').value.trim(),
+      select_file: $('#magSelectFile') ? $('#magSelectFile').value.trim() : '',
       auto_upload: $('#magAutoUpload').checked
     };
   } else if (endpoint.includes('biliup')) {

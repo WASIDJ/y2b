@@ -135,6 +135,28 @@ func TestPurgeVideoFilesInDirRemovesAllVideoVariants(t *testing.T) {
 	}
 }
 
+func TestCleanupWaitsForReviewApproval(t *testing.T) {
+	dir := t.TempDir()
+	video := filepath.Join(dir, "video.mp4")
+	if err := os.WriteFile(video, []byte("video"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	a := &App{jobs: map[string]*Job{"pending": {
+		ID: "pending", Kind: "pipeline", Status: "done", ReviewState: "pending",
+		Output: map[string]any{"dir": dir},
+	}}, order: []string{"pending"}}
+	if freed := a.cleanupCompletedJobMedia(); freed != 0 {
+		t.Fatalf("pending review must not clean media: freed=%d", freed)
+	}
+	if _, err := os.Stat(video); err != nil {
+		t.Fatalf("pending media was removed: %v", err)
+	}
+	a.jobs["pending"].ReviewState = "passed"
+	if freed := a.cleanupCompletedJobMedia(); freed != int64(len("video")) {
+		t.Fatalf("approved review should clean media: freed=%d", freed)
+	}
+}
+
 func TestMagnetValidationAndDeadSeedClassification(t *testing.T) {
 	if !validTorrentOrMagnet("magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567") {
 		t.Fatal("expected valid magnet URI")
@@ -144,6 +166,50 @@ func TestMagnetValidationAndDeadSeedClassification(t *testing.T) {
 	}
 	if !isDeadSeedOutput("[ERROR] number of seeders: 0") {
 		t.Fatal("expected dead seed output to be classified")
+	}
+}
+
+func TestMediaRecognitionSupportsCommonContainersAndAudio(t *testing.T) {
+	for _, name := range []string{"movie.mp4", "movie.MKV", "movie.ts", "movie.m2ts", "movie.mxf", "movie.rmvb", "audio.m4a", "audio.flac"} {
+		if !isVideoFilePath(name) {
+			t.Errorf("expected media format to be recognized: %s", name)
+		}
+	}
+	for _, name := range []string{"cover.jpg", "captions.vtt", "video.mp4.part", "notes.txt"} {
+		if isVideoFilePath(name) {
+			t.Errorf("unexpected non-media file recognition: %s", name)
+		}
+	}
+}
+
+func TestMediaFilesAndSizesAreDeduplicated(t *testing.T) {
+	dir := t.TempDir()
+	file := filepath.Join(dir, "video.mp4")
+	if err := os.WriteFile(file, []byte("123456"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	files := uniqueMediaFiles([]string{file, file, filepath.Join(dir, ".", "video.mp4"), filepath.Join(dir, "notes.txt")})
+	if len(files) != 1 || calcFilesSize(append(files, file)) != 6 {
+		t.Fatalf("media paths were not deduplicated: files=%v size=%d", files, calcFilesSize(append(files, file)))
+	}
+}
+
+func TestAriaSelectFileValidation(t *testing.T) {
+	for _, value := range []string{"", "3", "3,7-9", "1-4,8"} {
+		if !validAriaSelectFile(value) {
+			t.Errorf("valid aria2 file selection rejected: %q", value)
+		}
+	}
+	for _, value := range []string{"all", "3;7", "../3", "3,,7"} {
+		if validAriaSelectFile(value) {
+			t.Errorf("invalid aria2 file selection accepted: %q", value)
+		}
+	}
+}
+
+func TestSingleAriaSelectFileDetection(t *testing.T) {
+	if !isSingleAriaSelectFile("3") || isSingleAriaSelectFile("3,7-9") || isSingleAriaSelectFile("3-4") {
+		t.Fatal("single aria2 file selection detection is incorrect")
 	}
 }
 
@@ -192,6 +258,21 @@ func TestParseBiliupOutput(t *testing.T) {
 	got = parseBiliupOutput(`code: 0\nBV1AbCDeFgH1 投稿成功`)
 	if got.Code != 0 || got.BVID != "BV1AbCDeFgH1" {
 		t.Fatalf("success parse failed: %+v", got)
+	}
+}
+
+func TestParseBiliReviewAndViolations(t *testing.T) {
+	result, err := parseBiliReviewOutput("INFO tracing\n{\"archive\":{\"state\":-2,\"state_desc\":\"已退回\",\"reject_reason\":\"您的视频【P7(00:07:37-00:08:23)】【P11内容全程】存在问题\"}}")
+	if err != nil || biliReviewState(result) != "rejected" {
+		t.Fatalf("review result was not parsed: result=%+v err=%v", result, err)
+	}
+	violations := parseReviewViolations(result.Archive.RejectReason)
+	if len(violations) != 2 || violations[0].Part != 7 || violations[0].Start != 457 || violations[0].End != 503 || !violations[1].Whole || violations[1].Part != 11 {
+		t.Fatalf("unexpected violations: %+v", violations)
+	}
+	passed, err := parseBiliReviewOutput("{\"archive\":{\"state_desc\":\"已通过\"}}")
+	if err != nil || biliReviewState(passed) != "passed" {
+		t.Fatalf("passed review result was not recognized: %+v err=%v", passed, err)
 	}
 }
 
@@ -321,6 +402,25 @@ fi
 	b, _ := os.ReadFile(state)
 	if strings.TrimSpace(string(b)) != "2" {
 		t.Fatalf("expected fallback attempt, calls=%q", b)
+	}
+}
+
+func TestBiliupRepairExhaustionRemainsFailed(t *testing.T) {
+	bin, _ := writeMockBiliup(t, `echo 'message: "invalid title" code: 21020'`)
+	video := filepath.Join(t.TempDir(), "video.mp4")
+	if err := os.WriteFile(video, []byte("test"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	a := &App{cfg: Config{Biliup: bin, BiliCookies: "unused"}}
+	out, logs, err := a.executeBiliupUpload(context.Background(), uploadReq{
+		File:  video,
+		Title: strings.Repeat("标题", 50),
+	})
+	if err == nil {
+		t.Fatalf("exhausted repair attempts must fail: out=%v logs=%s", out, logs)
+	}
+	if !strings.Contains(err.Error(), "已尝试 3 个提交通道") {
+		t.Fatalf("unexpected exhaustion error: %v", err)
 	}
 }
 
