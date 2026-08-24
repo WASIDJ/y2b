@@ -1218,6 +1218,7 @@ func resumableJobUpload(j *Job) (uploadReq, bool) {
 			_ = json.Unmarshal(b, &pipeline)
 		}
 		req.Source = pipeline.URL
+		req.OriginalURL = pipeline.URL
 		req.Tid = pipeline.Tid
 		req.Tag = pipeline.Tags
 		req.Translate = pipeline.Translate
@@ -1227,6 +1228,7 @@ func resumableJobUpload(j *Job) (uploadReq, bool) {
 			_ = json.Unmarshal(b, &y)
 		}
 		req.Source = y.URL
+		req.OriginalURL = y.URL
 		req.Tid = y.Tid
 		req.Tag = y.Tags
 		req.Translate = y.Translate
@@ -1239,6 +1241,7 @@ func resumableJobUpload(j *Job) (uploadReq, bool) {
 		if req.Source == "" {
 			req.Source = m.Magnet
 		}
+		req.OriginalURL = req.Source
 		req.Tid = m.Tid
 		req.Tag = m.Tags
 		req.Translate = m.Translate
@@ -1253,6 +1256,10 @@ func resumableJobUpload(j *Job) (uploadReq, bool) {
 		req.Tag = up.Tag
 		req.Tid = up.Tid
 		req.Source = up.Source
+		req.OriginalURL = up.OriginalURL
+		if req.OriginalURL == "" && (validYouTube(up.Source) || validTorrentOrMagnet(up.Source)) {
+			req.OriginalURL = up.Source
+		}
 		req.Translate = up.Translate
 		if req.VID == "" {
 			req.VID = up.VID
@@ -1318,7 +1325,10 @@ func (a *App) retryJob(jobID string) (*Job, error) {
 			translate := false
 			if old.Kind == "biliup" {
 				if up, ok := old.Input.(uploadReq); ok {
-					sourceURL = up.Source
+					sourceURL = up.OriginalURL
+					if sourceURL == "" {
+						sourceURL = up.Source
+					}
 					tid = up.Tid
 					tags = up.Tag
 					translate = up.Translate
@@ -1326,7 +1336,10 @@ func (a *App) retryJob(jobID string) (*Job, error) {
 					var up uploadReq
 					if b, err := json.Marshal(old.Input); err == nil {
 						_ = json.Unmarshal(b, &up)
-						sourceURL = up.Source
+						sourceURL = up.OriginalURL
+						if sourceURL == "" {
+							sourceURL = up.Source
+						}
 						tid = up.Tid
 						tags = up.Tag
 						translate = up.Translate
@@ -1361,6 +1374,34 @@ func (a *App) retryJob(jobID string) (*Job, error) {
 					tid = m.Tid
 					tags = m.Tags
 					translate = m.Translate
+				}
+			}
+
+			// If sourceURL is a synthetic label (e.g. magnet-recovery-8a7cef125593ba70),
+			// look up related jobs by ID to resolve the actual underlying URL.
+			if sourceURL != "" && !validYouTube(sourceURL) && !validTorrentOrMagnet(sourceURL) {
+				targetID := strings.TrimPrefix(sourceURL, "magnet-recovery-")
+				targetID = strings.TrimPrefix(targetID, "magnet-job-")
+				targetID = strings.TrimPrefix(targetID, "youtube-recovery-")
+				targetID = strings.TrimPrefix(targetID, "youtube-job-")
+				if targetID != sourceURL {
+					if related, ok := a.jobs[targetID]; ok && related != nil {
+						if b, err := json.Marshal(related.Input); err == nil {
+							var relatedP struct {
+								URL    string `json:"url"`
+								Magnet string `json:"magnet"`
+								Source string `json:"source"`
+							}
+							_ = json.Unmarshal(b, &relatedP)
+							if relatedP.URL != "" && (validYouTube(relatedP.URL) || validTorrentOrMagnet(relatedP.URL)) {
+								sourceURL = relatedP.URL
+							} else if relatedP.Magnet != "" && validTorrentOrMagnet(relatedP.Magnet) {
+								sourceURL = relatedP.Magnet
+							} else if relatedP.Source != "" && (validYouTube(relatedP.Source) || validTorrentOrMagnet(relatedP.Source)) {
+								sourceURL = relatedP.Source
+							}
+						}
+					}
 				}
 			}
 
@@ -1739,7 +1780,7 @@ func (a *App) youtube(w http.ResponseWriter, r *http.Request) {
 	jsonResp(w, 202, j)
 }
 
-const defaultBTTrackers = "udp://tracker.opentrackr.org:1337/announce,udp://open.tracker.cl:1337/announce,udp://tracker.openbittorrent.com:6969/announce,http://tracker.openbittorrent.com:80/announce,udp://opentracker.i2p.rocks:6969/announce,udp://open.demonii.com:1337/announce"
+const defaultBTTrackers = "udp://tracker.opentrackr.org:1337/announce,udp://open.tracker.cl:1337/announce,udp://tracker.openbittorrent.com:6969/announce,http://tracker.openbittorrent.com:80/announce,udp://opentracker.i2p.rocks:6969/announce,udp://open.demonii.com:1337/announce,udp://tracker.torrent.eu.org:451/announce,udp://explodie.org:6969/announce,udp://tracker.moeking.me:6969/announce,udp://p4p.arenabg.com:1337/announce,udp://tracker.dler.org:6969/announce,udp://bt1.archive.org:6969/announce,udp://bt2.archive.org:6969/announce,udp://tracker.theoks.net:6969/announce,udp://tracker.altrosky.nl:2710/announce,udp://movies.zsw.ca:6969/announce,http://tracker.ipv6tracker.ru:80/announce"
 
 func buildYTDLPArgs(rawURL, quality, subLangs, cookiePath string, isPlaylist, splitChapters bool, destDir string) []string {
 	langs := strings.TrimSpace(subLangs)
@@ -1830,9 +1871,14 @@ func buildAria2Args(targetURL, destDir, selectFile, btPort string) []string {
 		"--bt-tracker-timeout=20",
 		"--listen-port=" + btPort,
 		"--max-connection-per-server=4",
-		"--bt-max-peers=60",
+		"--bt-max-peers=120",
 		"--max-concurrent-downloads=1",
 		"--enable-dht=true",
+		"--enable-dht6=true",
+		"--dht-entry-point=dht.transmissionbt.com:6881",
+		"--dht-entry-point=router.bittorrent.com:6881",
+		"--dht-entry-point=router.utorrent.com:6881",
+		"--dht-entry-point=dht.aelitis.com:6881",
 		"--enable-peer-exchange=true",
 		"--bt-enable-lpd=true",
 		"--follow-torrent=mem",
@@ -3005,6 +3051,7 @@ type uploadReq struct {
 	Tid         string       `json:"tid"`
 	Limit       string       `json:"limit"`
 	Source      string       `json:"source"`
+	OriginalURL string       `json:"original_url,omitempty"`
 	Translate   bool         `json:"translate"`
 	Parts       bool         `json:"parts"`
 	VID         string       `json:"vid,omitempty"`

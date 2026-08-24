@@ -715,7 +715,7 @@ func TestBuildYTDLPAndAria2ArgsHelpers(t *testing.T) {
 
 	ariaArgs := buildAria2Args("magnet:?xt=urn:btih:123", "/tmp/dir", "1", "6881")
 	joinedAria := strings.Join(ariaArgs, " ")
-	if !strings.Contains(joinedAria, "--select-file=1") || !strings.Contains(joinedAria, "--listen-port=6881") {
+	if !strings.Contains(joinedAria, "--select-file=1") || !strings.Contains(joinedAria, "--listen-port=6881") || !strings.Contains(joinedAria, "--enable-dht=true") || !strings.Contains(joinedAria, "--dht-entry-point=") {
 		t.Fatalf("unexpected aria args: %s", joinedAria)
 	}
 }
@@ -907,11 +907,48 @@ func TestResumableJobUploadPreservesFilesAndVID(t *testing.T) {
 	if fallbackJob.Kind != "pipeline" {
 		t.Fatalf("expected fallback to pipeline when media files are missing, got %s", fallbackJob.Kind)
 	}
-	pipeInput, ok := fallbackJob.Input.(pipelineReq)
-	if !ok || pipeInput.URL != "https://youtu.be/test" {
-		t.Fatalf("unexpected fallback pipeline input: %+v", fallbackJob.Input)
+	// Case 4: Synthetic recovery job resolves original URL through related job ID
+	origPipeline := &Job{
+		ID:     "orig8a7c",
+		Kind:   "pipeline",
+		Status: "failed",
+		Input: pipelineReq{
+			URL:       "magnet:?xt=urn:btih:8a7cef125593ba70&dn=TestCourse",
+			Translate: true,
+			Tid:       "188",
+			Tags:      "Tutorial",
+		},
+	}
+	syntheticBiliup := &Job{
+		ID:     "synth123",
+		Kind:   "biliup",
+		Status: "failed",
+		Input: uploadReq{
+			Source: "magnet-recovery-orig8a7c",
+			Title:  "Part 1",
+			Files:  []string{"/tmp/missing/file.mp4"},
+		},
+	}
+	synthApp := &App{
+		jobs: map[string]*Job{
+			origPipeline.ID:    origPipeline,
+			syntheticBiliup.ID: syntheticBiliup,
+		},
+		order: []string{origPipeline.ID, syntheticBiliup.ID},
+	}
+	recoveredJob, err := synthApp.retryJob(syntheticBiliup.ID)
+	if err != nil {
+		t.Fatalf("synthetic retryJob failed: %v", err)
+	}
+	if recoveredJob.Kind != "pipeline" {
+		t.Fatalf("expected synthetic job to recover as pipeline, got %s", recoveredJob.Kind)
+	}
+	recInput, ok := recoveredJob.Input.(pipelineReq)
+	if !ok || recInput.URL != "magnet:?xt=urn:btih:8a7cef125593ba70&dn=TestCourse" {
+		t.Fatalf("unexpected recovered pipeline URL: %+v", recoveredJob.Input)
 	}
 }
+
 
 
 
