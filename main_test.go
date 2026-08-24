@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -10,6 +11,7 @@ import (
 	"testing"
 	"time"
 )
+
 
 func TestAcquireSlotTimesOut(t *testing.T) {
 	slot := make(chan struct{}, 1)
@@ -971,6 +973,80 @@ func TestResumableJobUploadPreservesFilesAndVID(t *testing.T) {
 		t.Fatal("expected retryJob to reject unrecoverable biliup job with missing files and no source URL")
 	}
 }
+
+func TestBiliup100PartChunking(t *testing.T) {
+	// Create a mock biliup script that records calls
+	dir := t.TempDir()
+	callsFile := filepath.Join(dir, "calls.txt")
+	mockScript := filepath.Join(dir, "mock_biliup.sh")
+	scriptContent := fmt.Sprintf(`#!/bin/sh
+echo "$@" >> %q
+echo '{"code":0,"data":{"bvid":"BV1TestChunk%s"}}'
+`, callsFile, "$$")
+	if err := os.WriteFile(mockScript, []byte(scriptContent), 0755); err != nil {
+		t.Fatalf("failed to write mock script: %v", err)
+	}
+
+	app := &App{
+		cfg: Config{
+			Biliup:         mockScript,
+			SubmitEndpoint: "b-cut-android",
+			DataDir:        dir,
+		},
+		jobs: make(map[string]*Job),
+	}
+
+	// Create 102 mock video files
+	files := make([]string, 102)
+	for i := 0; i < 102; i++ {
+		f := filepath.Join(dir, fmt.Sprintf("video_%03d.mp4", i+1))
+		if err := os.WriteFile(f, []byte("fake video content"), 0644); err != nil {
+			t.Fatalf("failed to write fake video file: %v", err)
+		}
+		files[i] = f
+	}
+
+	req := uploadReq{
+		Files: files,
+		Title: "Large Course Test",
+		Tag:   "test,course",
+		Tid:   "188",
+	}
+
+	res, _, err := app.executeBiliupUpload(context.Background(), req)
+	if err != nil {
+		t.Fatalf("executeBiliupUpload failed: %v", err)
+	}
+
+	totalParts, ok := res["total_parts"].(int)
+	if !ok || totalParts != 102 {
+		t.Fatalf("expected total_parts = 102, got %v", res["total_parts"])
+	}
+
+	volumeCount, ok := res["volume_count"].(int)
+	if !ok || volumeCount != 2 {
+		t.Fatalf("expected volume_count = 2, got %v", res["volume_count"])
+	}
+
+	bvids, ok := res["bvids"].([]string)
+	if !ok || len(bvids) != 2 {
+		t.Fatalf("expected 2 bvids in result, got %v", res["bvids"])
+	}
+}
+
+func TestBiliupSubmitEndpointConfig(t *testing.T) {
+	dir := t.TempDir()
+	app := &App{
+		cfg: Config{
+			SubmitEndpoint: "b-cut-android",
+			DataDir:        dir,
+		},
+	}
+	if app.cfg.SubmitEndpoint != "b-cut-android" {
+		t.Fatalf("expected submit endpoint = b-cut-android, got %s", app.cfg.SubmitEndpoint)
+	}
+}
+
 
 
 

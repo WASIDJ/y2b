@@ -16,6 +16,9 @@ Environment=Y2B_ADDR=127.0.0.1:8765
 Environment=Y2B_COOKIES=/srv/y2b/cookies.json
 Environment=Y2B_BILI_COOKIES=/srv/y2b/cookies.json
 Environment=Y2B_DATA=/srv/y2b/data
+Environment=XDG_CONFIG_HOME=/srv/y2b/data/.config
+Environment=XDG_CACHE_HOME=/srv/y2b/data/.cache
+Environment=Y2B_BILIUP_SUBMIT_ENDPOINT=b-cut-android
 Environment=GOMEMLIMIT=64MiB
 Restart=always
 RestartSec=5
@@ -24,7 +27,7 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=/srv/y2b/data /srv/y2b /home/ubuntu/.cache
+ReadWritePaths=/srv/y2b/data /srv/y2b /home/ubuntu/.cache /home/ubuntu/.config
 UMask=0077
 
 # Strict Memory and Resource Protections (Prevent RAM Spikes / VPS OOM Lockup)

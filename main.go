@@ -63,6 +63,7 @@ type Config struct {
 	ReviewInterval   time.Duration
 	ReviewRepairMax  int
 	MinFreeDiskGB    float64
+	SubmitEndpoint   string
 }
 
 type MonitoredChannel struct {
@@ -293,6 +294,7 @@ func loadConfig() Config {
 			minFreeDiskGB = parsed
 		}
 	}
+	submitEndpoint := env("Y2B_BILIUP_SUBMIT_ENDPOINT", "b-cut-android")
 
 	return Config{
 		Addr:             env("Y2B_ADDR", "127.0.0.1:8765"),
@@ -319,8 +321,10 @@ func loadConfig() Config {
 		ReviewInterval:   reviewInterval,
 		ReviewRepairMax:  reviewRepairMax,
 		MinFreeDiskGB:    minFreeDiskGB,
+		SubmitEndpoint:   submitEndpoint,
 	}
 }
+
 
 func id() string {
 	b := make([]byte, 8)
@@ -1540,6 +1544,21 @@ func decode(r *http.Request, v any) error {
 func runCmdProgress(ctx context.Context, bin string, args []string, onLine func(string)) (string, error) {
 	c := exec.CommandContext(ctx, bin, args...)
 	c.Env = os.Environ()
+
+	dataDir := os.Getenv("Y2B_DATA")
+	if dataDir == "" {
+		dataDir = "/srv/y2b/data"
+	}
+	cfgDir := filepath.Join(dataDir, ".config")
+	cacheDir := filepath.Join(dataDir, ".cache")
+	_ = os.MkdirAll(cfgDir, 0750)
+	_ = os.MkdirAll(cacheDir, 0750)
+	c.Env = append(c.Env,
+		"XDG_CONFIG_HOME="+cfgDir,
+		"XDG_CACHE_HOME="+cacheDir,
+		"HOME="+dataDir,
+	)
+
 	capture := &progressCapture{buffer: &limitedBuffer{max: 128 << 10}, onLine: onLine}
 	c.Stdout = capture
 	c.Stderr = capture
@@ -3268,11 +3287,21 @@ func (a *App) prepareTranslatedPartFiles(ctx context.Context, files []string) ([
 
 	for i, file := range files {
 		partTitle := partTitleFromFile(file)
-		result, err := a.aiEnhanceMetadata(ctx, partTitle, "")
-		if err != nil || result == nil || strings.TrimSpace(result.Title) == "" {
-			continue
+		var translatedTitle string
+		if a.cfg.DeepSeekKey != "" {
+			res, err := a.callLLMEnhance(ctx, partTitle, "")
+			if err == nil && res != nil && res.Title != "" {
+				translatedTitle = sanitizeBiliTitle(res.Title)
+			}
 		}
-		translatedTitle := sanitizeBiliTitle(result.Title)
+		if translatedTitle == "" {
+			tCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+			zh, err := freeTranslateCtx(tCtx, partTitle, "zh-CN")
+			cancel()
+			if err == nil && zh != "" {
+				translatedTitle = sanitizeBiliTitle(zh)
+			}
+		}
 		if translatedTitle == "" || translatedTitle == partTitle {
 			continue
 		}
@@ -3310,14 +3339,6 @@ func (a *App) executeBiliupUpload(ctx context.Context, q uploadReq) (map[string]
 	}
 	if len(files) == 0 {
 		return nil, "", errors.New("no files provided for upload")
-	}
-	uploadFiles := files
-	cleanupTranslated := func() {}
-	translatedCount := 0
-	partTranslateLogs := ""
-	if q.Translate {
-		uploadFiles, cleanupTranslated, translatedCount, partTranslateLogs = a.prepareTranslatedPartFiles(ctx, files)
-		defer cleanupTranslated()
 	}
 
 	desc := sanitizeBiliDesc(q.Description)
@@ -3361,6 +3382,79 @@ func (a *App) executeBiliupUpload(ctx context.Context, q uploadReq) (map[string]
 		}
 	}
 
+	const maxBiliParts = 100
+	if len(files) > maxBiliParts && q.VID == "" {
+		var combinedLogs strings.Builder
+		bvids := make([]string, 0)
+		uploadResults := make([]map[string]any, 0)
+		totalChunks := (len(files) + maxBiliParts - 1) / maxBiliParts
+
+		for chunkIdx := 0; chunkIdx < totalChunks; chunkIdx++ {
+			start := chunkIdx * maxBiliParts
+			end := start + maxBiliParts
+			if end > len(files) {
+				end = len(files)
+			}
+			chunkFiles := files[start:end]
+
+			chunkReq := q
+			chunkReq.Files = chunkFiles
+			chunkReq.File = chunkFiles[0]
+			chunkTitle := fmt.Sprintf("%s 第 %d 部分", title, chunkIdx+1)
+			chunkReq.Title = chunkTitle
+
+			if q.Progress != nil {
+				q.Progress(fmt.Sprintf("[多卷投稿] 正在处理第 %d/%d 卷 (%d 个分P)...", chunkIdx+1, totalChunks, len(chunkFiles)))
+			}
+
+			chunkOut, chunkLog, chunkErr := a.executeSingleBiliupUpload(ctx, chunkReq, chunkTitle, desc, tags, tid)
+			combinedLogs.WriteString(fmt.Sprintf("\n=== 第 %d/%d 部分投稿日志 ===\n%s\n", chunkIdx+1, totalChunks, chunkLog))
+			if chunkErr != nil {
+				return nil, combinedLogs.String(), fmt.Errorf("第 %d/%d 卷投稿失败: %w", chunkIdx+1, totalChunks, chunkErr)
+			}
+			if bv, ok := chunkOut["bvid"].(string); ok && bv != "" {
+				bvids = append(bvids, bv)
+			}
+			uploadResults = append(uploadResults, chunkOut)
+		}
+
+		firstBVID := ""
+		if len(bvids) > 0 {
+			firstBVID = bvids[0]
+		}
+		res := map[string]any{
+			"title":        title,
+			"description":  desc,
+			"tags":         tags,
+			"tid":          tid,
+			"files":        files,
+			"bvid":         firstBVID,
+			"bvids":        bvids,
+			"bili_url":     "https://www.bilibili.com/video/" + firstBVID,
+			"volumes":      uploadResults,
+			"total_parts":  len(files),
+			"volume_count": totalChunks,
+		}
+		return res, combinedLogs.String(), nil
+	}
+
+	return a.executeSingleBiliupUpload(ctx, q, title, desc, tags, tid)
+}
+
+func (a *App) executeSingleBiliupUpload(ctx context.Context, q uploadReq, title, desc, tags, tid string) (map[string]any, string, error) {
+	files := q.Files
+	if len(files) == 0 && q.File != "" {
+		files = []string{q.File}
+	}
+	uploadFiles := files
+	cleanupTranslated := func() {}
+	translatedCount := 0
+	partTranslateLogs := ""
+	if q.Translate {
+		uploadFiles, cleanupTranslated, translatedCount, partTranslateLogs = a.prepareTranslatedPartFiles(ctx, files)
+		defer cleanupTranslated()
+	}
+
 	cover := q.Cover
 	if cover == "" {
 		cover = adjacentCover(ctx, files[0])
@@ -3371,7 +3465,11 @@ func (a *App) executeBiliupUpload(ctx context.Context, q uploadReq) (map[string]
 	cover = a.sanitizeBiliCover(ctx, cover, q.Progress)
 
 	// Multi-endpoint submission with smart auto-healing
-	submitEndpoints := []string{"web", "b-cut-android", "app"}
+	// Prioritize b-cut-android and app to minimize web 406 rate limiting
+	submitEndpoints := []string{"b-cut-android", "app", "web"}
+	if a.cfg.SubmitEndpoint != "" && a.cfg.SubmitEndpoint != "auto" {
+		submitEndpoints = []string{a.cfg.SubmitEndpoint}
+	}
 	var totalLogs string
 	var execErr error
 	var bvid string
@@ -3542,6 +3640,7 @@ finish:
 	}
 	return res, totalLogs, execErr
 }
+
 
 func (a *App) waitUploadCooldown(ctx context.Context) error {
 	for {
@@ -3896,14 +3995,23 @@ type aiEnhanceResult struct {
 }
 
 func freeTranslate(text, targetLang string) (string, error) {
+	return freeTranslateCtx(context.Background(), text, targetLang)
+}
+
+func freeTranslateCtx(ctx context.Context, text, targetLang string) (string, error) {
 	text = strings.TrimSpace(text)
 	if text == "" {
 		return "", nil
 	}
 	urlStr := fmt.Sprintf("https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=%s&dt=t&q=%s",
 		targetLang, url.QueryEscape(text))
-	client := &http.Client{Timeout: 5 * time.Second}
-	res, err := client.Get(urlStr)
+	req, err := http.NewRequestWithContext(ctx, "GET", urlStr, nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0")
+	client := &http.Client{Timeout: 3 * time.Second}
+	res, err := client.Do(req)
 	if err != nil {
 		return "", err
 	}
@@ -3936,6 +4044,7 @@ func freeTranslate(text, targetLang string) (string, error) {
 	}
 	return strings.TrimSpace(sb.String()), nil
 }
+
 
 func extractSmartKeywords(title, defaultTags string) []string {
 	tagMap := make(map[string]bool)
