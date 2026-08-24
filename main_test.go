@@ -377,7 +377,22 @@ func TestFailureCategoriesOnlyRetryTransientErrors(t *testing.T) {
 	if !autoRetryAllowed(5, 10, "upload_rate_limit") {
 		t.Fatal("upload_rate_limit must remain auto-retryable indefinitely")
 	}
+	// YouTube bot challenge is retryable
+	if got := classifyFailure("Sign in to confirm you're not a bot. Use --cookies-from-browser", ""); got != "youtube_bot_challenge" {
+		t.Fatalf("YouTube bot challenge category = %q, want youtube_bot_challenge", got)
+	}
+	if !isAutoRetryableCategory("youtube_bot_challenge") {
+		t.Fatal("youtube_bot_challenge must be auto-retryable")
+	}
+	// Missing media (biliup os error 2) is retryable to allow re-download fallback
+	if got := classifyFailure("RuntimeError: No such file or directory (os error 2)", ""); got != "missing_media" {
+		t.Fatalf("missing media category = %q, want missing_media", got)
+	}
+	if !isAutoRetryableCategory("missing_media") {
+		t.Fatal("missing_media must be auto-retryable to enable re-download fallback")
+	}
 }
+
 
 func TestBiliupEndpointFallbackMock(t *testing.T) {
 	bin, state := writeMockBiliup(t, `

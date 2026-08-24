@@ -644,6 +644,18 @@ func classifyFailure(err, logs string) string {
 		strings.Contains(s, "限流"), strings.Contains(s, "风控"),
 		strings.Contains(s, "upload rate limit"), strings.Contains(s, "biliup rate limit"):
 		return "upload_rate_limit"
+	case strings.Contains(s, "sign in to confirm you're not a bot"),
+		strings.Contains(s, "sign in to confirm you are not a bot"),
+		strings.Contains(s, "use --cookies-from-browser"),
+		strings.Contains(s, "confirming you're not a bot"),
+		strings.Contains(s, "youtube bot challenge"),
+		strings.Contains(s, "http error 429"),
+		strings.Contains(s, "too many requests"):
+		return "youtube_bot_challenge"
+	case strings.Contains(s, "no such file or directory"),
+		strings.Contains(s, "os error 2"),
+		strings.Contains(s, "missing_media"):
+		return "missing_media"
 	case strings.Contains(s, "magnet_timeout"):
 		return "magnet_timeout"
 	case strings.Contains(s, "dead_seed"):
@@ -656,8 +668,11 @@ func classifyFailure(err, logs string) string {
 }
 
 func isAutoRetryableCategory(category string) bool {
-	return category == "queue_timeout" || category == "upload_rate_limit" || category == "magnet_timeout"
+	return category == "queue_timeout" || category == "upload_rate_limit" ||
+		category == "magnet_timeout" || category == "youtube_bot_challenge" ||
+		category == "missing_media"
 }
+
 
 func autoRetryAllowed(max, count int, category string) bool {
 	// Rate limiting is NOT a permanent failure: keep task pending with periodic retries
@@ -1929,10 +1944,20 @@ func (a *App) createYoutubeHandler(q youtubeReq) func(*Job) {
 			if downloadErr != nil {
 				if errors.Is(downloadErr, context.Canceled) {
 					a.set(nj, "canceled", "已取消", outMap, totalLogs)
+					return
+				}
+				// Partial playlist salvage: if yt-dlp exited with error but some
+				// videos were already downloaded, proceed to upload those rather
+				// than marking the whole job as failed. This handles the common
+				// case of YouTube bot-challenge errors mid-playlist.
+				category := classifyFailure(downloadErr.Error(), totalLogs)
+				if q.AutoUpload && len(targetUploadFiles) > 0 && category != "unknown" {
+					totalLogs += fmt.Sprintf("\n[部分下载挽救] yt-dlp 遇到错误但已下载 %d 个视频，继续上传已有部分 (分类: %s)\n", len(targetUploadFiles), category)
+					downloadErr = nil // salvage: continue to upload
 				} else {
 					a.set(nj, "failed", downloadErr.Error(), outMap, totalLogs)
+					return
 				}
-				return
 			}
 
 			downBytes := calcFilesSize(append(targetUploadFiles, videoFiles...))
@@ -3588,7 +3613,10 @@ func (a *App) createPipelineHandler(q pipelineReq) func(*Job) {
 					ytLogs, err := runCmdProgress(nj.ctx, a.cfg.YTDLP, args, func(line string) { a.progressLine(nj, "YouTube 下载", line) })
 					totalLogs += "[YouTube Download Logs]\n" + ytLogs + "\n"
 					downloadErr = err
-					if downloadErr != nil {
+					if downloadErr != nil && !errors.Is(downloadErr, context.Canceled) {
+						// Don't bail immediately; scan for any files already downloaded.
+						// We'll decide below whether to salvage or fail.
+					} else if downloadErr != nil {
 						return
 					}
 
@@ -3684,10 +3712,19 @@ func (a *App) createPipelineHandler(q pipelineReq) func(*Job) {
 			if downloadErr != nil {
 				if errors.Is(downloadErr, context.Canceled) {
 					a.set(nj, "canceled", "已取消", map[string]any{"dir": targetDir}, totalLogs)
-				} else {
-					a.set(nj, "failed", downloadErr.Error(), map[string]any{"dir": targetDir}, totalLogs)
+					return
 				}
-				return
+				// Partial playlist salvage: if YouTube yt-dlp exited with bot-challenge
+				// or similar error mid-playlist but we have downloaded files, proceed
+				// to upload what we have rather than failing the whole job.
+				category := classifyFailure(downloadErr.Error(), totalLogs)
+				if isYT && len(targetUploadFiles) > 0 && category != "unknown" {
+					totalLogs += fmt.Sprintf("\n[部分下载挽救] yt-dlp 遇到错误但已下载 %d 个视频文件，继续上传已有部分 (分类: %s)\n", len(targetUploadFiles), category)
+					downloadErr = nil // salvage: continue to upload stage
+				} else {
+					a.set(nj, "failed", downloadErr.Error(), map[string]any{"dir": targetDir, "video_files": targetUploadFiles}, totalLogs)
+					return
+				}
 			}
 
 			if len(targetUploadFiles) == 0 {
