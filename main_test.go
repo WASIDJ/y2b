@@ -384,14 +384,15 @@ func TestFailureCategoriesOnlyRetryTransientErrors(t *testing.T) {
 	if !isAutoRetryableCategory("youtube_bot_challenge") {
 		t.Fatal("youtube_bot_challenge must be auto-retryable")
 	}
-	// Missing media (biliup os error 2) is retryable to allow re-download fallback
+	// Missing media (biliup os error 2) is classified as missing_media, not auto-retryable without a source URL
 	if got := classifyFailure("RuntimeError: No such file or directory (os error 2)", ""); got != "missing_media" {
 		t.Fatalf("missing media category = %q, want missing_media", got)
 	}
-	if !isAutoRetryableCategory("missing_media") {
-		t.Fatal("missing_media must be auto-retryable to enable re-download fallback")
+	if isAutoRetryableCategory("missing_media") {
+		t.Fatal("missing_media must not be blindly auto-retried without valid source")
 	}
 }
+
 
 
 func TestBiliupEndpointFallbackMock(t *testing.T) {
@@ -947,7 +948,30 @@ func TestResumableJobUploadPreservesFilesAndVID(t *testing.T) {
 	if !ok || recInput.URL != "magnet:?xt=urn:btih:8a7cef125593ba70&dn=TestCourse" {
 		t.Fatalf("unexpected recovered pipeline URL: %+v", recoveredJob.Input)
 	}
+
+	// Case 5: Unrecoverable biliup job (files missing and no source URL) fails cleanly without creating bad jobs
+	unrecBiliup := &Job{
+		ID:     "unrec123",
+		Kind:   "biliup",
+		Status: "failed",
+		Input: uploadReq{
+			Source: "magnet-recovery-deleted",
+			Title:  "Dead Job",
+			Files:  []string{"/tmp/missing/dead.mp4"},
+		},
+	}
+	unrecApp := &App{
+		jobs: map[string]*Job{
+			unrecBiliup.ID: unrecBiliup,
+		},
+		order: []string{unrecBiliup.ID},
+	}
+	_, unrecErr := unrecApp.retryJob(unrecBiliup.ID)
+	if unrecErr == nil {
+		t.Fatal("expected retryJob to reject unrecoverable biliup job with missing files and no source URL")
+	}
 }
+
 
 
 

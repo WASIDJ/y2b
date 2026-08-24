@@ -426,6 +426,23 @@ func (a *App) loadJobs() {
 			j.Status = "canceled"
 			j.Error = "服务重启中断"
 			j.Finished = time.Now()
+		} else if j.Status == "failed" && j.Kind == "biliup" {
+			category := classifyFailure(j.Error, j.Logs)
+			if category == "missing_media" {
+				j.NextRetryAt = time.Time{}
+				var up uploadReq
+				if b, err := json.Marshal(j.Input); err == nil {
+					_ = json.Unmarshal(b, &up)
+				}
+				src := up.OriginalURL
+				if src == "" {
+					src = up.Source
+				}
+				if !validYouTube(src) && !validTorrentOrMagnet(src) {
+					j.Status = "canceled"
+					j.Step = "已取消 (媒体文件缺失且无原始下载链接)"
+				}
+			}
 		}
 		a.jobs[j.ID] = j
 		a.order = append(a.order, j.ID)
@@ -669,8 +686,7 @@ func classifyFailure(err, logs string) string {
 
 func isAutoRetryableCategory(category string) bool {
 	return category == "queue_timeout" || category == "upload_rate_limit" ||
-		category == "magnet_timeout" || category == "youtube_bot_challenge" ||
-		category == "missing_media"
+		category == "magnet_timeout" || category == "youtube_bot_challenge"
 }
 
 
@@ -1413,17 +1429,18 @@ func (a *App) retryJob(jobID string) (*Job, error) {
 					Tags:      tags,
 					Translate: translate,
 				}
-			} else if out := outputMap(old.Output); out != nil {
+			} else if out := outputMap(old.Output); out != nil && old.Kind == "pipeline" {
 				if dir, ok := out["dir"].(string); ok && dir != "" {
-					if old.Kind == "pipeline" {
-						var pipeline pipelineReq
-						if b, err := json.Marshal(old.Input); err == nil {
-							_ = json.Unmarshal(b, &pipeline)
-						}
-						pipeline.ResumeDir = dir
-						retryInput = pipeline
+					var pipeline pipelineReq
+					if b, err := json.Marshal(old.Input); err == nil {
+						_ = json.Unmarshal(b, &pipeline)
 					}
+					pipeline.ResumeDir = dir
+					retryInput = pipeline
 				}
+			} else if old.Kind == "biliup" {
+				a.mu.Unlock()
+				return nil, errors.New("cannot retry: media files are missing on disk and no valid source URL is available to re-download")
 			}
 		}
 	}
