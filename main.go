@@ -888,6 +888,10 @@ func (a *App) diskRecoveryWatchdog(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+			// Trigger periodic cleanup of completed and orphaned media
+			a.cleanupCompletedJobMedia()
+			a.cleanupOrphanedMedia()
+
 			disk := getDiskInfo(a.cfg.DataDir)
 			minFree := a.cfg.MinFreeDiskGB
 			if minFree <= 0 {
@@ -944,10 +948,10 @@ func (a *App) cleanupOrphanedMedia() int64 {
 		if j == nil {
 			continue
 		}
-		activeIDs[id] = true
 
-		// Never delete directories of jobs that are not completed and passed
+		// Only retain directories of jobs that are active / not completed and passed
 		if j.ReviewState != "passed" || j.Status != "done" {
+			activeIDs[id] = true
 			// Check Output
 			if out := outputMap(j.Output); out != nil {
 				if d, ok := out["dir"].(string); ok && d != "" {
@@ -2259,6 +2263,7 @@ func (a *App) cleanupCompletedJobMedia() int64 {
 	}
 	a.mu.RUnlock()
 	var freed int64
+	root := filepath.Clean(a.cfg.DataDir)
 	for _, j := range jobs {
 		var out struct {
 			Dir string `json:"dir"`
@@ -2266,7 +2271,23 @@ func (a *App) cleanupCompletedJobMedia() int64 {
 		if b, err := json.Marshal(j.Output); err == nil {
 			_ = json.Unmarshal(b, &out)
 		}
-		freed += purgeVideoFilesInDir(out.Dir)
+		if out.Dir != "" {
+			freed += purgeVideoFilesInDir(out.Dir)
+			cleanDir := filepath.Clean(out.Dir)
+			if a.cfg.DataDir != "" {
+				if rel, err := filepath.Rel(root, cleanDir); err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) && !filepath.IsAbs(rel) {
+					_ = os.RemoveAll(cleanDir)
+				}
+			}
+		}
+		if a.cfg.DataDir != "" && j.ID != "" {
+			for _, sub := range []string{"magnet", "youtube"} {
+				jobDir := filepath.Join(a.cfg.DataDir, sub, j.ID)
+				if fi, err := os.Stat(jobDir); err == nil && fi.IsDir() {
+					_ = os.RemoveAll(jobDir)
+				}
+			}
+		}
 	}
 	return freed
 }
