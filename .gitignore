@@ -16,6 +16,8 @@ channels.json
 
 # Local build/runtime artifacts.
 y2b-go
+y2b
+jobs.json
 *.tmp
 *.bak
 .DS_Store

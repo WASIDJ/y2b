@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -1063,6 +1064,172 @@ func TestBiliupSubmitEndpointConfig(t *testing.T) {
 	}
 	if app.cfg.SubmitEndpoint != "b-cut-android" {
 		t.Fatalf("expected submit endpoint = b-cut-android, got %s", app.cfg.SubmitEndpoint)
+	}
+}
+
+func TestYouTubeRateLimitClassificationAndBackoff(t *testing.T) {
+	app := &App{
+		cfg: Config{
+			AutoRetryBase: 30 * time.Second,
+		},
+	}
+
+	ytMsg1 := "ERROR: [youtube] 6qLq7xkodA8: This content isn't available, try again later. The current session has been rate-limited by YouTube for up to an hour."
+	if got := classifyFailure(ytMsg1, ""); got != "youtube_bot_challenge" {
+		t.Fatalf("expected youtube_bot_challenge, got %s", got)
+	}
+
+	ytMsg2 := "rate-limited by youtube, please wait"
+	if got := classifyFailure(ytMsg2, ""); got != "youtube_bot_challenge" {
+		t.Fatalf("expected youtube_bot_challenge, got %s", got)
+	}
+
+	delay1 := app.retryDelayFor("youtube_bot_challenge", 1)
+	if delay1 != 15*time.Minute {
+		t.Fatalf("expected 15m delay for retry #1, got %v", delay1)
+	}
+	delay2 := app.retryDelayFor("youtube_bot_challenge", 2)
+	if delay2 != 30*time.Minute {
+		t.Fatalf("expected 30m delay for retry #2, got %v", delay2)
+	}
+}
+
+func TestLoadJobsReclassifiesDiskFullAndRateLimit(t *testing.T) {
+	dir := t.TempDir()
+	jobsPath := filepath.Join(dir, "jobs.json")
+	initialJobs := []map[string]any{
+		{
+			"id":               "job_disk_full",
+			"kind":             "pipeline",
+			"status":           "failed",
+			"step":             "失败",
+			"error":            "磁盘空间不足 (可用空间仅 0.0 GB，安全门限 >= 2.0 GB)，暂停下载以防写满磁盘",
+			"failure_category": "unknown",
+			"auto_retry_count": 5,
+		},
+		{
+			"id":               "job_rate_limit",
+			"kind":             "pipeline",
+			"status":           "failed",
+			"step":             "失败",
+			"error":            "B站投稿限流/需验证 (code 601: )",
+			"failure_category": "unknown",
+			"auto_retry_count": 3,
+		},
+	}
+	data, err := json.Marshal(initialJobs)
+	if err != nil {
+		t.Fatalf("marshal failed: %v", err)
+	}
+	if err := os.WriteFile(jobsPath, data, 0644); err != nil {
+		t.Fatalf("write failed: %v", err)
+	}
+
+	app := &App{
+		cfg:  Config{DataDir: dir},
+		jobs: map[string]*Job{},
+	}
+	app.loadJobs()
+
+	app.mu.RLock()
+	defer app.mu.RUnlock()
+
+	jDisk := app.jobs["job_disk_full"]
+	if jDisk == nil {
+		t.Fatal("job_disk_full not found")
+	}
+	if jDisk.FailureCategory != "disk_full" {
+		t.Fatalf("expected disk_full, got %s", jDisk.FailureCategory)
+	}
+	if jDisk.Step != "磁盘空间不足，等待手动清理后重试" {
+		t.Fatalf("unexpected step: %s", jDisk.Step)
+	}
+
+	jRate := app.jobs["job_rate_limit"]
+	if jRate == nil {
+		t.Fatal("job_rate_limit not found")
+	}
+	if jRate.FailureCategory != "upload_rate_limit" {
+		t.Fatalf("expected upload_rate_limit, got %s", jRate.FailureCategory)
+	}
+	if jRate.Step != "等待B站限流/风控解除 (可人工验证或次日自动刷新)" {
+		t.Fatalf("unexpected step: %s", jRate.Step)
+	}
+}
+
+func TestManualRetryResetsAutoRetryCount(t *testing.T) {
+	dir := t.TempDir()
+	app := &App{
+		cfg:           Config{DataDir: dir},
+		jobs:          map[string]*Job{},
+		downloadSlots: make(chan struct{}, 1),
+		uploadSlots:   make(chan struct{}, 1),
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	oldJob := &Job{
+		ID:             "job_failed_rate_limit",
+		Kind:           "pipeline",
+		Status:         "failed",
+		Step:           "失败",
+		Error:          "code 601 rate limit",
+		AutoRetryCount: 48, // exhausted count
+		Input: pipelineReq{
+			URL: "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+		},
+		ctx:        ctx,
+		cancelFunc: cancel,
+	}
+	app.jobs[oldJob.ID] = oldJob
+	app.order = []string{oldJob.ID}
+
+	// Internal retry keeps old AutoRetryCount
+	retriedInternal, err := app.retryJob(oldJob.ID)
+	if err != nil {
+		t.Fatalf("retryJob failed: %v", err)
+	}
+	if retriedInternal.AutoRetryCount != 48 {
+		t.Fatalf("expected internal retry to keep count=48, got %d", retriedInternal.AutoRetryCount)
+	}
+
+	// Mark retried job as failed again
+	retriedInternal.Status = "failed"
+	retriedInternal.Error = "code 601 rate limit"
+
+	// Manual retry resets count to 0
+	retriedManual, err := app.retryJobManual(retriedInternal.ID)
+	if err != nil {
+		t.Fatalf("retryJobManual failed: %v", err)
+	}
+	if retriedManual.AutoRetryCount != 0 {
+		t.Fatalf("expected manual retry to reset count to 0, got %d", retriedManual.AutoRetryCount)
+	}
+}
+
+func TestSystemDiagnosticsDiskFields(t *testing.T) {
+	dir := t.TempDir()
+	app := &App{
+		cfg: Config{
+			DataDir:        dir,
+			MinFreeDiskGB:  5.0,
+			BiliCookies:    filepath.Join(dir, "cookies.json"),
+			ChannelsFile:   filepath.Join(dir, "channels.json"),
+		},
+		jobs:     map[string]*Job{},
+		channels: map[string]*MonitoredChannel{},
+	}
+	diag := app.systemDiagnostics()
+	if _, ok := diag["disk_free_gb"]; !ok {
+		t.Fatal("missing disk_free_gb in systemDiagnostics")
+	}
+	if _, ok := diag["disk_total_gb"]; !ok {
+		t.Fatal("missing disk_total_gb in systemDiagnostics")
+	}
+	if _, ok := diag["disk_used_pct"]; !ok {
+		t.Fatal("missing disk_used_pct in systemDiagnostics")
+	}
+	if _, ok := diag["disk_warning"]; !ok {
+		t.Fatal("missing disk_warning in systemDiagnostics")
 	}
 }
 
