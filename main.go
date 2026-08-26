@@ -288,7 +288,7 @@ func loadConfig() Config {
 			reviewRepairMax = parsed
 		}
 	}
-	minFreeDiskGB := 3.0
+	minFreeDiskGB := 5.0
 	if raw := os.Getenv("Y2B_MIN_FREE_GIB"); raw != "" {
 		if parsed, err := strconv.ParseFloat(raw, 64); err == nil && parsed > 0 {
 			minFreeDiskGB = parsed
@@ -430,9 +430,10 @@ func (a *App) loadJobs() {
 			j.Status = "canceled"
 			j.Error = "服务重启中断"
 			j.Finished = time.Now()
-		} else if j.Status == "failed" && j.Kind == "biliup" {
+		} else if j.Status == "failed" {
 			category := classifyFailure(j.Error, j.Logs)
-			if category == "missing_media" {
+			j.FailureCategory = category
+			if category == "missing_media" && j.Kind == "biliup" {
 				j.NextRetryAt = time.Time{}
 				var up uploadReq
 				if b, err := json.Marshal(j.Input); err == nil {
@@ -446,6 +447,11 @@ func (a *App) loadJobs() {
 					j.Status = "canceled"
 					j.Step = "已取消 (媒体文件缺失且无原始下载链接)"
 				}
+			} else if category == "disk_full" {
+				j.NextRetryAt = time.Time{}
+				j.Step = "磁盘空间不足，等待手动清理后重试"
+			} else if category == "upload_rate_limit" {
+				j.Step = "等待B站限流/风控解除 (可人工验证或次日自动刷新)"
 			}
 		}
 		a.jobs[j.ID] = j
@@ -616,9 +622,12 @@ func (a *App) set(j *Job, status, err string, out any, logs string) {
 		}
 	} else if status == "failed" {
 		j.Finished = time.Now()
-		if j.FailureCategory == "upload_rate_limit" {
+		switch j.FailureCategory {
+		case "upload_rate_limit":
 			j.Step = "等待B站限流/风控解除 (可人工验证或次日自动刷新)"
-		} else {
+		case "disk_full":
+			j.Step = "磁盘空间不足，等待手动清理后重试"
+		default:
 			j.Step = "失败"
 		}
 	} else if status == "canceled" {
@@ -629,6 +638,14 @@ func (a *App) set(j *Job, status, err string, out any, logs string) {
 	a.saveJobs()
 	if shouldAutoRetry {
 		a.scheduleAutoRetry(j, retryDelay)
+	}
+	// Reclaim disk space immediately after any terminal state so completed
+	// media does not linger until the next service restart.
+	if status == "done" || status == "failed" || status == "canceled" {
+		go func() {
+			a.cleanupCompletedJobMedia()
+			a.cleanupOrphanedMedia()
+		}()
 	}
 }
 
@@ -641,6 +658,14 @@ func (a *App) retryDelayFor(category string, retryNo int) time.Duration {
 		// Rate limiting: pause for 30 minutes between attempts so operator can
 		// verify on Bilibili or next-day quota refreshes automatically.
 		return 30 * time.Minute
+	}
+	if category == "youtube_bot_challenge" {
+		// YouTube session rate limits typically advise waiting up to an hour.
+		// Space retries out to avoid persistent bans: 5m, 15m, 30m, 45m...
+		if retryNo > 4 {
+			retryNo = 4
+		}
+		return time.Duration(retryNo*15) * time.Minute
 	}
 	if retryNo > 5 {
 		retryNo = 5
@@ -672,7 +697,9 @@ func classifyFailure(err, logs string) string {
 		strings.Contains(s, "confirming you're not a bot"),
 		strings.Contains(s, "youtube bot challenge"),
 		strings.Contains(s, "http error 429"),
-		strings.Contains(s, "too many requests"):
+		strings.Contains(s, "too many requests"),
+		strings.Contains(s, "rate-limited by youtube"),
+		strings.Contains(s, "this content isn't available, try again later"):
 		return "youtube_bot_challenge"
 	case strings.Contains(s, "no such file or directory"),
 		strings.Contains(s, "os error 2"),
@@ -848,6 +875,50 @@ func (a *App) retryWatchdog(ctx context.Context) {
 	}
 }
 
+// diskRecoveryWatchdog periodically checks whether disk space has recovered
+// enough to resume disk_full jobs. It runs every 5 minutes and re-queues any
+// failed job whose failure category is disk_full once free space is above the
+// configured threshold. This avoids the user having to manually retry each job
+// after clearing disk space.
+func (a *App) diskRecoveryWatchdog(ctx context.Context) {
+	ticker := time.NewTicker(5 * time.Minute)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			disk := getDiskInfo(a.cfg.DataDir)
+			minFree := a.cfg.MinFreeDiskGB
+			if minFree <= 0 {
+				minFree = 5.0
+			}
+			if disk.TotalGB == 0 || disk.FreeGB < minFree {
+				// Still not enough space — don't resume yet.
+				continue
+			}
+			// Enough space recovered: re-queue disk_full jobs.
+			a.mu.RLock()
+			ids := make([]string, 0)
+			for _, oid := range a.order {
+				j := a.jobs[oid]
+				if j != nil && j.Status == "failed" &&
+					classifyFailure(j.Error, j.Logs) == "disk_full" {
+					ids = append(ids, j.ID)
+				}
+			}
+			a.mu.RUnlock()
+			for _, jobID := range ids {
+				if _, err := a.retryJob(jobID); err != nil {
+					fmt.Printf("disk recovery watchdog skipped job %s: %v\n", jobID, err)
+				} else {
+					fmt.Printf("disk recovery watchdog resumed disk_full job %s (free: %.1f GB)\n", jobID, disk.FreeGB)
+				}
+			}
+		}
+	}
+}
+
 func (a *App) ensureSafeMemory(ctx context.Context) error {
 	for i := 0; i < 15; i++ {
 		mem := getMemoryInfo()
@@ -943,7 +1014,7 @@ func (a *App) cleanupOrphanedMedia() int64 {
 func (a *App) ensureSafeDisk(ctx context.Context) error {
 	minFree := a.cfg.MinFreeDiskGB
 	if minFree <= 0 {
-		minFree = 2.0
+		minFree = 5.0
 	}
 
 	for i := 0; i < 15; i++ {
@@ -1336,6 +1407,14 @@ func stringSlice(value any) []string {
 }
 
 func (a *App) retryJob(jobID string) (*Job, error) {
+	return a.retryJobWithCount(jobID, false)
+}
+
+func (a *App) retryJobManual(jobID string) (*Job, error) {
+	return a.retryJobWithCount(jobID, true)
+}
+
+func (a *App) retryJobWithCount(jobID string, resetCount bool) (*Job, error) {
 	a.mu.Lock()
 	old := a.jobs[jobID]
 	if old == nil {
@@ -1508,7 +1587,12 @@ func (a *App) retryJob(jobID string) (*Job, error) {
 		Input:          retryInput,
 		ctx:            ctx,
 		cancelFunc:     cancel,
-		AutoRetryCount: old.AutoRetryCount,
+		AutoRetryCount: func() int {
+			if resetCount {
+				return 0
+			}
+			return old.AutoRetryCount
+		}(),
 	}
 	for i, oid := range a.order {
 		if oid == jobID {
@@ -5271,6 +5355,15 @@ func (a *App) systemDiagnostics() map[string]any {
 		"running_jobs":  runningJobs,
 		"ram":           ram,
 		"rom":           rom,
+		"disk_free_gb":  rom.FreeGB,
+		"disk_total_gb": rom.TotalGB,
+		"disk_used_pct": func() float64 {
+			if rom.TotalGB > 0 {
+				return (rom.TotalGB - rom.FreeGB) / rom.TotalGB * 100
+			}
+			return 0
+		}(),
+		"disk_warning": rom.TotalGB > 0 && rom.FreeGB < a.cfg.MinFreeDiskGB,
 		"cpu":           cpu,
 		"network":       netInfo,
 		"traffic_stats": trafficStats,
@@ -6183,7 +6276,7 @@ func (a *App) handler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if r.Method == "POST" && len(parts) == 2 && parts[1] == "retry" {
-			j, err := a.retryJob(id)
+			j, err := a.retryJobManual(id)
 			if err != nil {
 				jsonResp(w, 409, map[string]string{"error": err.Error()})
 			} else {
@@ -6256,6 +6349,7 @@ func main() {
 	a.recoverTransientJobs()
 	a.recoverInterruptedJobs()
 	go a.retryWatchdog(context.Background())
+	go a.diskRecoveryWatchdog(context.Background())
 	if freed := a.cleanupCompletedJobMedia(); freed > 0 {
 		fmt.Printf("cleaned %s from completed pipeline jobs\n", formatBytes(freed))
 	}
