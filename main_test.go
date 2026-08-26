@@ -375,9 +375,12 @@ func TestFailureCategoriesOnlyRetryTransientErrors(t *testing.T) {
 	if !isAutoRetryableCategory("queue_timeout") || !isAutoRetryableCategory("upload_rate_limit") {
 		t.Fatal("transient categories should be auto-retryable")
 	}
-	// Rate limit retries must not be capped
-	if !autoRetryAllowed(5, 10, "upload_rate_limit") {
-		t.Fatal("upload_rate_limit must remain auto-retryable indefinitely")
+	// Rate limit retries are capped at uploadRateLimitMaxRetries (~48) to prevent infinite loops.
+	if autoRetryAllowed(5, uploadRateLimitMaxRetries, "upload_rate_limit") {
+		t.Fatal("upload_rate_limit must stop retrying after uploadRateLimitMaxRetries")
+	}
+	if !autoRetryAllowed(5, uploadRateLimitMaxRetries-1, "upload_rate_limit") {
+		t.Fatal("upload_rate_limit should still be allowed before hitting the cap")
 	}
 	// YouTube bot challenge is retryable
 	if got := classifyFailure("Sign in to confirm you're not a bot. Use --cookies-from-browser", ""); got != "youtube_bot_challenge" {
@@ -392,6 +395,22 @@ func TestFailureCategoriesOnlyRetryTransientErrors(t *testing.T) {
 	}
 	if isAutoRetryableCategory("missing_media") {
 		t.Fatal("missing_media must not be blindly auto-retried without valid source")
+	}
+	// Disk full errors (Chinese UI message and aria2c exit status 9) must not be auto-retried.
+	if got := classifyFailure("磁盘空间不足 (可用空间仅 0.0 GB，安全门限 >= 2.0 GB)，暂停下载以防写满磁盘", ""); got != "disk_full" {
+		t.Fatalf("disk_full category (Chinese) = %q, want disk_full", got)
+	}
+	if got := classifyFailure("/usr/bin/aria2c: exit status 9: not enough disk space", ""); got != "disk_full" {
+		t.Fatalf("disk_full category (aria2 exit 9) = %q, want disk_full", got)
+	}
+	if got := classifyFailure("no space left on device", ""); got != "disk_full" {
+		t.Fatalf("disk_full category (no space left) = %q, want disk_full", got)
+	}
+	if isAutoRetryableCategory("disk_full") {
+		t.Fatal("disk_full must not be auto-retried (disk will still be full)")
+	}
+	if autoRetryAllowed(0, 0, "disk_full") {
+		t.Fatal("disk_full must never be auto-retried regardless of AutoRetryMax=0")
 	}
 }
 

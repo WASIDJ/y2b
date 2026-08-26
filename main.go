@@ -648,6 +648,7 @@ func (a *App) retryDelayFor(category string, retryNo int) time.Duration {
 	return base * time.Duration(1<<(retryNo-1))
 }
 
+
 // classifyFailure turns noisy external-tool output into a stable category that
 // the UI and the bounded recovery loop can act on.
 func classifyFailure(err, logs string) string {
@@ -677,6 +678,15 @@ func classifyFailure(err, logs string) string {
 		strings.Contains(s, "os error 2"),
 		strings.Contains(s, "missing_media"):
 		return "missing_media"
+	case strings.Contains(s, "磁盘空间不足"),
+		strings.Contains(s, "no space left on device"),
+		strings.Contains(s, "not enough disk space"),
+		strings.Contains(s, "disk full"),
+		strings.Contains(s, "exit status 9"):
+		// aria2c exit status 9 = Not Enough Disk Space; disk_full is never
+		// auto-retried — retrying immediately just wastes resources until
+		// the user frees disk space manually.
+		return "disk_full"
 	case strings.Contains(s, "magnet_timeout"):
 		return "magnet_timeout"
 	case strings.Contains(s, "dead_seed"):
@@ -693,12 +703,17 @@ func isAutoRetryableCategory(category string) bool {
 		category == "magnet_timeout" || category == "youtube_bot_challenge"
 }
 
+// uploadRateLimitMaxRetries is the hard ceiling for upload_rate_limit retries
+// (~48 attempts × 30 min ≈ 24 hours). Beyond this the job stays failed and
+// requires manual verification (B站 account check, cookie refresh, etc.).
+const uploadRateLimitMaxRetries = 48
 
 func autoRetryAllowed(max, count int, category string) bool {
-	// Rate limiting is NOT a permanent failure: keep task pending with periodic retries
-	// indefinitely until manually verified or refreshed next day.
+	// Rate limiting is NOT a permanent failure: keep task pending with periodic
+	// retries, but cap at uploadRateLimitMaxRetries to avoid infinite loops.
+	// After the cap the job stays failed and requires manual intervention.
 	if category == "upload_rate_limit" {
-		return true
+		return count < uploadRateLimitMaxRetries
 	}
 	return (max <= 0 || count < max) && isAutoRetryableCategory(category)
 }
