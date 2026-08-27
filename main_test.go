@@ -407,6 +407,16 @@ func TestFailureCategoriesOnlyRetryTransientErrors(t *testing.T) {
 	if got := classifyFailure("no space left on device", ""); got != "disk_full" {
 		t.Fatalf("disk_full category (no space left) = %q, want disk_full", got)
 	}
+	// aria2 exit status 7 / dead_seed classification
+	if got := classifyFailure("/usr/bin/aria2c: exit status 7: 08/26 20:59:50 [NOTICE] Downloading 1 item(s)", ""); got != "dead_seed" {
+		t.Fatalf("aria2 exit 7 category = %q, want dead_seed", got)
+	}
+	if got := classifyFailure("aria2c: exit status 7: bt-stop-timeout reached", ""); got != "dead_seed" {
+		t.Fatalf("aria2 bt-stop-timeout category = %q, want dead_seed", got)
+	}
+	if got := classifyFailure("BT 下载超过 30m0s", ""); got != "magnet_timeout" {
+		t.Fatalf("magnet timeout category = %q, want magnet_timeout", got)
+	}
 	if isAutoRetryableCategory("disk_full") {
 		t.Fatal("disk_full must not be auto-retried (disk will still be full)")
 	}

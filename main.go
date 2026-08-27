@@ -714,9 +714,13 @@ func classifyFailure(err, logs string) string {
 		// auto-retried — retrying immediately just wastes resources until
 		// the user frees disk space manually.
 		return "disk_full"
-	case strings.Contains(s, "magnet_timeout"):
+	case strings.Contains(s, "magnet_timeout"),
+		strings.Contains(s, "bt 下载超过"):
 		return "magnet_timeout"
-	case strings.Contains(s, "dead_seed"):
+	case strings.Contains(s, "dead_seed"),
+		strings.Contains(s, "未发现可用做种"),
+		strings.Contains(s, "bt-stop-timeout"),
+		strings.Contains(s, "exit status 7"):
 		return "dead_seed"
 	case strings.Contains(s, "context canceled"), strings.Contains(s, "已取消"):
 		return "canceled"
