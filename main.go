@@ -62,6 +62,7 @@ type Config struct {
 	AdminUser        string
 	AdminPass        string
 	SecretKey        string
+	DownloadTimeout  time.Duration
 	UploadTimeout    time.Duration
 	QueueWaitTimeout time.Duration
 	MagnetTimeout    time.Duration
@@ -266,6 +267,12 @@ func loadConfig() Config {
 	// short HTTP request. Keep this bounded, but do not fail large jobs after
 	// the old 30-minute window.
 	magnetTimeout := 6 * time.Hour
+	downloadTimeout := 2 * time.Hour
+	if raw := os.Getenv("Y2B_DOWNLOAD_TIMEOUT"); raw != "" {
+		if parsed, err := time.ParseDuration(raw); err == nil && parsed > 0 {
+			downloadTimeout = parsed
+		}
+	}
 	if raw := os.Getenv("Y2B_MAGNET_TIMEOUT"); raw != "" {
 		if parsed, err := time.ParseDuration(raw); err == nil && parsed > 0 {
 			magnetTimeout = parsed
@@ -328,6 +335,7 @@ func loadConfig() Config {
 		AdminUser:        adminUser,
 		AdminPass:        adminPass,
 		SecretKey:        secretKey,
+		DownloadTimeout:  downloadTimeout,
 		UploadTimeout:    uploadTimeout,
 		QueueWaitTimeout: queueWaitTimeout,
 		MagnetTimeout:    magnetTimeout,
@@ -3146,6 +3154,228 @@ func (a *App) runMagnetStreamingUpload(ctx context.Context, args []string, dir s
 	}
 }
 
+// runYouTubeStreamingUpload executes yt-dlp while periodically checking for completed
+// individual video files and triggering onVideoReady as each item finishes.
+func (a *App) runYouTubeStreamingUpload(ctx context.Context, args []string, dir string, onLine func(string), onVideoReady func(file string) error) (string, []string, error) {
+	streamCtx, cancel := context.WithCancel(ctx)
+	if a.cfg.DownloadTimeout > 0 {
+		streamCtx, cancel = context.WithTimeout(ctx, a.cfg.DownloadTimeout)
+	}
+	defer cancel()
+
+	c := exec.CommandContext(streamCtx, a.cfg.YTDLP, args...)
+	c.Env = os.Environ()
+	capture := &progressCapture{buffer: &limitedBuffer{max: 128 << 10}, onLine: onLine}
+	c.Stdout = capture
+	c.Stderr = capture
+	if err := c.Start(); err != nil {
+		return "", nil, err
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- c.Wait() }()
+
+	type fileState struct {
+		size int64
+		seen int
+	}
+	states := make(map[string]fileState)
+	uploaded := make(map[string]bool)
+	var uploadedFiles []string
+
+	scanReady := func(force bool) error {
+		var firstErr error
+		files, _ := filepath.Glob(filepath.Join(dir, "*"))
+		sort.Strings(files)
+
+		for _, path := range files {
+			if uploaded[path] || !isVideoFilePath(path) {
+				continue
+			}
+			// Skip if yt-dlp temporary .part or .ytdl file exists
+			if _, err := os.Stat(path + ".part"); err == nil {
+				continue
+			}
+			if _, err := os.Stat(path + ".ytdl"); err == nil {
+				continue
+			}
+			info, err := os.Stat(path)
+			if err != nil || info.IsDir() || info.Size() == 0 {
+				continue
+			}
+
+			st := states[path]
+			if st.size == info.Size() {
+				st.seen++
+			} else {
+				st.size, st.seen = info.Size(), 1
+			}
+			states[path] = st
+
+			if !force && st.seen < 2 {
+				continue
+			}
+
+			// Pre-upload subtitle preparation
+			convertVttToSrtAndBcc(dir)
+
+			if err := onVideoReady(path); err != nil {
+				firstErr = err
+				break
+			}
+			uploaded[path] = true
+			uploadedFiles = append(uploadedFiles, path)
+		}
+		return firstErr
+	}
+
+	ticker := time.NewTicker(3 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case processErr := <-done:
+			if err := scanReady(true); err != nil {
+				_ = c.Process.Kill()
+				return strings.TrimSpace(capture.String()), uploadedFiles, err
+			}
+			capture.flush()
+			logs := strings.TrimSpace(capture.String())
+			if processErr != nil {
+				if errors.Is(streamCtx.Err(), context.DeadlineExceeded) {
+					return logs, uploadedFiles, fmt.Errorf("download_timeout: YouTube 下载超过 %s", a.cfg.DownloadTimeout)
+				}
+				return logs, uploadedFiles, fmt.Errorf("%s: %w: %s", a.cfg.YTDLP, processErr, logs)
+			}
+			return logs, uploadedFiles, nil
+
+		case <-ticker.C:
+			if a.cfg.MinFreeDiskGB > 0 {
+				disk := getDiskInfo(a.cfg.DataDir)
+				if disk.TotalGB > 0 && disk.FreeGB < (a.cfg.MinFreeDiskGB/2) {
+					_ = c.Process.Kill()
+					return strings.TrimSpace(capture.String()), uploadedFiles, fmt.Errorf("磁盘空间不足 (可用空间仅 %.1f GB，安全门限 >= %.1f GB)，暂停下载以防写满磁盘", disk.FreeGB, a.cfg.MinFreeDiskGB)
+				}
+			}
+			if err := scanReady(false); err != nil {
+				_ = c.Process.Kill()
+				return strings.TrimSpace(capture.String()), uploadedFiles, err
+			}
+
+		case <-ctx.Done():
+			_ = c.Process.Kill()
+			return strings.TrimSpace(capture.String()), uploadedFiles, ctx.Err()
+		}
+	}
+}
+
+// streamUploader handles streaming concurrent uploads for individual files
+// as they become ready during downloads.
+type streamUploader struct {
+	app           *App
+	job           *Job
+	q             pipelineReq
+	mainBVID      string
+	mainTitle     string
+	uploadedFiles []string
+	results       []map[string]any
+	totalBytes    int64
+	mu            sync.Mutex
+}
+
+func (a *App) newStreamUploader(nj *Job, q pipelineReq) *streamUploader {
+	return &streamUploader{
+		app: a,
+		job: nj,
+		q:   q,
+	}
+}
+
+func (s *streamUploader) handleReadyVideo(file string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	nj := s.job
+	a := s.app
+
+	if err := a.acquireSlot(nj.ctx, a.uploadSlots); err != nil {
+		return err
+	}
+	defer func() { <-a.uploadSlots }()
+
+	partNum := len(s.uploadedFiles) + 1
+	a.setStep(nj, fmt.Sprintf("[2/2] B站边下边传 (第 %d 集): %s", partNum, filepath.Base(file)))
+	a.setProgress(nj, JobProgress{Detail: fmt.Sprintf("B站上传 P%d: %s", partNum, filepath.Base(file))})
+
+	uploadFile := file
+	if s.q.BurnSubs {
+		burned, _, _ := burnSubtitlesToVideos(nj.ctx, filepath.Dir(file), []string{file}, func(line string) {
+			a.progressLine(nj, fmt.Sprintf("字幕压制 P%d", partNum), line)
+		})
+		if len(burned) > 0 {
+			uploadFile = burned[0]
+		}
+	}
+
+	upReq := uploadReq{
+		File:      uploadFile,
+		Translate: s.q.Translate,
+		Tid:       s.q.Tid,
+		Tag:       s.q.Tags,
+		Source:    s.q.URL,
+		Parts:     false,
+		Progress:  func(line string) { a.progressLine(nj, fmt.Sprintf("B站上传 P%d", partNum), line) },
+	}
+
+	if s.mainBVID != "" {
+		upReq.VID = s.mainBVID
+	} else if s.mainTitle != "" {
+		upReq.Title = s.mainTitle
+	}
+
+	result, _, err := a.executeBiliupUpload(nj.ctx, upReq)
+	if err != nil {
+		return err
+	}
+
+	if s.mainBVID == "" {
+		if bv, ok := result["bvid"].(string); ok && bv != "" {
+			s.mainBVID = bv
+		}
+		if t, ok := result["title"].(string); ok && t != "" {
+			s.mainTitle = t
+			a.mu.Lock()
+			if nj.Title == "" {
+				nj.Title = t
+			}
+			a.mu.Unlock()
+		}
+	}
+
+	s.uploadedFiles = append(s.uploadedFiles, uploadFile)
+	s.results = append(s.results, result)
+
+	fileSize := calcFilesSize([]string{uploadFile})
+	if fileSize > 0 {
+		s.totalBytes += fileSize
+		a.recordDownload(fileSize)
+		a.recordUpload(fileSize)
+	}
+
+	// Dynamic disk space reclamation: If free disk is under safe threshold,
+	// remove the uploaded local video file to free space for ongoing download.
+	disk := getDiskInfo(a.cfg.DataDir)
+	if a.cfg.MinFreeDiskGB > 0 && disk.TotalGB > 0 && disk.FreeGB < a.cfg.MinFreeDiskGB {
+		_ = os.Remove(uploadFile)
+		base := strings.TrimSuffix(uploadFile, filepath.Ext(uploadFile))
+		_ = os.Remove(base + ".srt")
+		_ = os.Remove(base + ".vtt")
+		_ = os.Remove(base + ".bcc")
+	}
+
+	return nil
+}
+
 func isVideoFilePath(path string) bool {
 	switch strings.ToLower(filepath.Ext(path)) {
 	case ".mp4", ".mkv", ".avi", ".webm", ".mp3", ".m4v", ".mov",
@@ -3250,43 +3480,26 @@ func (a *App) createMagnetHandler(q magnetReq) func(*Job) {
 				// A streamed upload has no single review record for the whole
 				// manuscript. Keep auto-upload in the reviewed batch path so every
 				// source file remains available until its submission is approved.
-				// A single selected torrent file can be uploaded as soon as it
-				// is complete. Multi-file selections remain a batch so Biliup
-				// can preserve the intended multi-P submission.
-				streamUpload := q.AutoUpload && isSingleAriaSelectFile(q.SelectFile)
-				if q.AutoUpload && streamUpload {
-					magLogs, _, err = a.runMagnetStreamingUpload(nj.ctx, magnetArgs, d, func(line string) { a.progressLine(nj, "BT 下载", line) }, func(file string) error {
-						if err := a.acquireSlot(nj.ctx, a.uploadSlots); err != nil {
-							return err
-						}
-						defer func() { <-a.uploadSlots }()
-						a.setStep(nj, "B站投稿中（边下载边上传）")
-						a.setProgress(nj, JobProgress{Detail: "B站上传: " + filepath.Base(file)})
-						result, logs, uploadErr := a.executeBiliupUpload(nj.ctx, uploadReq{
-							File: file, Translate: q.Translate, Tid: q.Tid, Tag: q.Tags,
-							Source: m, Progress: func(line string) { a.progressLine(nj, "B站上传", line) },
-						})
-						totalLogs += "\n--- BILIUP STREAM UPLOAD LOGS ---\n" + logs
-						if uploadErr != nil {
-							return uploadErr
-						}
-						fileSize := calcFilesSize([]string{file})
-						if fileSize > 0 {
-							a.recordUpload(fileSize)
-							a.recordDownload(fileSize)
-						}
-						streamedUploads = append(streamedUploads, result)
-						videoFiles = append(videoFiles, file)
-						if videoFile == "" {
-							videoFile = file
-						}
-						return nil
+				if q.AutoUpload {
+					uploader := a.newStreamUploader(nj, pipelineReq{
+						URL:       m,
+						Translate: q.Translate,
+						Tid:       q.Tid,
+						Tags:      q.Tags,
 					})
+					magLogs, uploadedFiles, err := a.runMagnetStreamingUpload(nj.ctx, magnetArgs, d, func(line string) { a.progressLine(nj, "BT 下载", line) }, uploader.handleReadyVideo)
+					totalLogs += magLogs
+					downloadErr = err
+					videoFiles = uniqueMediaFiles(uploadedFiles)
+					streamedUploads = uploader.results
+					if len(uploadedFiles) > 0 {
+						videoFile = uploadedFiles[0]
+					}
 				} else {
 					magLogs, err = a.runMagnetProgress(nj.ctx, magnetArgs, func(line string) { a.progressLine(nj, "BT 下载", line) })
+					totalLogs += magLogs
+					downloadErr = err
 				}
-				totalLogs += magLogs
-				downloadErr = err
 
 				_ = filepath.Walk(d, func(p string, info os.FileInfo, err error) error {
 					if err != nil || info.IsDir() {
@@ -3863,6 +4076,9 @@ func (a *App) executeSingleBiliupUpload(ctx context.Context, q uploadReq, title,
 		// 1. Success!
 		if res.Code == 0 || res.BVID != "" {
 			bvid = res.BVID
+			if bvid == "" && q.VID != "" {
+				bvid = q.VID
+			}
 			execErr = nil
 			break
 		}
@@ -3939,6 +4155,9 @@ finish:
 	// Repair branches continue with the next endpoint. If all bounded attempts
 	// are exhausted without a BVID, preserve the failure instead of returning
 	// a false success with a nil error.
+	if bvid == "" && q.VID != "" {
+		bvid = q.VID
+	}
 	if bvid == "" && execErr == nil {
 		execErr = fmt.Errorf("B站投稿失败：已尝试 %d 个提交通道，自动修复后仍未成功", attempt)
 	}
@@ -4071,7 +4290,8 @@ func (a *App) createPipelineHandler(q pipelineReq) func(*Job) {
 			var targetUploadFiles []string
 			var mainVideoFile string
 			var downloadErr error
-			var streamedUploads []map[string]any
+
+			uploader := a.newStreamUploader(nj, q)
 
 			// Stage 1: Download stage (acquires downloadSlots)
 			func() {
@@ -4113,47 +4333,44 @@ func (a *App) createPipelineHandler(q pipelineReq) func(*Job) {
 					}
 					args := buildYTDLPArgs(q.URL, q.Quality, q.SubLangs, cookiePath, isPlaylist, splitChapters, d)
 
-					ytLogs, err := runCmdProgress(nj.ctx, a.cfg.YTDLP, args, func(line string) { a.progressLine(nj, "YouTube 下载", line) })
-					totalLogs += "[YouTube Download Logs]\n" + ytLogs + "\n"
-					downloadErr = err
-					if downloadErr != nil && !errors.Is(downloadErr, context.Canceled) {
-						// Don't bail immediately; scan for any files already downloaded.
-						// We'll decide below whether to salvage or fail.
-					} else if downloadErr != nil {
-						return
-					}
+					if isPlaylist || splitChapters {
+						a.setStep(nj, "[1/2] YouTube 边下载边投稿")
+						ytLogs, uploadedFiles, err := a.runYouTubeStreamingUpload(nj.ctx, args, d, func(line string) { a.progressLine(nj, "YouTube 下载", line) }, uploader.handleReadyVideo)
+						totalLogs += "[YouTube Streaming Download Logs]\n" + ytLogs + "\n"
+						downloadErr = err
+						targetUploadFiles = uniqueMediaFiles(uploadedFiles)
+					} else {
+						ytLogs, err := runCmdProgress(nj.ctx, a.cfg.YTDLP, args, func(line string) { a.progressLine(nj, "YouTube 下载", line) })
+						totalLogs += "[YouTube Download Logs]\n" + ytLogs + "\n"
+						downloadErr = err
+						if downloadErr != nil && !errors.Is(downloadErr, context.Canceled) {
+							// Don't bail immediately; scan for any files already downloaded.
+						} else if downloadErr != nil {
+							return
+						}
 
-					files, _ := filepath.Glob(filepath.Join(d, "*"))
-					sort.Strings(files)
-					var videoFiles []string
-					var chapterFiles []string
-					for _, f := range files {
-						name := filepath.Base(f)
-						if isVideoFilePath(name) {
-							if strings.Contains(name, " - P") || strings.Contains(name, " - C") {
-								chapterFiles = append(chapterFiles, f)
-							} else {
+						files, _ := filepath.Glob(filepath.Join(d, "*"))
+						sort.Strings(files)
+						var videoFiles []string
+						for _, f := range files {
+							name := filepath.Base(f)
+							if isVideoFilePath(name) {
 								videoFiles = append(videoFiles, f)
 							}
 						}
-					}
-					targetUploadFiles = videoFiles
-					if len(chapterFiles) > 0 {
-						// Do not drop playlist items that have no chapter markers.
-						targetUploadFiles = append(videoFiles, chapterFiles...)
-					}
-					targetUploadFiles = uniqueMediaFiles(targetUploadFiles)
+						targetUploadFiles = uniqueMediaFiles(videoFiles)
 
-					convertVttToSrtAndBcc(d)
-					if q.BurnSubs && len(targetUploadFiles) > 0 {
-						a.setStep(nj, "[1/2] 正在压制中英硬字幕...")
-						a.setProgress(nj, JobProgress{Detail: "ffmpeg 字幕压制"})
-						burned, bLogs, _ := burnSubtitlesToVideos(nj.ctx, d, targetUploadFiles, func(line string) { a.progressLine(nj, "ffmpeg 字幕压制", line) })
-						targetUploadFiles = burned
-						totalLogs += "\n[字幕压制日志]\n" + bLogs
+						convertVttToSrtAndBcc(d)
+						if q.BurnSubs && len(targetUploadFiles) > 0 {
+							a.setStep(nj, "[1/2] 正在压制中英硬字幕...")
+							a.setProgress(nj, JobProgress{Detail: "ffmpeg 字幕压制"})
+							burned, bLogs, _ := burnSubtitlesToVideos(nj.ctx, d, targetUploadFiles, func(line string) { a.progressLine(nj, "ffmpeg 字幕压制", line) })
+							targetUploadFiles = burned
+							totalLogs += "\n[字幕压制日志]\n" + bLogs
+						}
 					}
 				} else {
-					a.setStep(nj, "[1/2] 磁力高速抓取中")
+					a.setStep(nj, "[1/2] 磁力边下载边投稿")
 					d := q.ResumeDir
 					if d == "" {
 						d = filepath.Join(a.cfg.DataDir, "magnet", nj.ID)
@@ -4161,53 +4378,26 @@ func (a *App) createPipelineHandler(q pipelineReq) func(*Job) {
 					_ = os.MkdirAll(d, 0750)
 					targetDir = d
 					magnetArgs := buildAria2Args(q.URL, d, q.SelectFile, a.cfg.BTListenPort)
-					var magLogs string
-					var err error
-					if isSingleAriaSelectFile(q.SelectFile) {
-						magLogs, targetUploadFiles, err = a.runMagnetStreamingUpload(nj.ctx, magnetArgs, d, func(line string) { a.progressLine(nj, "BT 下载", line) }, func(file string) error {
-							if err := a.acquireSlot(nj.ctx, a.uploadSlots); err != nil {
-								return err
-							}
-							defer func() { <-a.uploadSlots }()
-							a.setStep(nj, "[2/2] B站边下载边投稿")
-							a.setProgress(nj, JobProgress{Detail: "B站上传: " + filepath.Base(file)})
-							result, logs, uploadErr := a.executeBiliupUpload(nj.ctx, uploadReq{
-								File: file, Translate: q.Translate, Tid: q.Tid, Tag: q.Tags,
-								Parts: false, Source: q.URL,
-								Progress: func(line string) { a.progressLine(nj, "B站上传", line) },
-							})
-							totalLogs += "\n[Biliup Streaming Upload Logs]\n" + logs
-							if uploadErr != nil {
-								return uploadErr
-							}
-							fileSize := calcFilesSize([]string{file})
-							if fileSize > 0 {
-								a.recordDownload(fileSize)
-								a.recordUpload(fileSize)
-							}
-							streamedUploads = append(streamedUploads, result)
-							return nil
-						})
-					} else {
-						magLogs, err = a.runMagnetProgress(nj.ctx, magnetArgs, func(line string) { a.progressLine(nj, "BT 下载", line) })
-					}
+					magLogs, uploadedFiles, err := a.runMagnetStreamingUpload(nj.ctx, magnetArgs, d, func(line string) { a.progressLine(nj, "BT 下载", line) }, uploader.handleReadyVideo)
 					totalLogs += "[Magnet Download Logs]\n" + magLogs + "\n"
 					downloadErr = err
-					if downloadErr != nil {
+					if downloadErr != nil && len(uploadedFiles) == 0 {
 						return
 					}
 
+					files, _ := filepath.Glob(filepath.Join(d, "*"))
+					sort.Strings(files)
+					var scannedFiles []string
 					_ = filepath.Walk(d, func(p string, info os.FileInfo, err error) error {
 						if err != nil || info.IsDir() {
 							return nil
 						}
-						name := info.Name()
-						if isVideoFilePath(name) {
-							targetUploadFiles = append(targetUploadFiles, p)
+						if isVideoFilePath(info.Name()) {
+							scannedFiles = append(scannedFiles, p)
 						}
 						return nil
 					})
-					targetUploadFiles = uniqueMediaFiles(targetUploadFiles)
+					targetUploadFiles = uniqueMediaFiles(append(uploadedFiles, scannedFiles...))
 					sort.Strings(targetUploadFiles)
 				}
 			}()
@@ -4217,34 +4407,45 @@ func (a *App) createPipelineHandler(q pipelineReq) func(*Job) {
 					a.set(nj, "canceled", "已取消", map[string]any{"dir": targetDir}, totalLogs)
 					return
 				}
-				// Partial playlist salvage: if YouTube yt-dlp exited with bot-challenge
-				// or similar error mid-playlist but we have downloaded files, proceed
-				// to upload what we have rather than failing the whole job.
 				category := classifyFailure(downloadErr.Error(), totalLogs)
-				if isYT && len(targetUploadFiles) > 0 && category != "unknown" {
+				if (isYT || isMag) && len(uploader.results) > 0 {
+					totalLogs += fmt.Sprintf("\n[部分完成挽救] 下载遇到错误但已成功流式投稿 %d 个分P，保留已投稿成果 (分类: %s)\n", len(uploader.results), category)
+					downloadErr = nil
+				} else if isYT && len(targetUploadFiles) > 0 && category != "unknown" {
 					totalLogs += fmt.Sprintf("\n[部分下载挽救] yt-dlp 遇到错误但已下载 %d 个视频文件，继续上传已有部分 (分类: %s)\n", len(targetUploadFiles), category)
-					downloadErr = nil // salvage: continue to upload stage
+					downloadErr = nil
 				} else {
 					a.set(nj, "failed", downloadErr.Error(), map[string]any{"dir": targetDir, "video_files": targetUploadFiles}, totalLogs)
 					return
 				}
 			}
 
-			if len(targetUploadFiles) == 0 {
-				a.set(nj, "failed", "no video files found after download", map[string]any{"dir": targetDir}, totalLogs)
-				return
-			}
-			if len(streamedUploads) > 0 {
-				mainVideoFile = targetUploadFiles[0]
+			if len(uploader.results) > 0 {
+				mainVideoFile = ""
+				if len(uploader.uploadedFiles) > 0 {
+					mainVideoFile = uploader.uploadedFiles[0]
+				}
 				a.recordPipelineSuccess()
 				if q.Translate {
 					a.recordAiTrans()
 				}
+				isMultiP := len(uploader.uploadedFiles) > 1
+				uploadSummary := map[string]any{
+					"bvid":        uploader.mainBVID,
+					"title":       uploader.mainTitle,
+					"bili_url":    "https://www.bilibili.com/video/" + uploader.mainBVID,
+					"parts":       uploader.results,
+					"total_parts": len(uploader.uploadedFiles),
+				}
 				a.set(nj, "done", "", map[string]any{
-					"dir": targetDir, "video_file": mainVideoFile, "video_files": targetUploadFiles,
-					"is_multi_p": false, "upload": streamedUploads, "stream_upload": true,
-					"review_state": "pending",
-				}, totalLogs+"\n[审核保护] 流式投稿成功，源视频暂不删除，等待B站审核通过。\n")
+					"dir":           targetDir,
+					"video_file":    mainVideoFile,
+					"video_files":   uploader.uploadedFiles,
+					"is_multi_p":    isMultiP,
+					"upload":        uploadSummary,
+					"stream_upload": true,
+					"review_state":  "pending",
+				}, totalLogs+"\n[审核保护] 流式边下边传投稿成功，源视频暂不删除，等待B站审核通过。\n")
 				return
 			}
 
