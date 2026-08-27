@@ -1300,6 +1300,62 @@ func TestQuotaExceededClassification(t *testing.T) {
 	}
 }
 
+func TestExtractCleanTitle(t *testing.T) {
+	// 1. Magnet link with encoded dn
+	magWithDN := "magnet:?xt=urn:btih:10A977C4D8ED2FE992D60F07613200A75D916B42&tr=http%3A%2F%2Fbt.t-ru.org%2Fann%3Fmagnet&dn=%5BCoursera%5D%20Microsoft%20Python%20Development%20Professional%20Certificate%20%5B10%2F2025%2C%20ENG%5D"
+	dn := extractMagnetDN(magWithDN)
+	wantDN := "[Coursera] Microsoft Python Development Professional Certificate [10/2025, ENG]"
+	if dn != wantDN {
+		t.Fatalf("extractMagnetDN() = %q, want %q", dn, wantDN)
+	}
+
+	// 2. Magnet link with only xt
+	magOnlyXT := "magnet:?xt=urn:btih:10A977C4D8ED2FE992D60F07613200A75D916B42&tr=http%3A%2F%2Fbt.t-ru.org"
+	dnXT := extractMagnetDN(magOnlyXT)
+	if !strings.HasPrefix(dnXT, "磁力: 10A977C4D8ED") {
+		t.Fatalf("extractMagnetDN(no dn) = %q, expected prefix '磁力: 10A977C4D8ED'", dnXT)
+	}
+
+	// 3. YouTube URL with playlist
+	ytList := "https://www.youtube.com/watch?v=hdjB_wHW0-Q&list=PLdu4L6n1QSfYzEojeDKWJhzOKQc31b"
+	ytListTitle := extractYouTubeCleanTitle(ytList)
+	if !strings.Contains(ytListTitle, "YouTube 播放列表") || !strings.Contains(ytListTitle, "PLdu4L6n1QSf") {
+		t.Fatalf("extractYouTubeCleanTitle(playlist) = %q", ytListTitle)
+	}
+
+	// 4. YouTube single video
+	ytVid := "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+	ytVidTitle := extractYouTubeCleanTitle(ytVid)
+	if ytVidTitle != "YouTube 视频 (dQw4w9WgXcQ)" {
+		t.Fatalf("extractYouTubeCleanTitle(single) = %q, want 'YouTube 视频 (dQw4w9WgXcQ)'", ytVidTitle)
+	}
+
+	// 5. youtu.be short URL
+	ytShort := "https://youtu.be/dQw4w9WgXcQ?si=abcdef123"
+	ytShortTitle := extractYouTubeCleanTitle(ytShort)
+	if ytShortTitle != "YouTube 视频 (dQw4w9WgXcQ)" {
+		t.Fatalf("extractYouTubeCleanTitle(short) = %q, want 'YouTube 视频 (dQw4w9WgXcQ)'", ytShortTitle)
+	}
+
+	// 6. extractJobTitle on pipelineReq
+	pReq := pipelineReq{URL: magWithDN}
+	if got := extractJobTitle("pipeline", pReq); got != wantDN {
+		t.Fatalf("extractJobTitle(pipeline) = %q, want %q", got, wantDN)
+	}
+
+	// 7. extractJobTitle with explicit Title
+	uReq := uploadReq{Title: "自定义精选课程标题", File: "/tmp/sample.mp4"}
+	if got := extractJobTitle("biliup", uReq); got != "自定义精选课程标题" {
+		t.Fatalf("extractJobTitle(biliup with title) = %q, want '自定义精选课程标题'", got)
+	}
+
+	// 8. extractJobTitle with file only
+	uReqFile := uploadReq{File: "/srv/y2b/data/sample_video.mp4"}
+	if got := extractJobTitle("biliup", uReqFile); got != "sample_video.mp4" {
+		t.Fatalf("extractJobTitle(biliup file) = %q, want 'sample_video.mp4'", got)
+	}
+}
+
 
 
 

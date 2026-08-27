@@ -99,7 +99,8 @@ type MonitoredChannel struct {
 
 type Job struct {
 	ID              string       `json:"id"`
-	Kind            string       `json:"kind"`   // "youtube", "magnet", "biliup", "pipeline"
+	Kind            string       `json:"kind"` // "youtube", "magnet", "biliup", "pipeline"
+	Title           string       `json:"title,omitempty"`
 	Status          string       `json:"status"` // "queued", "running", "done", "failed", "canceled"
 	Step            string       `json:"step,omitempty"`
 	Error           string       `json:"error,omitempty"`
@@ -470,6 +471,14 @@ func (a *App) loadJobs() {
 				j.Step = "等待B站限流/风控解除 (可人工验证或次日自动刷新)"
 			}
 		}
+		if j.Title == "" {
+			j.Title = extractJobTitle(j.Kind, j.Input)
+			if outMap := outputMap(j.Output); outMap != nil {
+				if t, ok := outMap["title"].(string); ok && strings.TrimSpace(t) != "" {
+					j.Title = strings.TrimSpace(t)
+				}
+			}
+		}
 		a.jobs[j.ID] = j
 		a.order = append(a.order, j.ID)
 	}
@@ -547,11 +556,100 @@ func (a *App) compactDuplicateJobs() int {
 	return count
 }
 
+// extractJobTitle extracts a clean, human-readable title from job input or URL.
+func extractJobTitle(kind string, input any) string {
+	if input == nil {
+		return ""
+	}
+	if b, err := json.Marshal(input); err == nil {
+		var p struct {
+			Title     string   `json:"title"`
+			URL       string   `json:"url"`
+			Magnet    string   `json:"magnet"`
+			File      string   `json:"file"`
+			Files     []string `json:"files"`
+			ResumeDir string   `json:"resume_dir"`
+		}
+		if json.Unmarshal(b, &p) == nil {
+			if strings.TrimSpace(p.Title) != "" {
+				return strings.TrimSpace(p.Title)
+			}
+			rawURL := p.URL
+			if rawURL == "" {
+				rawURL = p.Magnet
+			}
+			if strings.HasPrefix(strings.ToLower(rawURL), "magnet:") {
+				if dn := extractMagnetDN(rawURL); dn != "" {
+					return dn
+				}
+			} else if strings.Contains(rawURL, "youtube.com") || strings.Contains(rawURL, "youtu.be") {
+				return extractYouTubeCleanTitle(rawURL)
+			}
+			if len(p.Files) > 0 && p.Files[0] != "" {
+				return filepath.Base(p.Files[0])
+			}
+			if p.File != "" {
+				return filepath.Base(p.File)
+			}
+			if p.ResumeDir != "" {
+				return filepath.Base(p.ResumeDir)
+			}
+		}
+	}
+	return ""
+}
+
+func extractMagnetDN(rawURL string) string {
+	if u, err := url.Parse(rawURL); err == nil {
+		if dn := u.Query().Get("dn"); dn != "" {
+			return strings.TrimSpace(dn)
+		}
+		if xt := u.Query().Get("xt"); xt != "" {
+			hash := strings.TrimPrefix(xt, "urn:btih:")
+			if len(hash) > 12 {
+				hash = hash[:12] + "..."
+			}
+			return "磁力: " + hash
+		}
+	}
+	re := regexp.MustCompile(`(?i)[?&]dn=([^&]+)`)
+	if m := re.FindStringSubmatch(rawURL); len(m) > 1 {
+		if decoded, err := url.QueryUnescape(m[1]); err == nil {
+			return strings.TrimSpace(decoded)
+		}
+		return strings.TrimSpace(m[1])
+	}
+	return ""
+}
+
+func extractYouTubeCleanTitle(rawURL string) string {
+	if u, err := url.Parse(rawURL); err == nil {
+		if list := u.Query().Get("list"); list != "" {
+			if len(list) > 12 {
+				list = list[:12] + "..."
+			}
+			return "YouTube 播放列表 (" + list + ")"
+		}
+		if v := u.Query().Get("v"); v != "" {
+			return "YouTube 视频 (" + v + ")"
+		}
+	}
+	if strings.Contains(rawURL, "youtu.be/") {
+		parts := strings.Split(rawURL, "youtu.be/")
+		if len(parts) > 1 {
+			id := strings.Split(parts[1], "?")[0]
+			return "YouTube 视频 (" + id + ")"
+		}
+	}
+	return "YouTube 视频"
+}
+
 func (a *App) add(kind string, input any) *Job {
 	ctx, cancel := context.WithCancel(context.Background())
 	j := &Job{
 		ID:         id(),
 		Kind:       kind,
+		Title:      extractJobTitle(kind, input),
 		Status:     "queued",
 		Step:       "排队中",
 		Created:    time.Now(),
@@ -599,6 +697,13 @@ func (a *App) set(j *Job, status, err string, out any, logs string) {
 	j.Status = status
 	j.Error = err
 	j.Output = out
+	if out != nil {
+		if outMap := outputMap(out); outMap != nil {
+			if t, ok := outMap["title"].(string); ok && strings.TrimSpace(t) != "" {
+				j.Title = strings.TrimSpace(t)
+			}
+		}
+	}
 	if logs != "" {
 		if len(logs) > 64*1024 {
 			logs = logs[len(logs)-64*1024:] // Keep latest 64KB to avoid RAM growth

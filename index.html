@@ -2983,18 +2983,111 @@ function formatTime(tStr) {
   }
 }
 
-function getJobSummary(j) {
-  const input = j.input || {};
-  if (typeof input === 'string') return input;
-  if (j.kind === 'pipeline') return input.url ? '⚡ ' + input.url : '全自动流水线任务';
-  if (j.kind === 'youtube') return input.url || input.URL || 'YouTube 任务';
-  if (j.kind === 'magnet') return input.magnet || input.url || input.Magnet || '磁力下载任务';
-  if (j.kind === 'biliup') {
-    if (input.title) return input.title;
-    if (input.files && input.files.length) return input.files.join(', ');
-    if (input.file) return input.file;
-    return 'Bilibili 投稿任务';
+function extractMagnetDisplayName(uri) {
+  if (!uri || typeof uri !== 'string') return '';
+  if (!uri.toLowerCase().startsWith('magnet:')) return '';
+  try {
+    const searchPart = uri.includes('?') ? uri.split('?')[1] : uri;
+    const params = new URLSearchParams(searchPart);
+    const dn = params.get('dn');
+    if (dn) return dn.trim();
+    const xt = params.get('xt');
+    if (xt) {
+      const hash = xt.replace(/^urn:btih:/i, '');
+      return '磁力: ' + hash.substring(0, 12) + '...';
+    }
+  } catch (e) {
+    const match = uri.match(/[?&]dn=([^&]+)/i);
+    if (match && match[1]) {
+      try {
+        return decodeURIComponent(match[1].replace(/\+/g, ' ')).trim();
+      } catch {
+        return match[1].trim();
+      }
+    }
   }
+  return '磁力下载任务';
+}
+
+function extractYouTubeDisplayName(url) {
+  if (!url || typeof url !== 'string') return '';
+  try {
+    if (url.includes('youtube.com') || url.includes('youtu.be')) {
+      const searchPart = url.includes('?') ? url.split('?')[1] : '';
+      const params = new URLSearchParams(searchPart);
+      const listId = params.get('list');
+      if (listId) return `YouTube 播放列表 (${listId.substring(0, 12)}...)`;
+      const videoId = params.get('v') || (url.includes('youtu.be/') ? url.split('youtu.be/')[1]?.split('?')[0] : '');
+      if (videoId) return `YouTube 视频 (${videoId})`;
+      return 'YouTube 视频';
+    }
+  } catch {}
+  return '';
+}
+
+function getJobSummary(j) {
+  if (!j) return '';
+  const out = j.output || {};
+  const input = j.input || {};
+
+  // 1. Explicit clean job title
+  if (j.title && !j.title.toLowerCase().startsWith('magnet:')) return j.title;
+
+  // 2. Output generated/translated title
+  if (out.title) return out.title;
+
+  // 3. Output directory name (if descriptive)
+  if (out.dir) {
+    const dirBase = out.dir.replace(/\/+$/, '').split('/').pop();
+    if (dirBase && dirBase !== j.id) return dirBase;
+  }
+
+  // 4. Output first video file name
+  if (Array.isArray(out.video_files) && out.video_files.length) {
+    const fileBase = out.video_files[0].split('/').pop();
+    if (fileBase) return fileBase;
+  }
+  if (Array.isArray(out.files) && out.files.length) {
+    const fileBase = out.files[0].split('/').pop();
+    if (fileBase) return fileBase;
+  }
+
+  // 5. Input string handling
+  if (typeof input === 'string') {
+    if (input.toLowerCase().startsWith('magnet:')) return '🧲 ' + extractMagnetDisplayName(input);
+    const yt = extractYouTubeDisplayName(input);
+    if (yt) return '▶ ' + yt;
+    return input;
+  }
+
+  if (input.title) return input.title;
+
+  // 6. Input URL / Magnet clean extraction
+  const rawUrl = input.url || input.magnet || input.URL || input.Magnet || '';
+  if (rawUrl.toLowerCase().startsWith('magnet:')) {
+    const dn = extractMagnetDisplayName(rawUrl);
+    return dn ? '🧲 ' + dn : '🧲 磁力任务';
+  }
+  if (rawUrl.includes('youtube.com') || rawUrl.includes('youtu.be')) {
+    const yt = extractYouTubeDisplayName(rawUrl);
+    if (yt) return '▶ ' + yt;
+  }
+
+  // 7. Input files or resume_dir
+  if (Array.isArray(input.files) && input.files.length) {
+    return input.files.map(f => f.split('/').pop()).join(', ');
+  }
+  if (input.file) return input.file.split('/').pop();
+  if (input.resume_dir) {
+    const dirBase = input.resume_dir.replace(/\/+$/, '').split('/').pop();
+    if (dirBase && dirBase !== j.id) return dirBase;
+  }
+
+  if (j.kind === 'biliup') return 'Bilibili 投稿任务';
+  if (j.kind === 'pipeline') return rawUrl ? '⚡ ' + rawUrl : '全自动流水线任务';
+  if (j.kind === 'youtube') return 'YouTube 任务';
+  if (j.kind === 'magnet') return '磁力下载任务';
+
   return j.id;
 }
 
