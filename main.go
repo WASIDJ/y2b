@@ -821,10 +821,15 @@ func classifyFailure(err, logs string) string {
 		strings.Contains(s, "upload rate limit"), strings.Contains(s, "biliup rate limit"):
 		return "upload_rate_limit"
 	case strings.Contains(s, "sign in to confirm you're not a bot"),
+		strings.Contains(s, "sign in to confirm you’re not a bot"),
 		strings.Contains(s, "sign in to confirm you are not a bot"),
 		strings.Contains(s, "use --cookies-from-browser"),
 		strings.Contains(s, "confirming you're not a bot"),
+		strings.Contains(s, "confirming you’re not a bot"),
+		strings.Contains(s, "confirm you're not a bot"),
+		strings.Contains(s, "confirm you’re not a bot"),
 		strings.Contains(s, "youtube bot challenge"),
+		strings.Contains(s, "bot challenge"),
 		strings.Contains(s, "http error 429"),
 		strings.Contains(s, "too many requests"),
 		strings.Contains(s, "rate-limited by youtube"),
