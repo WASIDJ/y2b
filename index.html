@@ -3092,24 +3092,43 @@ function getJobSummary(j) {
 }
 
 function renderBadge(status, job) {
+  let mainBadge = '';
   switch (status) {
     case 'running': {
-      const dur = formatDuration(job.started, null);
-      return `<span class="badge badge-running"><span class="badge-dot"></span>${escapeHtml(job.step || '执行中')}${dur ? ` (${dur})` : ''}</span>`;
+      const dur = formatDuration(job ? job.started : null, null);
+      mainBadge = `<span class="badge badge-running"><span class="badge-dot"></span>${escapeHtml(job ? (job.step || '执行中') : '执行中')}${dur ? ` (${dur})` : ''}</span>`;
+      break;
     }
     case 'queued':
-      return `<span class="badge badge-queued"><span class="badge-dot"></span>排队中</span>`;
+      mainBadge = `<span class="badge badge-queued"><span class="badge-dot"></span>排队中</span>`;
+      break;
     case 'done': {
-      const dur = formatDuration(job.started, job.finished);
-      return `<span class="badge badge-done"><span class="badge-dot"></span>已完成${dur ? ` (${dur})` : ''}</span>`;
+      const dur = formatDuration(job ? job.started : null, job ? job.finished : null);
+      mainBadge = `<span class="badge badge-done"><span class="badge-dot"></span>已完成${dur ? ` (${dur})` : ''}</span>`;
+      break;
     }
     case 'failed':
-      return `<span class="badge badge-failed"><span class="badge-dot"></span>失败</span>`;
+      mainBadge = `<span class="badge badge-failed"><span class="badge-dot"></span>失败</span>`;
+      break;
     case 'canceled':
-      return `<span class="badge badge-canceled"><span class="badge-dot"></span>已取消</span>`;
+      mainBadge = `<span class="badge badge-canceled"><span class="badge-dot"></span>已取消</span>`;
+      break;
     default:
-      return `<span class="badge">${escapeHtml(status)}</span>`;
+      mainBadge = `<span class="badge">${escapeHtml(status)}</span>`;
+      break;
   }
+
+  const rs = job ? (job.review_state || (job.output && job.output.review_state)) : null;
+  const rErr = job ? (job.review_error || (job.output && job.output.review_error)) : null;
+  if (rs === 'passed') {
+    mainBadge += ` <span class="badge" style="background:rgba(34,197,94,0.15);color:#22c55e;border:1px solid rgba(34,197,94,0.3);margin-left:4px;" title="B站审核通过 (已发布)"><span class="badge-dot" style="background:#22c55e;"></span>已过审</span>`;
+  } else if (rs === 'rejected') {
+    mainBadge += ` <span class="badge" style="background:rgba(239,68,68,0.15);color:#ef4444;border:1px solid rgba(239,68,68,0.3);margin-left:4px;" title="${escapeHtml(rErr || '审核退回/转码错误')}"><span class="badge-dot" style="background:#ef4444;"></span>审核退回</span>`;
+  } else if (rs === 'pending') {
+    mainBadge += ` <span class="badge" style="background:rgba(234,179,8,0.15);color:#eab308;border:1px solid rgba(234,179,8,0.3);margin-left:4px;" title="B站审核/转码中"><span class="badge-dot" style="background:#eab308;"></span>审核中</span>`;
+  }
+
+  return mainBadge;
 }
 
 function renderTypeIcon(kind) {
@@ -3228,6 +3247,7 @@ function renderJobs() {
               <div class="job-meta-line">
                 <span class="job-id-chip mono">#${escapeHtml(j.id)}</span>
                 ${j.error ? `<span style="color: var(--color-failed); font-weight: 600;">⚠ ${escapeHtml(j.failureCategory || '出错')}</span>` : ''}
+                ${(j.review_error || (j.output && j.output.review_error)) ? `<span style="color: #ef4444; font-size:11px; font-weight:500;" title="${escapeHtml(j.review_error || j.output.review_error)}">⚠ 审核/转码异常: ${escapeHtml(j.review_error || j.output.review_error)}</span>` : ''}
               </div>
             </div>
           </div>
