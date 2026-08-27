@@ -2464,6 +2464,19 @@ func (a *App) purgeManagedVideoFiles(files ...string) int64 {
 // Biliup exposes the moderation result through `biliup show <BV>`. Keep the
 // parser independent from the CLI's tracing logs so it also works with older
 // biliup versions that print logs before the JSON document.
+type biliReviewVideo struct {
+	Index        int    `json:"index"`
+	Title        string `json:"title"`
+	XcodeState   int    `json:"xcode_state"` // 6=done, <0=transcoding/encoding failed
+	FailCode     int    `json:"fail_code"`
+	FailDesc     string `json:"fail_desc"` // e.g. "视频编码错误", "转码失败"
+	Status       int    `json:"status"`    // 0=ok, 2=reject/failed
+	StatusDesc   string `json:"status_desc"`
+	RejectReason string `json:"reject_reason"`
+	ModifyAdvice string `json:"modify_advise"`
+	ProblemDesc  string `json:"problem_description"`
+}
+
 type biliReviewResult struct {
 	Archive struct {
 		State        int    `json:"state"`
@@ -2473,31 +2486,75 @@ type biliReviewResult struct {
 		ProblemDesc  string `json:"problem_description"`
 		ModifyAdvice string `json:"modify_advise"`
 	} `json:"archive"`
+	Videos []biliReviewVideo `json:"videos"`
 }
 
 func parseBiliReviewOutput(raw string) (biliReviewResult, error) {
 	var result biliReviewResult
+	raw = strings.ToValidUTF8(raw, "")
 	start := strings.IndexByte(raw, '{')
 	if start < 0 {
 		return result, errors.New("biliup show 未返回审核 JSON")
 	}
-	if err := json.Unmarshal([]byte(raw[start:]), &result); err != nil {
+	jsonStr := raw[start:]
+	if end := strings.LastIndexByte(jsonStr, '}'); end >= 0 {
+		jsonStr = jsonStr[:end+1]
+	}
+	if err := json.Unmarshal([]byte(jsonStr), &result); err != nil {
 		return result, fmt.Errorf("解析B站审核结果失败: %w", err)
 	}
 	return result, nil
 }
 
-func biliReviewState(result biliReviewResult) string {
+func biliReviewSummary(result biliReviewResult) (state string, reason string) {
+	// 1. Check video-level transcoding & encoding errors
+	var failParts []string
+	for _, v := range result.Videos {
+		partNum := v.Index
+		if partNum <= 0 {
+			partNum = 1
+		}
+		if v.XcodeState < 0 || v.FailCode != 0 || v.FailDesc != "" || strings.Contains(v.StatusDesc, "转码失败") || strings.Contains(v.StatusDesc, "编码错误") || strings.Contains(v.StatusDesc, "失败") {
+			errMsg := v.FailDesc
+			if errMsg == "" {
+				errMsg = v.StatusDesc
+			}
+			if errMsg == "" {
+				errMsg = fmt.Sprintf("转码/编码失败 (xcode_state: %d, fail_code: %d)", v.XcodeState, v.FailCode)
+			}
+			failParts = append(failParts, fmt.Sprintf("P%d: %s", partNum, errMsg))
+		} else if v.RejectReason != "" {
+			failParts = append(failParts, fmt.Sprintf("P%d: %s", partNum, v.RejectReason))
+		}
+	}
+
+	if len(failParts) > 0 {
+		return "rejected", strings.Join(failParts, "; ")
+	}
+
+	// 2. Check archive-level review state
 	desc := strings.TrimSpace(result.Archive.StateDesc)
 	switch {
-	case strings.Contains(desc, "退回"), strings.Contains(desc, "不通过"), strings.Contains(desc, "驳回"):
-		return "rejected"
+	case strings.Contains(desc, "退回"), strings.Contains(desc, "不通过"), strings.Contains(desc, "驳回"), strings.Contains(desc, "锁定"):
+		rejectMsg := result.Archive.RejectReason
+		if rejectMsg == "" {
+			rejectMsg = result.Archive.ProblemDesc
+		}
+		if rejectMsg == "" {
+			rejectMsg = desc
+		}
+		return "rejected", rejectMsg
 	case result.Archive.HadPassed,
 		strings.Contains(desc, "通过"), strings.Contains(desc, "已发布"), strings.Contains(desc, "开放浏览"):
-		return "passed"
+		return "passed", ""
 	default:
-		return "pending"
+		return "pending", ""
 	}
+}
+
+func biliReviewState(result biliReviewResult) string {
+	state, _ := biliReviewSummary(result)
+	return state
 }
 
 func (a *App) fetchBiliReview(ctx context.Context, bvid string) (biliReviewResult, string, error) {
@@ -2719,15 +2776,19 @@ func (a *App) reviewJob(ctx context.Context, jobID string) {
 	if uploadList, isList := out["upload"].([]any); isList && len(uploadList) > 0 {
 		allPassed := true
 		now := time.Now()
+		var reasons []string
 		for _, item := range uploadList {
 			if itemMap, isMap := item.(map[string]any); isMap {
 				if bvid, _ := itemMap["bvid"].(string); bvid != "" {
 					result, _, err := a.fetchBiliReview(ctx, bvid)
 					if err == nil {
-						st := biliReviewState(result)
+						st, reason := biliReviewSummary(result)
 						itemMap["review_state"] = st
 						if st != "passed" {
 							allPassed = false
+							if reason != "" {
+								reasons = append(reasons, reason)
+							}
 						}
 					} else {
 						allPassed = false
@@ -2744,6 +2805,9 @@ func (a *App) reviewJob(ctx context.Context, jobID string) {
 				if dir, ok := out["dir"].(string); ok && dir != "" {
 					purgeVideoFilesInDir(dir)
 				}
+			} else if len(reasons) > 0 {
+				current.ReviewState = "rejected"
+				current.ReviewError = strings.Join(reasons, "; ")
 			}
 			current.Output = out
 		}
@@ -2778,11 +2842,11 @@ func (a *App) reviewJob(ctx context.Context, jobID string) {
 		a.saveJobs()
 		return
 	}
-	state := biliReviewState(result)
+	state, reason := biliReviewSummary(result)
 	a.mu.Lock()
 	if current := a.jobs[jobID]; current != nil {
 		current.ReviewState = state
-		current.ReviewError = ""
+		current.ReviewError = reason
 		current.ReviewCheckedAt = now
 	}
 	a.mu.Unlock()
@@ -2834,9 +2898,9 @@ func (a *App) reviewJob(ctx context.Context, jobID string) {
 		a.saveJobs()
 		return
 	}
-	reason := result.Archive.RejectReason + " " + result.Archive.ProblemDesc + " " + result.Archive.ModifyAdvice
+	repairReason := result.Archive.RejectReason + " " + result.Archive.ProblemDesc + " " + result.Archive.ModifyAdvice
 	repairDir := filepath.Join(filepath.Dir(files[0]), ".y2b-review-repair-"+bvid+"-"+strconv.FormatInt(now.Unix(), 10))
-	repaired, repairLogs, repairErr := a.reviewUploadFiles(ctx, files, reason, repairDir)
+	repaired, repairLogs, repairErr := a.reviewUploadFiles(ctx, files, repairReason, repairDir)
 	if repairErr != nil {
 		a.mu.Lock()
 		if current := a.jobs[jobID]; current != nil {
@@ -6131,8 +6195,10 @@ func srtFileToBCC(path string) (bccHeader, error) {
 	if err != nil {
 		return bccHeader{}, err
 	}
+	b = bytes.TrimPrefix(b, []byte("\xef\xbb\xbf"))
+	content := strings.ToValidUTF8(string(b), "")
 	reTime := regexp.MustCompile(`(\d{1,2}:\d{2}:\d{2}[\.,]\d{3}|\d{2}:\d{2}[\.,]\d{3})\s*-->\s*(\d{1,2}:\d{2}:\d{2}[\.,]\d{3}|\d{2}:\d{2}[\.,]\d{3})`)
-	lines := strings.Split(strings.ReplaceAll(string(b), "\r\n", "\n"), "\n")
+	lines := strings.Split(strings.ReplaceAll(content, "\r\n", "\n"), "\n")
 	var body []bccItem
 	for i := 0; i < len(lines); i++ {
 		line := strings.TrimSpace(lines[i])
@@ -6192,7 +6258,9 @@ func convertVttToSrtAndBcc(dir string) {
 		if err != nil {
 			continue
 		}
-		lines := strings.Split(string(b), "\n")
+		b = bytes.TrimPrefix(b, []byte("\xef\xbb\xbf"))
+		content := strings.ToValidUTF8(string(b), "")
+		lines := strings.Split(strings.ReplaceAll(content, "\r\n", "\n"), "\n")
 		var srtLines []string
 		var bccItems []bccItem
 		idx := 1
@@ -6260,19 +6328,26 @@ func convertVttToSrtAndBcc(dir string) {
 	}
 }
 
-func burnSubtitlesToVideos(ctx context.Context, dir string, videoFiles []string, onLine func(string)) ([]string, string, error) {
-	var subFile string
-	for _, pattern := range []string{"*zh-Hans*.vtt", "*zh*.vtt", "*zh-Hans*.srt", "*zh*.srt", "*en*.vtt", "*en*.srt", "*.vtt", "*.srt"} {
-		matches, err := filepath.Glob(filepath.Join(dir, pattern))
-		if err == nil && len(matches) > 0 {
-			subFile = matches[0]
-			break
+func findMatchingSubtitle(dir, videoFile string) string {
+	base := strings.TrimSuffix(videoFile, filepath.Ext(videoFile))
+	// 1. Try video-specific subtitles first (for multi-P or split chapters)
+	for _, ext := range []string{".zh-Hans.srt", ".zh.srt", ".zh-Hans.vtt", ".zh.vtt", ".en.srt", ".en.vtt", ".srt", ".vtt"} {
+		p := base + ext
+		if _, err := os.Stat(p); err == nil {
+			return p
 		}
 	}
-	if subFile == "" {
-		return videoFiles, "未找到字幕文件，跳过硬字幕压制\n", nil
+	// 2. Try directory-wide patterns as fallback for single video
+	for _, pattern := range []string{"*zh-Hans*.srt", "*zh*.srt", "*zh-Hans*.vtt", "*zh*.vtt", "*en*.srt", "*en*.vtt", "*.srt", "*.vtt"} {
+		matches, err := filepath.Glob(filepath.Join(dir, pattern))
+		if err == nil && len(matches) > 0 {
+			return matches[0]
+		}
 	}
+	return ""
+}
 
+func burnSubtitlesToVideos(ctx context.Context, dir string, videoFiles []string, onLine func(string)) ([]string, string, error) {
 	var logs string
 	var outVideos []string
 	for idx, vf := range videoFiles {
@@ -6280,6 +6355,12 @@ func burnSubtitlesToVideos(ctx context.Context, dir string, videoFiles []string,
 		base := strings.TrimSuffix(vf, ext)
 		burnedFile := base + ".burned.mp4"
 		if strings.HasSuffix(base, ".burned") {
+			outVideos = append(outVideos, vf)
+			continue
+		}
+
+		subFile := findMatchingSubtitle(dir, vf)
+		if subFile == "" {
 			outVideos = append(outVideos, vf)
 			continue
 		}
@@ -6294,9 +6375,14 @@ func burnSubtitlesToVideos(ctx context.Context, dir string, videoFiles []string,
 			"-i", vf,
 			"-vf", fmt.Sprintf("subtitles='%s':force_style='FontSize=18,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BorderStyle=1,Outline=1.5,Shadow=1,MarginV=25'", escapedSub),
 			"-c:v", "libx264",
+			"-pix_fmt", "yuv420p",
 			"-preset", "veryfast",
 			"-crf", "20",
-			"-c:a", "copy",
+			"-c:a", "aac",
+			"-b:a", "192k",
+			"-ar", "48000",
+			"-ac", "2",
+			"-movflags", "+faststart",
 			burnedFile,
 		}
 
