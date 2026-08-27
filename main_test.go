@@ -1356,6 +1356,93 @@ func TestExtractCleanTitle(t *testing.T) {
 	}
 }
 
+func TestYouTubeStreamingUploadProcessesCompletedFiles(t *testing.T) {
+	dir := t.TempDir()
+	ytdlpMock := filepath.Join(dir, "ytdlp-mock.sh")
+	script := `#!/bin/sh
+printf "part-data" > "$1/01.mp4.part"
+sleep 0.1
+mv "$1/01.mp4.part" "$1/01.mp4"
+printf "WEBVTT\n" > "$1/01.en.vtt"
+printf "video2" > "$1/02.mp4"
+echo "yt-dlp done"
+`
+	if err := os.WriteFile(ytdlpMock, []byte(script), 0755); err != nil {
+		t.Fatal(err)
+	}
+	a := &App{cfg: Config{YTDLP: ytdlpMock}}
+	var uploaded []string
+	logs, files, err := a.runYouTubeStreamingUpload(context.Background(), []string{dir}, dir, nil, func(file string) error {
+		uploaded = append(uploaded, file)
+		return nil
+	})
+	if err != nil || !strings.Contains(logs, "yt-dlp done") || len(files) != 2 || len(uploaded) != 2 {
+		t.Fatalf("youtube streaming upload failed: logs=%q files=%v uploaded=%v err=%v", logs, files, uploaded, err)
+	}
+}
+
+func TestStreamUploaderAppendAndReclamation(t *testing.T) {
+	dir := t.TempDir()
+	biliupMock := filepath.Join(dir, "biliup-mock.sh")
+	script := `#!/bin/sh
+if echo "$*" | grep -q "append"; then
+	echo "append success aid: 123 bvid: BV1append123"
+else
+	echo "upload success aid: 123 bvid: BV1initial12"
+fi
+`
+	if err := os.WriteFile(biliupMock, []byte(script), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	app := &App{
+		cfg: Config{
+			Biliup:         biliupMock,
+			DataDir:        dir,
+			MinFreeDiskGB:  0.0,
+			SubmitEndpoint: "web",
+		},
+		jobs:        map[string]*Job{},
+		uploadSlots: make(chan struct{}, 1),
+	}
+
+	nj := &Job{
+		ID:     "stream_job_1",
+		Kind:   "pipeline",
+		Status: "running",
+		ctx:    context.Background(),
+	}
+	app.jobs[nj.ID] = nj
+
+	uploader := app.newStreamUploader(nj, pipelineReq{
+		URL: "https://www.youtube.com/playlist?list=PL123",
+	})
+
+	video1 := filepath.Join(dir, "video1.mp4")
+	_ = os.WriteFile(video1, []byte("video1 content data"), 0644)
+	video2 := filepath.Join(dir, "video2.mp4")
+	_ = os.WriteFile(video2, []byte("video2 content data"), 0644)
+
+	// Upload part 1
+	if err := uploader.handleReadyVideo(video1); err != nil {
+		t.Fatalf("upload part 1 failed: %v", err)
+	}
+	if uploader.mainBVID != "BV1initial12" {
+		t.Fatalf("expected mainBVID to be BV1initial12, got %q", uploader.mainBVID)
+	}
+
+	// Upload part 2 (should append to BV1initial12)
+	if err := uploader.handleReadyVideo(video2); err != nil {
+		t.Fatalf("upload part 2 failed: %v", err)
+	}
+	if len(uploader.uploadedFiles) != 2 || len(uploader.results) != 2 {
+		t.Fatalf("expected 2 parts uploaded, got %d files, %d results", len(uploader.uploadedFiles), len(uploader.results))
+	}
+	if uploader.mainBVID != "BV1initial12" {
+		t.Fatalf("mainBVID should remain BV1initial12 after append, got %q", uploader.mainBVID)
+	}
+}
+
 
 
 
