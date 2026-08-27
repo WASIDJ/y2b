@@ -1176,7 +1176,6 @@ func TestManualRetryResetsAutoRetryCount(t *testing.T) {
 		uploadSlots:   make(chan struct{}, 1),
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
 	oldJob := &Job{
 		ID:             "job_failed_rate_limit",
 		Kind:           "unknown",
