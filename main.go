@@ -38,6 +38,14 @@ import (
 //go:embed index.html
 var indexHTML string
 
+var (
+	Version         = "1.2.0"
+	BuildCommit     = "dev"
+	BuildTime       = "unknown"
+	serverStartTime = time.Now()
+)
+
+
 type Config struct {
 	Addr             string
 	DataDir          string
@@ -5476,10 +5484,15 @@ func (a *App) systemDiagnostics() map[string]any {
 	}
 
 	return map[string]any{
-		"ok":            true,
-		"time":          time.Now().Format(time.RFC3339),
-		"data_dir":      a.cfg.DataDir,
-		"total_jobs":    totalJobs,
+		"ok":                true,
+		"version":           Version,
+		"build_commit":      BuildCommit,
+		"build_time":        BuildTime,
+		"server_started_at": serverStartTime.Format(time.RFC3339),
+		"uptime_seconds":    int(time.Since(serverStartTime).Seconds()),
+		"time":              time.Now().Format(time.RFC3339),
+		"data_dir":          a.cfg.DataDir,
+		"total_jobs":        totalJobs,
 		"running_jobs":  runningJobs,
 		"ram":           ram,
 		"rom":           rom,

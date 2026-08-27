@@ -1245,6 +1245,18 @@ func TestSystemDiagnosticsDiskFields(t *testing.T) {
 	if maxGB, ok := diag["max_job_disk_gb"].(float64); !ok || maxGB <= 0 {
 		t.Fatalf("expected positive max_job_disk_gb, got %v", diag["max_job_disk_gb"])
 	}
+	if _, ok := diag["version"]; !ok {
+		t.Fatal("missing version in systemDiagnostics")
+	}
+	if _, ok := diag["build_commit"]; !ok {
+		t.Fatal("missing build_commit in systemDiagnostics")
+	}
+	if _, ok := diag["build_time"]; !ok {
+		t.Fatal("missing build_time in systemDiagnostics")
+	}
+	if _, ok := diag["uptime_seconds"]; !ok {
+		t.Fatal("missing uptime_seconds in systemDiagnostics")
+	}
 }
 
 func TestIsActiveJobMedia(t *testing.T) {
