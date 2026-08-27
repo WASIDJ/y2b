@@ -63,6 +63,7 @@ type Config struct {
 	ReviewInterval   time.Duration
 	ReviewRepairMax  int
 	MinFreeDiskGB    float64
+	MaxJobDiskGB     float64
 	SubmitEndpoint   string
 }
 
@@ -294,6 +295,12 @@ func loadConfig() Config {
 			minFreeDiskGB = parsed
 		}
 	}
+	maxJobDiskGB := 40.0
+	if raw := os.Getenv("Y2B_MAX_JOB_DISK_GB"); raw != "" {
+		if parsed, err := strconv.ParseFloat(raw, 64); err == nil && parsed > 0 {
+			maxJobDiskGB = parsed
+		}
+	}
 	submitEndpoint := env("Y2B_BILIUP_SUBMIT_ENDPOINT", "b-cut-android")
 
 	return Config{
@@ -321,6 +328,7 @@ func loadConfig() Config {
 		ReviewInterval:   reviewInterval,
 		ReviewRepairMax:  reviewRepairMax,
 		MinFreeDiskGB:    minFreeDiskGB,
+		MaxJobDiskGB:     maxJobDiskGB,
 		SubmitEndpoint:   submitEndpoint,
 	}
 }
@@ -709,6 +717,8 @@ func classifyFailure(err, logs string) string {
 		strings.Contains(s, "no space left on device"),
 		strings.Contains(s, "not enough disk space"),
 		strings.Contains(s, "disk full"),
+		strings.Contains(s, "quota_exceeded"),
+		strings.Contains(s, "安全配额上限"),
 		strings.Contains(s, "exit status 9"):
 		// aria2c exit status 9 = Not Enough Disk Space; disk_full is never
 		// auto-retried — retrying immediately just wastes resources until
@@ -945,6 +955,26 @@ func (a *App) ensureSafeMemory(ctx context.Context) error {
 	return nil
 }
 
+func isActiveJobMedia(j *Job) bool {
+	if j == nil {
+		return false
+	}
+	if j.Status == "running" || j.Status == "queued" || j.Status == "pending" {
+		return true
+	}
+	if j.Status == "done" {
+		// Keep media until submission review has passed
+		return j.ReviewState != "passed"
+	}
+	if j.Status == "failed" {
+		// Only keep media if the job is waiting for an active scheduled retry
+		if isAutoRetryableCategory(j.FailureCategory) && !j.NextRetryAt.IsZero() {
+			return true
+		}
+	}
+	return false
+}
+
 func (a *App) cleanupOrphanedMedia() int64 {
 	a.mu.RLock()
 	activeIDs := make(map[string]bool, len(a.jobs))
@@ -953,8 +983,8 @@ func (a *App) cleanupOrphanedMedia() int64 {
 			continue
 		}
 
-		// Only retain directories of jobs that are active / not completed and passed
-		if j.ReviewState != "passed" || j.Status != "done" {
+		// Only retain directories of jobs that are active (running, pending review, or pending transient retry)
+		if isActiveJobMedia(j) {
 			activeIDs[id] = true
 			// Check Output
 			if out := outputMap(j.Output); out != nil {
@@ -2815,14 +2845,73 @@ func (a *App) runMagnetProgress(ctx context.Context, args []string, callbacks ..
 	if len(callbacks) > 0 {
 		onLine = callbacks[0]
 	}
-	if a.cfg.MagnetTimeout <= 0 {
-		return runCmdProgress(ctx, a.cfg.Aria2, args, onLine)
+
+	var destDir string
+	for _, arg := range args {
+		if strings.HasPrefix(arg, "--dir=") {
+			destDir = strings.TrimPrefix(arg, "--dir=")
+			break
+		}
 	}
-	magnetCtx, cancel := context.WithTimeout(ctx, a.cfg.MagnetTimeout)
+
+	magnetCtx, cancel := context.WithCancel(ctx)
+	if a.cfg.MagnetTimeout > 0 {
+		magnetCtx, cancel = context.WithTimeout(ctx, a.cfg.MagnetTimeout)
+	}
 	defer cancel()
+
+	var quotaErr error
+	var quotaMu sync.Mutex
+	if destDir != "" && (a.cfg.MaxJobDiskGB > 0 || a.cfg.MinFreeDiskGB > 0) {
+		stopMon := make(chan struct{})
+		defer close(stopMon)
+		go func() {
+			ticker := time.NewTicker(3 * time.Second)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-stopMon:
+					return
+				case <-magnetCtx.Done():
+					return
+				case <-ticker.C:
+					if a.cfg.MaxJobDiskGB > 0 {
+						size := calcDirSize(destDir)
+						gb := float64(size) / (1024 * 1024 * 1024)
+						if gb > a.cfg.MaxJobDiskGB {
+							quotaMu.Lock()
+							quotaErr = fmt.Errorf("quota_exceeded: 任务下载体积 (%.1f GB) 超过单任务安全配额上限 (%.1f GB)，已中止下载以防写满磁盘", gb, a.cfg.MaxJobDiskGB)
+							quotaMu.Unlock()
+							cancel()
+							return
+						}
+					}
+					if a.cfg.MinFreeDiskGB > 0 {
+						disk := getDiskInfo(a.cfg.DataDir)
+						if disk.TotalGB > 0 && disk.FreeGB < (a.cfg.MinFreeDiskGB/2) {
+							quotaMu.Lock()
+							quotaErr = fmt.Errorf("磁盘空间不足 (可用空间仅 %.1f GB，安全门限 >= %.1f GB)，暂停下载以防写满磁盘", disk.FreeGB, a.cfg.MinFreeDiskGB)
+							quotaMu.Unlock()
+							cancel()
+							return
+						}
+					}
+				}
+			}
+		}()
+	}
+
 	logs, err := runCmdProgress(magnetCtx, a.cfg.Aria2, args, onLine)
+	quotaMu.Lock()
+	if quotaErr != nil {
+		err = quotaErr
+	}
+	quotaMu.Unlock()
 	if err == nil {
 		return logs, nil
+	}
+	if quotaErr != nil {
+		return logs, quotaErr
 	}
 	if errors.Is(magnetCtx.Err(), context.DeadlineExceeded) {
 		return logs, fmt.Errorf("magnet_timeout: BT 下载超过 %s", a.cfg.MagnetTimeout)
@@ -2838,12 +2927,11 @@ func (a *App) runMagnetProgress(ctx context.Context, args []string, callbacks ..
 // a file is complete, so this is safe for large multi-file torrents. A single
 // huge video still has to finish before an uploader can read it reliably.
 func (a *App) runMagnetStreamingUpload(ctx context.Context, args []string, dir string, onLine func(string), upload func(string) error) (string, []string, error) {
-	streamCtx := ctx
-	var cancel context.CancelFunc
+	streamCtx, cancel := context.WithCancel(ctx)
 	if a.cfg.MagnetTimeout > 0 {
 		streamCtx, cancel = context.WithTimeout(ctx, a.cfg.MagnetTimeout)
-		defer cancel()
 	}
+	defer cancel()
 
 	c := exec.CommandContext(streamCtx, a.cfg.Aria2, args...)
 	c.Env = os.Environ()
@@ -2919,6 +3007,21 @@ func (a *App) runMagnetStreamingUpload(ctx context.Context, args []string, dir s
 			}
 			return logs, uploadedFiles, nil
 		case <-ticker.C:
+			if a.cfg.MaxJobDiskGB > 0 {
+				size := calcDirSize(dir)
+				gb := float64(size) / (1024 * 1024 * 1024)
+				if gb > a.cfg.MaxJobDiskGB {
+					_ = c.Process.Kill()
+					return strings.TrimSpace(capture.String()), uploadedFiles, fmt.Errorf("quota_exceeded: 任务下载体积 (%.1f GB) 超过单任务安全配额上限 (%.1f GB)，已中止下载以防写满磁盘", gb, a.cfg.MaxJobDiskGB)
+				}
+			}
+			if a.cfg.MinFreeDiskGB > 0 {
+				disk := getDiskInfo(a.cfg.DataDir)
+				if disk.TotalGB > 0 && disk.FreeGB < (a.cfg.MinFreeDiskGB/2) {
+					_ = c.Process.Kill()
+					return strings.TrimSpace(capture.String()), uploadedFiles, fmt.Errorf("磁盘空间不足 (可用空间仅 %.1f GB，安全门限 >= %.1f GB)，暂停下载以防写满磁盘", disk.FreeGB, a.cfg.MinFreeDiskGB)
+				}
+			}
 			if err := uploadReady(false); err != nil {
 				_ = c.Process.Kill()
 				return strings.TrimSpace(capture.String()), uploadedFiles, err
@@ -5380,8 +5483,10 @@ func (a *App) systemDiagnostics() map[string]any {
 		"running_jobs":  runningJobs,
 		"ram":           ram,
 		"rom":           rom,
-		"disk_free_gb":  rom.FreeGB,
-		"disk_total_gb": rom.TotalGB,
+		"disk_free_gb":     rom.FreeGB,
+		"disk_total_gb":    rom.TotalGB,
+		"min_free_disk_gb": a.cfg.MinFreeDiskGB,
+		"max_job_disk_gb":  a.cfg.MaxJobDiskGB,
 		"disk_used_pct": func() float64 {
 			if rom.TotalGB > 0 {
 				return (rom.TotalGB - rom.FreeGB) / rom.TotalGB * 100

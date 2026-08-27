@@ -1222,6 +1222,7 @@ func TestSystemDiagnosticsDiskFields(t *testing.T) {
 		cfg: Config{
 			DataDir:        dir,
 			MinFreeDiskGB:  5.0,
+			MaxJobDiskGB:   40.0,
 			BiliCookies:    filepath.Join(dir, "cookies.json"),
 			ChannelsFile:   filepath.Join(dir, "channels.json"),
 		},
@@ -1240,6 +1241,55 @@ func TestSystemDiagnosticsDiskFields(t *testing.T) {
 	}
 	if _, ok := diag["disk_warning"]; !ok {
 		t.Fatal("missing disk_warning in systemDiagnostics")
+	}
+	if maxGB, ok := diag["max_job_disk_gb"].(float64); !ok || maxGB <= 0 {
+		t.Fatalf("expected positive max_job_disk_gb, got %v", diag["max_job_disk_gb"])
+	}
+}
+
+func TestIsActiveJobMedia(t *testing.T) {
+	now := time.Now()
+	tests := []struct {
+		name string
+		job  *Job
+		want bool
+	}{
+		{"nil job", nil, false},
+		{"running job", &Job{Status: "running"}, true},
+		{"queued job", &Job{Status: "queued"}, true},
+		{"pending job", &Job{Status: "pending"}, true},
+		{"done job pending review", &Job{Status: "done", ReviewState: "pending"}, true},
+		{"done job passed review", &Job{Status: "done", ReviewState: "passed"}, false},
+		{"canceled job", &Job{Status: "canceled"}, false},
+		{"failed disk_full no retry", &Job{Status: "failed", FailureCategory: "disk_full"}, false},
+		{"failed dead_seed no retry", &Job{Status: "failed", FailureCategory: "dead_seed"}, false},
+		{"failed upload_rate_limit with pending retry", &Job{
+			Status:          "failed",
+			FailureCategory: "upload_rate_limit",
+			NextRetryAt:     now.Add(30 * time.Minute),
+		}, true},
+		{"failed upload_rate_limit exhausted retry", &Job{
+			Status:          "failed",
+			FailureCategory: "upload_rate_limit",
+		}, false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isActiveJobMedia(tt.job); got != tt.want {
+				t.Fatalf("isActiveJobMedia() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestQuotaExceededClassification(t *testing.T) {
+	errStr := "quota_exceeded: 任务下载体积 (81.0 GB) 超过单任务安全配额上限 (40.0 GB)，已中止下载以防写满磁盘"
+	if got := classifyFailure(errStr, ""); got != "disk_full" {
+		t.Fatalf("quota exceeded classification = %q, want disk_full", got)
+	}
+	if isAutoRetryableCategory("disk_full") {
+		t.Fatal("disk_full should not be auto retryable")
 	}
 }
 
