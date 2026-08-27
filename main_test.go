@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -1440,6 +1441,107 @@ fi
 	}
 	if uploader.mainBVID != "BV1initial12" {
 		t.Fatalf("mainBVID should remain BV1initial12 after append, got %q", uploader.mainBVID)
+	}
+}
+
+func TestParseBiliReviewVideoTranscodeFailures(t *testing.T) {
+	// 1. Test video transcoding failure extraction
+	raw := `INFO ThreadId(01) tracing
+{
+  "archive": {
+    "state": 0,
+    "state_desc": "审核中",
+    "had_passed": false
+  },
+  "videos": [
+    {
+      "index": 1,
+      "title": "P01 - 课程介绍",
+      "xcode_state": 6,
+      "fail_code": 0,
+      "fail_desc": ""
+    },
+    {
+      "index": 2,
+      "title": "P02 - 实战演练",
+      "xcode_state": -1,
+      "fail_code": 1002,
+      "fail_desc": "视频编码格式不支持 (音频流解码失败)",
+      "status": 2,
+      "status_desc": "转码失败"
+    }
+  ]
+}
+[INFO] Trailing log message
+`
+	res, err := parseBiliReviewOutput(raw)
+	if err != nil {
+		t.Fatalf("failed to parse review output: %v", err)
+	}
+	state, reason := biliReviewSummary(res)
+	if state != "rejected" {
+		t.Fatalf("expected state rejected, got %q", state)
+	}
+	if !strings.Contains(reason, "P2") || !strings.Contains(reason, "视频编码格式不支持") {
+		t.Fatalf("expected failure in P2 with transcode error, got %q", reason)
+	}
+}
+
+func TestBurnSubtitlesArgsAndMatching(t *testing.T) {
+	dir := t.TempDir()
+	v1 := filepath.Join(dir, "lesson-01.mp4")
+	v2 := filepath.Join(dir, "lesson-02.mp4")
+	_ = os.WriteFile(v1, []byte("video1"), 0644)
+	_ = os.WriteFile(v2, []byte("video2"), 0644)
+
+	sub1 := filepath.Join(dir, "lesson-01.zh-Hans.srt")
+	sub2 := filepath.Join(dir, "lesson-02.zh-Hans.srt")
+	_ = os.WriteFile(sub1, []byte("1\n00:00:01,000 --> 00:00:02,000\n你好\n"), 0644)
+	_ = os.WriteFile(sub2, []byte("1\n00:00:01,000 --> 00:00:02,000\n世界\n"), 0644)
+
+	matched1 := findMatchingSubtitle(dir, v1)
+	if matched1 != sub1 {
+		t.Fatalf("matched sub1 = %q, want %q", matched1, sub1)
+	}
+	matched2 := findMatchingSubtitle(dir, v2)
+	if matched2 != sub2 {
+		t.Fatalf("matched sub2 = %q, want %q", matched2, sub2)
+	}
+}
+
+func TestConvertVttBOMAndEncodingSafety(t *testing.T) {
+	dir := t.TempDir()
+	vttWithBOM := filepath.Join(dir, "test.zh.vtt")
+	bomBytes := []byte("\xef\xbb\xbfWEBVTT\n\n00:00:01.000 --> 00:00:03.000\n测试字幕带BOM\n")
+	if err := os.WriteFile(vttWithBOM, bomBytes, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	convertVttToSrtAndBcc(dir)
+
+	srtPath := filepath.Join(dir, "test.zh.srt")
+	srtBytes, err := os.ReadFile(srtPath)
+	if err != nil {
+		t.Fatalf("expected srt file generated, err: %v", err)
+	}
+	if bytes.HasPrefix(srtBytes, []byte("\xef\xbb\xbf")) {
+		t.Fatal("generated SRT should not contain UTF-8 BOM")
+	}
+	if !strings.Contains(string(srtBytes), "测试字幕带BOM") {
+		t.Fatalf("SRT content missing expected text: %s", string(srtBytes))
+	}
+
+	bccPath := filepath.Join(dir, "test.zh.bcc")
+	bccBytes, err := os.ReadFile(bccPath)
+	if err != nil {
+		t.Fatalf("expected BCC file generated, err: %v", err)
+	}
+	var header bccHeader
+	if err := json.Unmarshal(bccBytes, &header); err != nil {
+		t.Fatalf("BCC JSON parsing failed: %v", err)
+	}
+	if len(header.Body) != 1 || header.Body[0].Content != "测试字幕带BOM" {
+		t.Fatalf("BCC body unexpected: %+v", header.Body)
 	}
 }
 
