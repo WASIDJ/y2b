@@ -1179,16 +1179,12 @@ func TestManualRetryResetsAutoRetryCount(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	oldJob := &Job{
 		ID:             "job_failed_rate_limit",
-		Kind:           "pipeline",
+		Kind:           "unknown",
 		Status:         "failed",
 		Step:           "失败",
 		Error:          "code 601 rate limit",
 		AutoRetryCount: 48, // exhausted count
-		Input: pipelineReq{
-			URL: "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
-		},
-		ctx:        ctx,
-		cancelFunc: cancel,
+		Input:          map[string]any{"url": "https://example.com/test"},
 	}
 	app.jobs[oldJob.ID] = oldJob
 	app.order = []string{oldJob.ID}
