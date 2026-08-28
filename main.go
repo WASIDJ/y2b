@@ -10,6 +10,7 @@ import (
 	"crypto/subtle"
 	_ "embed"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -756,6 +757,8 @@ func (a *App) set(j *Job, status, err string, out any, logs string) {
 			j.Step = "等待B站限流/风控解除 (可人工验证或次日自动刷新)"
 		case "disk_full":
 			j.Step = "磁盘空间不足，等待手动清理后重试"
+		case "auth_failed":
+			j.Step = "B站登录鉴权失效或重复稿件，请更新 cookies.json"
 		default:
 			j.Step = "失败"
 		}
@@ -810,6 +813,13 @@ func classifyFailure(err, logs string) string {
 	switch {
 	case strings.Contains(s, "队列等待超时"), strings.Contains(s, "queue wait timeout"):
 		return "queue_timeout"
+	case strings.Contains(s, "code -663"), strings.Contains(s, "code: -663"), strings.Contains(s, `"code":-663`), strings.Contains(s, `"code": -663`),
+		strings.Contains(s, "鉴权失败"), strings.Contains(s, "登录凭证失效"),
+		strings.Contains(s, "code -101"), strings.Contains(s, "code: -101"), strings.Contains(s, `"code":-101`), strings.Contains(s, `"code": -101`),
+		strings.Contains(s, "code -400"), strings.Contains(s, "code: -400"), strings.Contains(s, `"code":-400`), strings.Contains(s, `"code": -400`),
+		strings.Contains(s, "重复稿件"), strings.Contains(s, "code 21070"), strings.Contains(s, "code: 21070"), strings.Contains(s, "code 21071"), strings.Contains(s, "code: 21071"),
+		strings.Contains(s, "code 21016"), strings.Contains(s, "code: 21016"), strings.Contains(s, "code 21017"), strings.Contains(s, "code: 21017"), strings.Contains(s, "code 21018"), strings.Contains(s, "code: 21018"):
+		return "auth_failed"
 	case strings.Contains(s, "code 406"), strings.Contains(s, `"code":406`),
 		strings.Contains(s, "code 601"), strings.Contains(s, `"code":601`),
 		strings.Contains(s, "code 21564"), strings.Contains(s, `"code":21564`),
@@ -3148,10 +3158,18 @@ func (a *App) runMagnetStreamingUpload(ctx context.Context, args []string, dir s
 			if err != nil || info == nil || info.IsDir() || uploaded[path] || !isVideoFilePath(path) {
 				return nil
 			}
-			// The sidecar is present while aria2 is still writing this file.
+			if info.Size() == 0 {
+				return nil
+			}
+			// The direct sidecar is present while aria2 is still writing this file.
 			if _, err := os.Stat(path + ".aria2"); err == nil {
 				return nil
 			}
+			// Verify media container integrity (ensure moov atom and complete headers)
+			if !validateMediaIntegrity(path) {
+				return nil
+			}
+
 			st := states[path]
 			if st.size == info.Size() {
 				st.seen++
@@ -3258,7 +3276,16 @@ func (a *App) runYouTubeStreamingUpload(ctx context.Context, args []string, dir 
 		sort.Strings(files)
 
 		for _, path := range files {
-			if uploaded[path] || !isVideoFilePath(path) {
+			if uploaded[path] {
+				continue
+			}
+			// When running in real-time streaming mode, ignore standalone audio streams (e.g. .m4a)
+			// as yt-dlp downloads them separately before merging them into .mp4 containers.
+			// Only allow pure audio files if force=true (after yt-dlp exits) AND no video containers exist.
+			if !force && isPureAudioFilePath(path) {
+				continue
+			}
+			if !isVideoFilePath(path) {
 				continue
 			}
 			// Skip if yt-dlp temporary .part or .ytdl file exists
@@ -3266,6 +3293,19 @@ func (a *App) runYouTubeStreamingUpload(ctx context.Context, args []string, dir 
 				continue
 			}
 			if _, err := os.Stat(path + ".ytdl"); err == nil {
+				continue
+			}
+			base := strings.TrimSuffix(path, filepath.Ext(path))
+			if _, err := os.Stat(base + ".m4a.part"); err == nil {
+				continue
+			}
+			if _, err := os.Stat(base + ".webm.part"); err == nil {
+				continue
+			}
+			if _, err := os.Stat(base + ".mp4.part"); err == nil {
+				continue
+			}
+			if _, err := os.Stat(base + ".ytdl"); err == nil {
 				continue
 			}
 			info, err := os.Stat(path)
@@ -3431,10 +3471,11 @@ func (s *streamUploader) handleReadyVideo(file string) error {
 		a.recordUpload(fileSize)
 	}
 
-	// Dynamic disk space reclamation: If free disk is under safe threshold,
-	// remove the uploaded local video file to free space for ongoing download.
+	// Dynamic disk space reclamation: Only under critical disk pressure (< MinFreeDiskGB / 4),
+	// remove the uploaded local video file to prevent disk exhaustion during massive torrents.
+	// Under normal conditions, preserve local files until B站 review passes so auto-repair can work.
 	disk := getDiskInfo(a.cfg.DataDir)
-	if a.cfg.MinFreeDiskGB > 0 && disk.TotalGB > 0 && disk.FreeGB < a.cfg.MinFreeDiskGB {
+	if a.cfg.MinFreeDiskGB > 0 && disk.TotalGB > 0 && disk.FreeGB < (a.cfg.MinFreeDiskGB/4) {
 		_ = os.Remove(uploadFile)
 		base := strings.TrimSuffix(uploadFile, filepath.Ext(uploadFile))
 		_ = os.Remove(base + ".srt")
@@ -3443,6 +3484,19 @@ func (s *streamUploader) handleReadyVideo(file string) error {
 	}
 
 	return nil
+}
+
+func isPureAudioFilePath(path string) bool {
+	switch strings.ToLower(filepath.Ext(path)) {
+	case ".m4a", ".aac", ".wav", ".flac", ".ogg", ".opus", ".mp3":
+		return true
+	default:
+		return false
+	}
+}
+
+func isVideoContainerFilePath(path string) bool {
+	return isVideoFilePath(path) && !isPureAudioFilePath(path)
 }
 
 func isVideoFilePath(path string) bool {
@@ -3455,6 +3509,110 @@ func isVideoFilePath(path string) bool {
 	default:
 		return false
 	}
+}
+
+// validateMediaIntegrity performs fast, non-destructive container validation to ensure
+// a video file is structurally sound and complete before submission.
+func validateMediaIntegrity(path string) bool {
+	info, err := os.Stat(path)
+	if err != nil || info.IsDir() || info.Size() < 16 {
+		return false
+	}
+
+	ext := strings.ToLower(filepath.Ext(path))
+	switch ext {
+	case ".mp4", ".m4v", ".mov", ".m4a":
+		return validateMP4Integrity(path, info.Size())
+	case ".mkv", ".webm":
+		return validateMKVIntegrity(path, info.Size())
+	case ".avi":
+		return validateAVIIntegrity(path, info.Size())
+	default:
+		return info.Size() > 16
+	}
+}
+
+// validateMP4Integrity scans top-level ISO base media file format boxes (atoms).
+// A valid, decodable MP4/MOV must contain 'moov' (or 'moof') atom.
+func validateMP4Integrity(path string, size int64) bool {
+	f, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+
+	var offset int64
+	hasFtyp := false
+	hasMoovOrMoof := false
+	buf := make([]byte, 8)
+
+	for offset < size {
+		n, err := f.ReadAt(buf, offset)
+		if err != nil || n < 8 {
+			break
+		}
+		boxSize := int64(binary.BigEndian.Uint32(buf[0:4]))
+		boxType := string(buf[4:8])
+
+		if boxType == "ftyp" {
+			hasFtyp = true
+		} else if boxType == "moov" || boxType == "moof" {
+			hasMoovOrMoof = true
+		}
+
+		if boxSize == 0 {
+			// Box extends to end of file
+			break
+		}
+		if boxSize == 1 {
+			// 64-bit extended size
+			extBuf := make([]byte, 8)
+			if n, err := f.ReadAt(extBuf, offset+8); err != nil || n < 8 {
+				break
+			}
+			boxSize = int64(binary.BigEndian.Uint64(extBuf))
+			if boxSize < 16 {
+				break
+			}
+		} else if boxSize < 8 {
+			// Invalid box size
+			break
+		}
+
+		offset += boxSize
+	}
+
+	return hasFtyp && hasMoovOrMoof
+}
+
+func validateMKVIntegrity(path string, size int64) bool {
+	f, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+
+	header := make([]byte, 4)
+	if n, err := f.Read(header); err != nil || n < 4 {
+		return false
+	}
+	// EBML header: 0x1A 0x45 0xDF 0xA3
+	return bytes.Equal(header, []byte{0x1A, 0x45, 0xDF, 0xA3})
+}
+
+func validateAVIIntegrity(path string, size int64) bool {
+	f, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+
+	header := make([]byte, 12)
+	if n, err := f.Read(header); err != nil || n < 12 {
+		return false
+	}
+	// RIFF....AVI
+	return string(header[0:4]) == "RIFF" && string(header[8:12]) == "AVI "
 }
 
 // uniqueMediaFiles prevents the same path being counted/uploaded twice when
@@ -3744,7 +3902,7 @@ func biliRepairActionFor(code int) biliRepairAction {
 	switch code {
 	case 0:
 		return biliRepairSuccess
-	case -101, 21016, 21017, 21018, 21070, 21071:
+	case -101, -400, -663, 21016, 21017, 21018, 21070, 21071:
 		return biliRepairStop
 	case 21020, 21021, 21022:
 		return biliRepairTitle
@@ -3927,6 +4085,9 @@ func (a *App) prepareTranslatedPartFiles(ctx context.Context, files []string) ([
 		if translatedTitle == "" || translatedTitle == partTitle {
 			continue
 		}
+		if fi, err := os.Stat(file); err != nil || fi.IsDir() || fi.Size() == 0 {
+			continue
+		}
 		if tmpDir == "" {
 			var mkErr error
 			tmpDir, mkErr = os.MkdirTemp(filepath.Dir(file), ".y2b-translated-parts-")
@@ -3936,6 +4097,10 @@ func (a *App) prepareTranslatedPartFiles(ctx context.Context, files []string) ([
 			}
 		}
 		target := filepath.Join(tmpDir, safePartFilename(translatedTitle, i, filepath.Ext(file)))
+		absFile, absErr := filepath.Abs(file)
+		if absErr == nil {
+			file = absFile
+		}
 		if err := os.Symlink(file, target); err != nil {
 			continue
 		}
@@ -4157,6 +4322,10 @@ func (a *App) executeSingleBiliupUpload(ctx context.Context, q uploadReq, title,
 		case biliRepairStop:
 			if res.Code == 21070 || res.Code == 21071 {
 				execErr = fmt.Errorf("B站提示：检测到重复稿件或相同视频正在审核中 (code %d: %s)", res.Code, res.Message)
+			} else if res.Code == -663 {
+				execErr = fmt.Errorf("B站登录凭证鉴权失败 (code %d: %s)，请在控制台更新 cookies.json", res.Code, res.Message)
+			} else if res.Code == -400 {
+				execErr = fmt.Errorf("B站请求错误/凭证无效 (code %d: %s)，请检查 cookies.json 或视频参数", res.Code, res.Message)
 			} else {
 				execErr = fmt.Errorf("B站登录凭证失效 (code %d: %s)，请在控制台更新 cookies.json", res.Code, res.Message)
 			}
@@ -5898,15 +6067,45 @@ func (a *App) systemDiagnostics() map[string]any {
 	}
 }
 
+type flexibleBool bool
+
+func (b *flexibleBool) UnmarshalJSON(data []byte) error {
+	dataStr := strings.Trim(strings.TrimSpace(string(data)), "\"")
+	switch strings.ToLower(dataStr) {
+	case "true", "1":
+		*b = true
+		return nil
+	case "false", "0", "null", "":
+		*b = false
+		return nil
+	default:
+		var num float64
+		if err := json.Unmarshal(data, &num); err == nil {
+			*b = (num != 0)
+			return nil
+		}
+		*b = false
+		return nil
+	}
+}
+
+func (b flexibleBool) MarshalJSON() ([]byte, error) {
+	if b {
+		return []byte("true"), nil
+	}
+	return []byte("false"), nil
+}
+
 type cookieJSON struct {
-	Domain         string  `json:"domain"`
-	Path           string  `json:"path"`
-	Name           string  `json:"name"`
-	Value          string  `json:"value"`
-	Expires        int64   `json:"expires"`
-	ExpirationDate float64 `json:"expirationDate"`
-	HTTPOnly       bool    `json:"httpOnly"`
-	Secure         bool    `json:"secure"`
+	Domain         string       `json:"domain"`
+	Path           string       `json:"path"`
+	Name           string       `json:"name"`
+	Value          string       `json:"value"`
+	Expires        int64        `json:"expires"`
+	ExpirationDate float64      `json:"expirationDate"`
+	HTTPOnly       flexibleBool `json:"httpOnly"`
+	HTTPOnlySnake  flexibleBool `json:"http_only"`
+	Secure         flexibleBool `json:"secure"`
 }
 
 type cookieEnvelope struct {
@@ -5989,10 +6188,10 @@ func prepareCookies(src, dir string) (string, func(), error) {
 				exp = int64(c.ExpirationDate)
 			}
 			domain := c.Domain
-			if c.HTTPOnly {
+			if bool(c.HTTPOnly) || bool(c.HTTPOnlySnake) {
 				domain = "#HttpOnly_" + domain
 			}
-			fmt.Fprintf(tmp, "%s\t%s\t%s\t%s\t%d\t%s\t%s\n", domain, "TRUE", path, map[bool]string{true: "TRUE", false: "FALSE"}[c.Secure], exp, c.Name, strings.ReplaceAll(strings.ReplaceAll(c.Value, "\t", ""), "\n", ""))
+			fmt.Fprintf(tmp, "%s\t%s\t%s\t%s\t%d\t%s\t%s\n", domain, "TRUE", path, map[bool]string{true: "TRUE", false: "FALSE"}[bool(c.Secure)], exp, c.Name, strings.ReplaceAll(strings.ReplaceAll(c.Value, "\t", ""), "\n", ""))
 			wrote++
 		}
 		if err := tmp.Close(); err != nil {

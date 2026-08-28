@@ -220,7 +220,8 @@ func TestSingleAriaSelectFileDetection(t *testing.T) {
 func TestMagnetStreamingUploadProcessesCompletedFiles(t *testing.T) {
 	dir := t.TempDir()
 	aria := filepath.Join(dir, "aria2-mock.sh")
-	if err := os.WriteFile(aria, []byte("#!/bin/sh\nprintf video > \"$1/part.mp4\"\necho done\n"), 0700); err != nil {
+	script := "#!/bin/sh\nprintf \"\\000\\000\\000\\024ftypisom\\000\\000\\002\\000isom\\000\\000\\000\\020moov12345678\" > \"$1/part.mp4\"\necho done\n"
+	if err := os.WriteFile(aria, []byte(script), 0700); err != nil {
 		t.Fatal(err)
 	}
 	a := &App{cfg: Config{Aria2: aria}}
@@ -236,7 +237,7 @@ func TestMagnetStreamingUploadProcessesCompletedFiles(t *testing.T) {
 
 func TestBiliRepairActionMatrix(t *testing.T) {
 	cases := map[int]biliRepairAction{
-		0: biliRepairSuccess, -101: biliRepairStop,
+		0: biliRepairSuccess, -101: biliRepairStop, -400: biliRepairStop, -663: biliRepairStop,
 		21016: biliRepairStop, 21017: biliRepairStop, 21018: biliRepairStop,
 		21020: biliRepairTitle, 21021: biliRepairTitle, 21022: biliRepairTitle,
 		21023: biliRepairDesc, 21024: biliRepairDesc, 21025: biliRepairDesc,
@@ -1542,6 +1543,241 @@ func TestConvertVttBOMAndEncodingSafety(t *testing.T) {
 	}
 	if len(header.Body) != 1 || header.Body[0].Content != "测试字幕带BOM" {
 		t.Fatalf("BCC body unexpected: %+v", header.Body)
+	}
+}
+
+func TestFlexibleBoolAndCookieParsing(t *testing.T) {
+	// Test flexibleBool json unmarshaling
+	type testStruct struct {
+		Flag flexibleBool `json:"flag"`
+	}
+	for _, tc := range []struct {
+		input string
+		want  bool
+	}{
+		{`{"flag": true}`, true},
+		{`{"flag": false}`, false},
+		{`{"flag": 1}`, true},
+		{`{"flag": 0}`, false},
+		{`{"flag": "true"}`, true},
+		{`{"flag": "false"}`, false},
+		{`{"flag": "1"}`, true},
+		{`{"flag": "0"}`, false},
+		{`{"flag": null}`, false},
+		{`{"flag": ""}`, false},
+	} {
+		var ts testStruct
+		if err := json.Unmarshal([]byte(tc.input), &ts); err != nil {
+			t.Fatalf("failed unmarshaling %q: %v", tc.input, err)
+		}
+		if bool(ts.Flag) != tc.want {
+			t.Fatalf("for %q got %v, want %v", tc.input, ts.Flag, tc.want)
+		}
+	}
+
+	// Test real-world Biliup cookie JSON with integer secure and http_only
+	dir := t.TempDir()
+	cookiePath := filepath.Join(dir, "cookies.json")
+	sampleCookies := `{
+		"cookie_info": {
+			"cookies": [
+				{
+					"domain": ".bilibili.com",
+					"expires": 1795712586,
+					"http_only": 1,
+					"name": "SESSDATA",
+					"same_site": 0,
+					"secure": 0,
+					"value": "sample_sessdata_value"
+				},
+				{
+					"domain": ".bilibili.com",
+					"expires": 1795712586,
+					"http_only": 0,
+					"name": "bili_jct",
+					"same_site": 0,
+					"secure": 0,
+					"value": "sample_csrf_jct"
+				}
+			]
+		}
+	}`
+	if err := os.WriteFile(cookiePath, []byte(sampleCookies), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	header, csrf, err := loadBiliCookieHeader(cookiePath)
+	if err != nil {
+		t.Fatalf("loadBiliCookieHeader failed on integer secure/http_only: %v", err)
+	}
+	if csrf != "sample_csrf_jct" {
+		t.Fatalf("expected csrf sample_csrf_jct, got %q", csrf)
+	}
+	if !strings.Contains(header, "SESSDATA=sample_sessdata_value") || !strings.Contains(header, "bili_jct=sample_csrf_jct") {
+		t.Fatalf("header missing cookie values: %s", header)
+	}
+}
+
+func TestAuthFailedFailureClassification(t *testing.T) {
+	cases := []struct {
+		err  string
+		logs string
+		want string
+	}{
+		{"exit status 1", "ResponseData { code: -663, data: None, message: \"鉴权失败，请联系账号组\" }", "auth_failed"},
+		{"exit status 1", "ResponseData { code: -400, data: None, message: \"请求错误\" }", "auth_failed"},
+		{"exit status 1", "B站登录凭证失效 (code -101)", "auth_failed"},
+		{"exit status 1", "code 21070: 重复稿件", "auth_failed"},
+	}
+	for _, tc := range cases {
+		got := classifyFailure(tc.err, tc.logs)
+		if got != tc.want {
+			t.Fatalf("classifyFailure(%q, %q) = %q, want %q", tc.err, tc.logs, got, tc.want)
+		}
+		if isAutoRetryableCategory(got) {
+			t.Fatalf("category %q should not be auto-retryable", got)
+		}
+	}
+}
+
+func TestAudioAndVideoContainerHelpers(t *testing.T) {
+	if !isPureAudioFilePath("test.m4a") || !isPureAudioFilePath("audio.mp3") || !isPureAudioFilePath("sound.aac") {
+		t.Fatal("audio extensions should be recognized as pure audio")
+	}
+	if isPureAudioFilePath("video.mp4") || isPureAudioFilePath("movie.mkv") {
+		t.Fatal("video containers should not be recognized as pure audio")
+	}
+	if !isVideoContainerFilePath("video.mp4") || !isVideoContainerFilePath("movie.mkv") || !isVideoContainerFilePath("clip.webm") {
+		t.Fatal("video containers should be recognized by isVideoContainerFilePath")
+	}
+	if isVideoContainerFilePath("test.m4a") || isVideoContainerFilePath("song.mp3") {
+		t.Fatal("audio files should not be recognized as video containers")
+	}
+}
+
+func TestYouTubeStreamingUploadIgnoresIntermediateAudioStreams(t *testing.T) {
+	dir := t.TempDir()
+	ytdlpMock := filepath.Join(dir, "ytdlp-mock.sh")
+	// Mock yt-dlp script that downloads video + audio separately, then merges to mp4 and deletes m4a
+	script := `#!/bin/sh
+outdir="$1"
+printf "audio-stream" > "$outdir/video1.f140.m4a"
+printf "video-stream" > "$outdir/video1.f137.mp4"
+sleep 0.1
+# ffmpeg merge simulation:
+printf "merged-video-data" > "$outdir/video1.mp4"
+rm -f "$outdir/video1.f140.m4a" "$outdir/video1.f137.mp4"
+echo "yt-dlp merge complete"
+`
+	if err := os.WriteFile(ytdlpMock, []byte(script), 0755); err != nil {
+		t.Fatal(err)
+	}
+	a := &App{cfg: Config{YTDLP: ytdlpMock}}
+	var uploaded []string
+	logs, files, err := a.runYouTubeStreamingUpload(context.Background(), []string{dir}, dir, nil, func(file string) error {
+		uploaded = append(uploaded, file)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("runYouTubeStreamingUpload returned error: %v", err)
+	}
+	if !strings.Contains(logs, "yt-dlp merge complete") {
+		t.Fatalf("logs missing expected completion string: %s", logs)
+	}
+	for _, up := range uploaded {
+		if strings.HasSuffix(up, ".m4a") {
+			t.Fatalf("intermediate audio file %s should not have been uploaded", up)
+		}
+	}
+	if len(uploaded) != 1 || !strings.HasSuffix(uploaded[0], "video1.mp4") {
+		t.Fatalf("expected uploaded single merged video1.mp4, got %v (files: %v)", uploaded, files)
+	}
+}
+
+func createMockMP4(t *testing.T, path string, includeMoov bool) {
+	t.Helper()
+	var buf bytes.Buffer
+	// ftyp box (size 20)
+	buf.Write([]byte{0x00, 0x00, 0x00, 0x14})
+	buf.WriteString("ftyp")
+	buf.WriteString("isom\x00\x00\x02\x00isom")
+
+	// mdat box (size 16)
+	buf.Write([]byte{0x00, 0x00, 0x00, 0x10})
+	buf.WriteString("mdat")
+	buf.WriteString("12345678")
+
+	if includeMoov {
+		// moov box (size 16)
+		buf.Write([]byte{0x00, 0x00, 0x00, 0x10})
+		buf.WriteString("moov")
+		buf.WriteString("12345678")
+	}
+
+	if err := os.WriteFile(path, buf.Bytes(), 0644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestMediaIntegrityValidation(t *testing.T) {
+	dir := t.TempDir()
+
+	validMP4 := filepath.Join(dir, "valid.mp4")
+	createMockMP4(t, validMP4, true)
+	if !validateMediaIntegrity(validMP4) {
+		t.Fatal("valid MP4 with moov atom should pass validation")
+	}
+
+	corruptMP4 := filepath.Join(dir, "corrupt.mp4")
+	createMockMP4(t, corruptMP4, false)
+	if validateMediaIntegrity(corruptMP4) {
+		t.Fatal("corrupt MP4 without moov atom should fail validation")
+	}
+
+	zeroByteFile := filepath.Join(dir, "zero.mp4")
+	_ = os.WriteFile(zeroByteFile, []byte{}, 0644)
+	if validateMediaIntegrity(zeroByteFile) {
+		t.Fatal("0-byte file should fail validation")
+	}
+
+	validMKV := filepath.Join(dir, "valid.mkv")
+	_ = os.WriteFile(validMKV, append([]byte{0x1A, 0x45, 0xDF, 0xA3}, bytes.Repeat([]byte{0x01}, 2000)...), 0644)
+	if !validateMediaIntegrity(validMKV) {
+		t.Fatal("valid MKV should pass validation")
+	}
+}
+
+func TestMagnetStreamingUploadRejectsIncompleteOrZeroByteFiles(t *testing.T) {
+	dir := t.TempDir()
+	ariaMock := filepath.Join(dir, "aria2-mock.sh")
+	script := `#!/bin/sh
+outdir="$1"
+# Create 0-byte file and incomplete MP4 (missing moov)
+touch "$outdir/00_empty.mp4"
+printf "\000\000\000\024ftypisom\000\000\002\000isom\000\000\000\020mdat12345678" > "$outdir/01_corrupt.mp4"
+sleep 0.1
+# Now create valid MP4 with moov atom
+printf "\000\000\000\024ftypisom\000\000\002\000isom\000\000\000\020mdat12345678\000\000\000\020moov12345678" > "$outdir/02_valid.mp4"
+echo "aria2 finished"
+`
+	if err := os.WriteFile(ariaMock, []byte(script), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	a := &App{cfg: Config{Aria2: ariaMock}}
+	var uploaded []string
+	logs, files, err := a.runMagnetStreamingUpload(context.Background(), []string{dir}, dir, nil, func(file string) error {
+		uploaded = append(uploaded, file)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("runMagnetStreamingUpload returned error: %v", err)
+	}
+	if !strings.Contains(logs, "aria2 finished") {
+		t.Fatalf("logs missing completion string: %s", logs)
+	}
+	if len(uploaded) != 1 || !strings.HasSuffix(uploaded[0], "02_valid.mp4") {
+		t.Fatalf("expected only 02_valid.mp4 to be uploaded, got %v (files: %v)", uploaded, files)
 	}
 }
 
