@@ -10,6 +10,7 @@ import (
 	"crypto/subtle"
 	_ "embed"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -3157,10 +3158,18 @@ func (a *App) runMagnetStreamingUpload(ctx context.Context, args []string, dir s
 			if err != nil || info == nil || info.IsDir() || uploaded[path] || !isVideoFilePath(path) {
 				return nil
 			}
-			// The sidecar is present while aria2 is still writing this file.
+			if info.Size() == 0 {
+				return nil
+			}
+			// The direct sidecar is present while aria2 is still writing this file.
 			if _, err := os.Stat(path + ".aria2"); err == nil {
 				return nil
 			}
+			// Verify media container integrity (ensure moov atom and complete headers)
+			if !validateMediaIntegrity(path) {
+				return nil
+			}
+
 			st := states[path]
 			if st.size == info.Size() {
 				st.seen++
@@ -3462,10 +3471,11 @@ func (s *streamUploader) handleReadyVideo(file string) error {
 		a.recordUpload(fileSize)
 	}
 
-	// Dynamic disk space reclamation: If free disk is under safe threshold,
-	// remove the uploaded local video file to free space for ongoing download.
+	// Dynamic disk space reclamation: Only under critical disk pressure (< MinFreeDiskGB / 4),
+	// remove the uploaded local video file to prevent disk exhaustion during massive torrents.
+	// Under normal conditions, preserve local files until B站 review passes so auto-repair can work.
 	disk := getDiskInfo(a.cfg.DataDir)
-	if a.cfg.MinFreeDiskGB > 0 && disk.TotalGB > 0 && disk.FreeGB < a.cfg.MinFreeDiskGB {
+	if a.cfg.MinFreeDiskGB > 0 && disk.TotalGB > 0 && disk.FreeGB < (a.cfg.MinFreeDiskGB/4) {
 		_ = os.Remove(uploadFile)
 		base := strings.TrimSuffix(uploadFile, filepath.Ext(uploadFile))
 		_ = os.Remove(base + ".srt")
@@ -3499,6 +3509,110 @@ func isVideoFilePath(path string) bool {
 	default:
 		return false
 	}
+}
+
+// validateMediaIntegrity performs fast, non-destructive container validation to ensure
+// a video file is structurally sound and complete before submission.
+func validateMediaIntegrity(path string) bool {
+	info, err := os.Stat(path)
+	if err != nil || info.IsDir() || info.Size() < 16 {
+		return false
+	}
+
+	ext := strings.ToLower(filepath.Ext(path))
+	switch ext {
+	case ".mp4", ".m4v", ".mov", ".m4a":
+		return validateMP4Integrity(path, info.Size())
+	case ".mkv", ".webm":
+		return validateMKVIntegrity(path, info.Size())
+	case ".avi":
+		return validateAVIIntegrity(path, info.Size())
+	default:
+		return info.Size() > 16
+	}
+}
+
+// validateMP4Integrity scans top-level ISO base media file format boxes (atoms).
+// A valid, decodable MP4/MOV must contain 'moov' (or 'moof') atom.
+func validateMP4Integrity(path string, size int64) bool {
+	f, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+
+	var offset int64
+	hasFtyp := false
+	hasMoovOrMoof := false
+	buf := make([]byte, 8)
+
+	for offset < size {
+		n, err := f.ReadAt(buf, offset)
+		if err != nil || n < 8 {
+			break
+		}
+		boxSize := int64(binary.BigEndian.Uint32(buf[0:4]))
+		boxType := string(buf[4:8])
+
+		if boxType == "ftyp" {
+			hasFtyp = true
+		} else if boxType == "moov" || boxType == "moof" {
+			hasMoovOrMoof = true
+		}
+
+		if boxSize == 0 {
+			// Box extends to end of file
+			break
+		}
+		if boxSize == 1 {
+			// 64-bit extended size
+			extBuf := make([]byte, 8)
+			if n, err := f.ReadAt(extBuf, offset+8); err != nil || n < 8 {
+				break
+			}
+			boxSize = int64(binary.BigEndian.Uint64(extBuf))
+			if boxSize < 16 {
+				break
+			}
+		} else if boxSize < 8 {
+			// Invalid box size
+			break
+		}
+
+		offset += boxSize
+	}
+
+	return hasFtyp && hasMoovOrMoof
+}
+
+func validateMKVIntegrity(path string, size int64) bool {
+	f, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+
+	header := make([]byte, 4)
+	if n, err := f.Read(header); err != nil || n < 4 {
+		return false
+	}
+	// EBML header: 0x1A 0x45 0xDF 0xA3
+	return bytes.Equal(header, []byte{0x1A, 0x45, 0xDF, 0xA3})
+}
+
+func validateAVIIntegrity(path string, size int64) bool {
+	f, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+
+	header := make([]byte, 12)
+	if n, err := f.Read(header); err != nil || n < 12 {
+		return false
+	}
+	// RIFF....AVI
+	return string(header[0:4]) == "RIFF" && string(header[8:12]) == "AVI "
 }
 
 // uniqueMediaFiles prevents the same path being counted/uploaded twice when

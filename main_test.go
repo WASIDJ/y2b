@@ -220,7 +220,8 @@ func TestSingleAriaSelectFileDetection(t *testing.T) {
 func TestMagnetStreamingUploadProcessesCompletedFiles(t *testing.T) {
 	dir := t.TempDir()
 	aria := filepath.Join(dir, "aria2-mock.sh")
-	if err := os.WriteFile(aria, []byte("#!/bin/sh\nprintf video > \"$1/part.mp4\"\necho done\n"), 0700); err != nil {
+	script := "#!/bin/sh\nprintf \"\\000\\000\\000\\024ftypisom\\000\\000\\002\\000isom\\000\\000\\000\\020moov12345678\" > \"$1/part.mp4\"\necho done\n"
+	if err := os.WriteFile(aria, []byte(script), 0700); err != nil {
 		t.Fatal(err)
 	}
 	a := &App{cfg: Config{Aria2: aria}}
@@ -1690,6 +1691,93 @@ echo "yt-dlp merge complete"
 	}
 	if len(uploaded) != 1 || !strings.HasSuffix(uploaded[0], "video1.mp4") {
 		t.Fatalf("expected uploaded single merged video1.mp4, got %v (files: %v)", uploaded, files)
+	}
+}
+
+func createMockMP4(t *testing.T, path string, includeMoov bool) {
+	t.Helper()
+	var buf bytes.Buffer
+	// ftyp box (size 20)
+	buf.Write([]byte{0x00, 0x00, 0x00, 0x14})
+	buf.WriteString("ftyp")
+	buf.WriteString("isom\x00\x00\x02\x00isom")
+
+	// mdat box (size 16)
+	buf.Write([]byte{0x00, 0x00, 0x00, 0x10})
+	buf.WriteString("mdat")
+	buf.WriteString("12345678")
+
+	if includeMoov {
+		// moov box (size 16)
+		buf.Write([]byte{0x00, 0x00, 0x00, 0x10})
+		buf.WriteString("moov")
+		buf.WriteString("12345678")
+	}
+
+	if err := os.WriteFile(path, buf.Bytes(), 0644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestMediaIntegrityValidation(t *testing.T) {
+	dir := t.TempDir()
+
+	validMP4 := filepath.Join(dir, "valid.mp4")
+	createMockMP4(t, validMP4, true)
+	if !validateMediaIntegrity(validMP4) {
+		t.Fatal("valid MP4 with moov atom should pass validation")
+	}
+
+	corruptMP4 := filepath.Join(dir, "corrupt.mp4")
+	createMockMP4(t, corruptMP4, false)
+	if validateMediaIntegrity(corruptMP4) {
+		t.Fatal("corrupt MP4 without moov atom should fail validation")
+	}
+
+	zeroByteFile := filepath.Join(dir, "zero.mp4")
+	_ = os.WriteFile(zeroByteFile, []byte{}, 0644)
+	if validateMediaIntegrity(zeroByteFile) {
+		t.Fatal("0-byte file should fail validation")
+	}
+
+	validMKV := filepath.Join(dir, "valid.mkv")
+	_ = os.WriteFile(validMKV, append([]byte{0x1A, 0x45, 0xDF, 0xA3}, bytes.Repeat([]byte{0x01}, 2000)...), 0644)
+	if !validateMediaIntegrity(validMKV) {
+		t.Fatal("valid MKV should pass validation")
+	}
+}
+
+func TestMagnetStreamingUploadRejectsIncompleteOrZeroByteFiles(t *testing.T) {
+	dir := t.TempDir()
+	ariaMock := filepath.Join(dir, "aria2-mock.sh")
+	script := `#!/bin/sh
+outdir="$1"
+# Create 0-byte file and incomplete MP4 (missing moov)
+touch "$outdir/00_empty.mp4"
+printf "\000\000\000\024ftypisom\000\000\002\000isom\000\000\000\020mdat12345678" > "$outdir/01_corrupt.mp4"
+sleep 0.1
+# Now create valid MP4 with moov atom
+printf "\000\000\000\024ftypisom\000\000\002\000isom\000\000\000\020mdat12345678\000\000\000\020moov12345678" > "$outdir/02_valid.mp4"
+echo "aria2 finished"
+`
+	if err := os.WriteFile(ariaMock, []byte(script), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	a := &App{cfg: Config{Aria2: ariaMock}}
+	var uploaded []string
+	logs, files, err := a.runMagnetStreamingUpload(context.Background(), []string{dir}, dir, nil, func(file string) error {
+		uploaded = append(uploaded, file)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("runMagnetStreamingUpload returned error: %v", err)
+	}
+	if !strings.Contains(logs, "aria2 finished") {
+		t.Fatalf("logs missing completion string: %s", logs)
+	}
+	if len(uploaded) != 1 || !strings.HasSuffix(uploaded[0], "02_valid.mp4") {
+		t.Fatalf("expected only 02_valid.mp4 to be uploaded, got %v (files: %v)", uploaded, files)
 	}
 }
 
