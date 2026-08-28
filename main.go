@@ -756,6 +756,8 @@ func (a *App) set(j *Job, status, err string, out any, logs string) {
 			j.Step = "等待B站限流/风控解除 (可人工验证或次日自动刷新)"
 		case "disk_full":
 			j.Step = "磁盘空间不足，等待手动清理后重试"
+		case "auth_failed":
+			j.Step = "B站登录鉴权失效或重复稿件，请更新 cookies.json"
 		default:
 			j.Step = "失败"
 		}
@@ -810,6 +812,13 @@ func classifyFailure(err, logs string) string {
 	switch {
 	case strings.Contains(s, "队列等待超时"), strings.Contains(s, "queue wait timeout"):
 		return "queue_timeout"
+	case strings.Contains(s, "code -663"), strings.Contains(s, "code: -663"), strings.Contains(s, `"code":-663`), strings.Contains(s, `"code": -663`),
+		strings.Contains(s, "鉴权失败"), strings.Contains(s, "登录凭证失效"),
+		strings.Contains(s, "code -101"), strings.Contains(s, "code: -101"), strings.Contains(s, `"code":-101`), strings.Contains(s, `"code": -101`),
+		strings.Contains(s, "code -400"), strings.Contains(s, "code: -400"), strings.Contains(s, `"code":-400`), strings.Contains(s, `"code": -400`),
+		strings.Contains(s, "重复稿件"), strings.Contains(s, "code 21070"), strings.Contains(s, "code: 21070"), strings.Contains(s, "code 21071"), strings.Contains(s, "code: 21071"),
+		strings.Contains(s, "code 21016"), strings.Contains(s, "code: 21016"), strings.Contains(s, "code 21017"), strings.Contains(s, "code: 21017"), strings.Contains(s, "code 21018"), strings.Contains(s, "code: 21018"):
+		return "auth_failed"
 	case strings.Contains(s, "code 406"), strings.Contains(s, `"code":406`),
 		strings.Contains(s, "code 601"), strings.Contains(s, `"code":601`),
 		strings.Contains(s, "code 21564"), strings.Contains(s, `"code":21564`),
@@ -3744,7 +3753,7 @@ func biliRepairActionFor(code int) biliRepairAction {
 	switch code {
 	case 0:
 		return biliRepairSuccess
-	case -101, 21016, 21017, 21018, 21070, 21071:
+	case -101, -400, -663, 21016, 21017, 21018, 21070, 21071:
 		return biliRepairStop
 	case 21020, 21021, 21022:
 		return biliRepairTitle
@@ -4157,6 +4166,10 @@ func (a *App) executeSingleBiliupUpload(ctx context.Context, q uploadReq, title,
 		case biliRepairStop:
 			if res.Code == 21070 || res.Code == 21071 {
 				execErr = fmt.Errorf("B站提示：检测到重复稿件或相同视频正在审核中 (code %d: %s)", res.Code, res.Message)
+			} else if res.Code == -663 {
+				execErr = fmt.Errorf("B站登录凭证鉴权失败 (code %d: %s)，请在控制台更新 cookies.json", res.Code, res.Message)
+			} else if res.Code == -400 {
+				execErr = fmt.Errorf("B站请求错误/凭证无效 (code %d: %s)，请检查 cookies.json 或视频参数", res.Code, res.Message)
 			} else {
 				execErr = fmt.Errorf("B站登录凭证失效 (code %d: %s)，请在控制台更新 cookies.json", res.Code, res.Message)
 			}
@@ -5898,15 +5911,45 @@ func (a *App) systemDiagnostics() map[string]any {
 	}
 }
 
+type flexibleBool bool
+
+func (b *flexibleBool) UnmarshalJSON(data []byte) error {
+	dataStr := strings.Trim(strings.TrimSpace(string(data)), "\"")
+	switch strings.ToLower(dataStr) {
+	case "true", "1":
+		*b = true
+		return nil
+	case "false", "0", "null", "":
+		*b = false
+		return nil
+	default:
+		var num float64
+		if err := json.Unmarshal(data, &num); err == nil {
+			*b = (num != 0)
+			return nil
+		}
+		*b = false
+		return nil
+	}
+}
+
+func (b flexibleBool) MarshalJSON() ([]byte, error) {
+	if b {
+		return []byte("true"), nil
+	}
+	return []byte("false"), nil
+}
+
 type cookieJSON struct {
-	Domain         string  `json:"domain"`
-	Path           string  `json:"path"`
-	Name           string  `json:"name"`
-	Value          string  `json:"value"`
-	Expires        int64   `json:"expires"`
-	ExpirationDate float64 `json:"expirationDate"`
-	HTTPOnly       bool    `json:"httpOnly"`
-	Secure         bool    `json:"secure"`
+	Domain         string       `json:"domain"`
+	Path           string       `json:"path"`
+	Name           string       `json:"name"`
+	Value          string       `json:"value"`
+	Expires        int64        `json:"expires"`
+	ExpirationDate float64      `json:"expirationDate"`
+	HTTPOnly       flexibleBool `json:"httpOnly"`
+	HTTPOnlySnake  flexibleBool `json:"http_only"`
+	Secure         flexibleBool `json:"secure"`
 }
 
 type cookieEnvelope struct {
@@ -5989,10 +6032,10 @@ func prepareCookies(src, dir string) (string, func(), error) {
 				exp = int64(c.ExpirationDate)
 			}
 			domain := c.Domain
-			if c.HTTPOnly {
+			if bool(c.HTTPOnly) || bool(c.HTTPOnlySnake) {
 				domain = "#HttpOnly_" + domain
 			}
-			fmt.Fprintf(tmp, "%s\t%s\t%s\t%s\t%d\t%s\t%s\n", domain, "TRUE", path, map[bool]string{true: "TRUE", false: "FALSE"}[c.Secure], exp, c.Name, strings.ReplaceAll(strings.ReplaceAll(c.Value, "\t", ""), "\n", ""))
+			fmt.Fprintf(tmp, "%s\t%s\t%s\t%s\t%d\t%s\t%s\n", domain, "TRUE", path, map[bool]string{true: "TRUE", false: "FALSE"}[bool(c.Secure)], exp, c.Name, strings.ReplaceAll(strings.ReplaceAll(c.Value, "\t", ""), "\n", ""))
 			wrote++
 		}
 		if err := tmp.Close(); err != nil {

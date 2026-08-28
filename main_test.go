@@ -236,7 +236,7 @@ func TestMagnetStreamingUploadProcessesCompletedFiles(t *testing.T) {
 
 func TestBiliRepairActionMatrix(t *testing.T) {
 	cases := map[int]biliRepairAction{
-		0: biliRepairSuccess, -101: biliRepairStop,
+		0: biliRepairSuccess, -101: biliRepairStop, -400: biliRepairStop, -663: biliRepairStop,
 		21016: biliRepairStop, 21017: biliRepairStop, 21018: biliRepairStop,
 		21020: biliRepairTitle, 21021: biliRepairTitle, 21022: biliRepairTitle,
 		21023: biliRepairDesc, 21024: biliRepairDesc, 21025: biliRepairDesc,
@@ -1542,6 +1542,100 @@ func TestConvertVttBOMAndEncodingSafety(t *testing.T) {
 	}
 	if len(header.Body) != 1 || header.Body[0].Content != "测试字幕带BOM" {
 		t.Fatalf("BCC body unexpected: %+v", header.Body)
+	}
+}
+
+func TestFlexibleBoolAndCookieParsing(t *testing.T) {
+	// Test flexibleBool json unmarshaling
+	type testStruct struct {
+		Flag flexibleBool `json:"flag"`
+	}
+	for _, tc := range []struct {
+		input string
+		want  bool
+	}{
+		{`{"flag": true}`, true},
+		{`{"flag": false}`, false},
+		{`{"flag": 1}`, true},
+		{`{"flag": 0}`, false},
+		{`{"flag": "true"}`, true},
+		{`{"flag": "false"}`, false},
+		{`{"flag": "1"}`, true},
+		{`{"flag": "0"}`, false},
+		{`{"flag": null}`, false},
+		{`{"flag": ""}`, false},
+	} {
+		var ts testStruct
+		if err := json.Unmarshal([]byte(tc.input), &ts); err != nil {
+			t.Fatalf("failed unmarshaling %q: %v", tc.input, err)
+		}
+		if bool(ts.Flag) != tc.want {
+			t.Fatalf("for %q got %v, want %v", tc.input, ts.Flag, tc.want)
+		}
+	}
+
+	// Test real-world Biliup cookie JSON with integer secure and http_only
+	dir := t.TempDir()
+	cookiePath := filepath.Join(dir, "cookies.json")
+	sampleCookies := `{
+		"cookie_info": {
+			"cookies": [
+				{
+					"domain": ".bilibili.com",
+					"expires": 1795712586,
+					"http_only": 1,
+					"name": "SESSDATA",
+					"same_site": 0,
+					"secure": 0,
+					"value": "sample_sessdata_value"
+				},
+				{
+					"domain": ".bilibili.com",
+					"expires": 1795712586,
+					"http_only": 0,
+					"name": "bili_jct",
+					"same_site": 0,
+					"secure": 0,
+					"value": "sample_csrf_jct"
+				}
+			]
+		}
+	}`
+	if err := os.WriteFile(cookiePath, []byte(sampleCookies), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	header, csrf, err := loadBiliCookieHeader(cookiePath)
+	if err != nil {
+		t.Fatalf("loadBiliCookieHeader failed on integer secure/http_only: %v", err)
+	}
+	if csrf != "sample_csrf_jct" {
+		t.Fatalf("expected csrf sample_csrf_jct, got %q", csrf)
+	}
+	if !strings.Contains(header, "SESSDATA=sample_sessdata_value") || !strings.Contains(header, "bili_jct=sample_csrf_jct") {
+		t.Fatalf("header missing cookie values: %s", header)
+	}
+}
+
+func TestAuthFailedFailureClassification(t *testing.T) {
+	cases := []struct {
+		err  string
+		logs string
+		want string
+	}{
+		{"exit status 1", "ResponseData { code: -663, data: None, message: \"鉴权失败，请联系账号组\" }", "auth_failed"},
+		{"exit status 1", "ResponseData { code: -400, data: None, message: \"请求错误\" }", "auth_failed"},
+		{"exit status 1", "B站登录凭证失效 (code -101)", "auth_failed"},
+		{"exit status 1", "code 21070: 重复稿件", "auth_failed"},
+	}
+	for _, tc := range cases {
+		got := classifyFailure(tc.err, tc.logs)
+		if got != tc.want {
+			t.Fatalf("classifyFailure(%q, %q) = %q, want %q", tc.err, tc.logs, got, tc.want)
+		}
+		if isAutoRetryableCategory(got) {
+			t.Fatalf("category %q should not be auto-retryable", got)
+		}
 	}
 }
 
