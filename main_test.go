@@ -1639,6 +1639,60 @@ func TestAuthFailedFailureClassification(t *testing.T) {
 	}
 }
 
+func TestAudioAndVideoContainerHelpers(t *testing.T) {
+	if !isPureAudioFilePath("test.m4a") || !isPureAudioFilePath("audio.mp3") || !isPureAudioFilePath("sound.aac") {
+		t.Fatal("audio extensions should be recognized as pure audio")
+	}
+	if isPureAudioFilePath("video.mp4") || isPureAudioFilePath("movie.mkv") {
+		t.Fatal("video containers should not be recognized as pure audio")
+	}
+	if !isVideoContainerFilePath("video.mp4") || !isVideoContainerFilePath("movie.mkv") || !isVideoContainerFilePath("clip.webm") {
+		t.Fatal("video containers should be recognized by isVideoContainerFilePath")
+	}
+	if isVideoContainerFilePath("test.m4a") || isVideoContainerFilePath("song.mp3") {
+		t.Fatal("audio files should not be recognized as video containers")
+	}
+}
+
+func TestYouTubeStreamingUploadIgnoresIntermediateAudioStreams(t *testing.T) {
+	dir := t.TempDir()
+	ytdlpMock := filepath.Join(dir, "ytdlp-mock.sh")
+	// Mock yt-dlp script that downloads video + audio separately, then merges to mp4 and deletes m4a
+	script := `#!/bin/sh
+outdir="$1"
+printf "audio-stream" > "$outdir/video1.f140.m4a"
+printf "video-stream" > "$outdir/video1.f137.mp4"
+sleep 0.1
+# ffmpeg merge simulation:
+printf "merged-video-data" > "$outdir/video1.mp4"
+rm -f "$outdir/video1.f140.m4a" "$outdir/video1.f137.mp4"
+echo "yt-dlp merge complete"
+`
+	if err := os.WriteFile(ytdlpMock, []byte(script), 0755); err != nil {
+		t.Fatal(err)
+	}
+	a := &App{cfg: Config{YTDLP: ytdlpMock}}
+	var uploaded []string
+	logs, files, err := a.runYouTubeStreamingUpload(context.Background(), []string{dir}, dir, nil, func(file string) error {
+		uploaded = append(uploaded, file)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("runYouTubeStreamingUpload returned error: %v", err)
+	}
+	if !strings.Contains(logs, "yt-dlp merge complete") {
+		t.Fatalf("logs missing expected completion string: %s", logs)
+	}
+	for _, up := range uploaded {
+		if strings.HasSuffix(up, ".m4a") {
+			t.Fatalf("intermediate audio file %s should not have been uploaded", up)
+		}
+	}
+	if len(uploaded) != 1 || !strings.HasSuffix(uploaded[0], "video1.mp4") {
+		t.Fatalf("expected uploaded single merged video1.mp4, got %v (files: %v)", uploaded, files)
+	}
+}
+
 
 
 

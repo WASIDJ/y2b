@@ -3267,7 +3267,16 @@ func (a *App) runYouTubeStreamingUpload(ctx context.Context, args []string, dir 
 		sort.Strings(files)
 
 		for _, path := range files {
-			if uploaded[path] || !isVideoFilePath(path) {
+			if uploaded[path] {
+				continue
+			}
+			// When running in real-time streaming mode, ignore standalone audio streams (e.g. .m4a)
+			// as yt-dlp downloads them separately before merging them into .mp4 containers.
+			// Only allow pure audio files if force=true (after yt-dlp exits) AND no video containers exist.
+			if !force && isPureAudioFilePath(path) {
+				continue
+			}
+			if !isVideoFilePath(path) {
 				continue
 			}
 			// Skip if yt-dlp temporary .part or .ytdl file exists
@@ -3275,6 +3284,19 @@ func (a *App) runYouTubeStreamingUpload(ctx context.Context, args []string, dir 
 				continue
 			}
 			if _, err := os.Stat(path + ".ytdl"); err == nil {
+				continue
+			}
+			base := strings.TrimSuffix(path, filepath.Ext(path))
+			if _, err := os.Stat(base + ".m4a.part"); err == nil {
+				continue
+			}
+			if _, err := os.Stat(base + ".webm.part"); err == nil {
+				continue
+			}
+			if _, err := os.Stat(base + ".mp4.part"); err == nil {
+				continue
+			}
+			if _, err := os.Stat(base + ".ytdl"); err == nil {
 				continue
 			}
 			info, err := os.Stat(path)
@@ -3452,6 +3474,19 @@ func (s *streamUploader) handleReadyVideo(file string) error {
 	}
 
 	return nil
+}
+
+func isPureAudioFilePath(path string) bool {
+	switch strings.ToLower(filepath.Ext(path)) {
+	case ".m4a", ".aac", ".wav", ".flac", ".ogg", ".opus", ".mp3":
+		return true
+	default:
+		return false
+	}
+}
+
+func isVideoContainerFilePath(path string) bool {
+	return isVideoFilePath(path) && !isPureAudioFilePath(path)
 }
 
 func isVideoFilePath(path string) bool {
@@ -3936,6 +3971,9 @@ func (a *App) prepareTranslatedPartFiles(ctx context.Context, files []string) ([
 		if translatedTitle == "" || translatedTitle == partTitle {
 			continue
 		}
+		if fi, err := os.Stat(file); err != nil || fi.IsDir() || fi.Size() == 0 {
+			continue
+		}
 		if tmpDir == "" {
 			var mkErr error
 			tmpDir, mkErr = os.MkdirTemp(filepath.Dir(file), ".y2b-translated-parts-")
@@ -3945,6 +3983,10 @@ func (a *App) prepareTranslatedPartFiles(ctx context.Context, files []string) ([
 			}
 		}
 		target := filepath.Join(tmpDir, safePartFilename(translatedTitle, i, filepath.Ext(file)))
+		absFile, absErr := filepath.Abs(file)
+		if absErr == nil {
+			file = absFile
+		}
 		if err := os.Symlink(file, target); err != nil {
 			continue
 		}
