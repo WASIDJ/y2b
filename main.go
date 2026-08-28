@@ -4248,6 +4248,19 @@ func (a *App) executeBiliupUpload(ctx context.Context, q uploadReq) (map[string]
 	return a.executeSingleBiliupUpload(ctx, q, title, desc, tags, tid)
 }
 
+func (a *App) autoRenewBiliCookie(ctx context.Context) error {
+	if a.cfg.BiliCookies == "" {
+		return errors.New("no bili cookies configured")
+	}
+	rCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(rCtx, a.cfg.Biliup, "-u", a.cfg.BiliCookies, "renew").CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("renew failed: %w: %s", err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
 func (a *App) executeSingleBiliupUpload(ctx context.Context, q uploadReq, title, desc, tags, tid string) (map[string]any, string, error) {
 	files := q.Files
 	if len(files) == 0 && q.File != "" {
@@ -4284,6 +4297,7 @@ func (a *App) executeSingleBiliupUpload(ctx context.Context, q uploadReq, title,
 
 	attempt := 0
 	useCover := (cover != "")
+	renewAttempted := false
 
 	for _, ep := range submitEndpoints {
 		attempt++
@@ -4340,6 +4354,15 @@ func (a *App) executeSingleBiliupUpload(ctx context.Context, q uploadReq, title,
 		// 2. Automated Code Analysis & Self-Healing Decision
 		switch biliRepairActionFor(res.Code) {
 		case biliRepairStop:
+			if (res.Code == -663 || res.Code == -101) && !renewAttempted {
+				renewAttempted = true
+				if rErr := a.autoRenewBiliCookie(ctx); rErr == nil {
+					totalLogs += fmt.Sprintf("[自动化自愈] 捕获凭证失效 (code %d: %s)，已通过 biliup renew 自动刷新 Token，正在重新尝试投稿...\n", res.Code, res.Message)
+					continue
+				} else {
+					totalLogs += fmt.Sprintf("[自动化自愈] 尝试 biliup renew 刷新 Token 失败: %v\n", rErr)
+				}
+			}
 			if res.Code == 21070 || res.Code == 21071 {
 				execErr = fmt.Errorf("B站提示：检测到重复稿件或相同视频正在审核中 (code %d: %s)", res.Code, res.Message)
 			} else if res.Code == -663 {
