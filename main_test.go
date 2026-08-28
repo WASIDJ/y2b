@@ -1821,6 +1821,41 @@ echo "split complete"
 	}
 }
 
+func TestBiliupAuthRenewOn663Mock(t *testing.T) {
+	bin, state := writeMockBiliup(t, `
+if echo "$*" | grep -q "renew"; then
+  echo "更新cookie成功"
+  exit 0
+fi
+n=0
+[ -f "$MOCK_STATE" ] && n=$(cat "$MOCK_STATE")
+n=$((n+1)); echo "$n" > "$MOCK_STATE"
+if [ "$n" -eq 1 ]; then
+  echo 'ResponseData { code: -663, data: None, message: "鉴权失败，请联系账号组" }'
+else
+  echo 'code: 0 BV1RenewOk1234 投稿成功'
+fi
+`)
+	video := filepath.Join(t.TempDir(), "video.mp4")
+	if err := os.WriteFile(video, []byte("test"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	a := &App{cfg: Config{Biliup: bin, BiliCookies: "fake_cookie.json"}}
+	oldState := os.Getenv("MOCK_STATE")
+	if err := os.Setenv("MOCK_STATE", state); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Setenv("MOCK_STATE", oldState)
+
+	out, logs, err := a.executeBiliupUpload(context.Background(), uploadReq{File: video, Title: "测试自动刷新Token"})
+	if err != nil {
+		t.Fatalf("expected renewed upload to succeed: %v; logs=%s", err, logs)
+	}
+	if out["bvid"] != "BV1RenewOk12" || !strings.Contains(logs, "自动刷新 Token") {
+		t.Fatalf("renew result missing: out=%v logs=%s", out, logs)
+	}
+}
+
 
 
 
