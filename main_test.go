@@ -1362,11 +1362,12 @@ func TestYouTubeStreamingUploadProcessesCompletedFiles(t *testing.T) {
 	dir := t.TempDir()
 	ytdlpMock := filepath.Join(dir, "ytdlp-mock.sh")
 	script := `#!/bin/sh
-printf "part-data" > "$1/01.mp4.part"
+outdir="$1"
+printf "\000\000\000\024ftypisom\000\000\002\000isom\000\000\000\020moov12345678" > "$outdir/01.mp4.part"
 sleep 0.1
-mv "$1/01.mp4.part" "$1/01.mp4"
-printf "WEBVTT\n" > "$1/01.en.vtt"
-printf "video2" > "$1/02.mp4"
+mv "$outdir/01.mp4.part" "$outdir/01.mp4"
+printf "WEBVTT\n" > "$outdir/01.en.vtt"
+printf "\000\000\000\024ftypisom\000\000\002\000isom\000\000\000\020moov12345678" > "$outdir/02.mp4"
 echo "yt-dlp done"
 `
 	if err := os.WriteFile(ytdlpMock, []byte(script), 0755); err != nil {
@@ -1662,10 +1663,10 @@ func TestYouTubeStreamingUploadIgnoresIntermediateAudioStreams(t *testing.T) {
 	script := `#!/bin/sh
 outdir="$1"
 printf "audio-stream" > "$outdir/video1.f140.m4a"
-printf "video-stream" > "$outdir/video1.f137.mp4"
+printf "\000\000\000\024ftypisom\000\000\002\000isom\000\000\000\020moov12345678" > "$outdir/video1.f137.mp4"
 sleep 0.1
 # ffmpeg merge simulation:
-printf "merged-video-data" > "$outdir/video1.mp4"
+printf "\000\000\000\024ftypisom\000\000\002\000isom\000\000\000\020moov12345678" > "$outdir/video1.mp4"
 rm -f "$outdir/video1.f140.m4a" "$outdir/video1.f137.mp4"
 echo "yt-dlp merge complete"
 `
@@ -1778,6 +1779,45 @@ echo "aria2 finished"
 	}
 	if len(uploaded) != 1 || !strings.HasSuffix(uploaded[0], "02_valid.mp4") {
 		t.Fatalf("expected only 02_valid.mp4 to be uploaded, got %v (files: %v)", uploaded, files)
+	}
+}
+
+func TestYouTubeStreamingUploadIgnoresParentVideoWhenSplittingChapters(t *testing.T) {
+	dir := t.TempDir()
+	ytdlpMock := filepath.Join(dir, "ytdlp-mock.sh")
+	script := `#!/bin/sh
+for last; do outdir="$last"; done
+# First, simulate downloading parent full video
+printf "\000\000\000\024ftypisom\000\000\002\000isom\000\000\000\020moov12345678" > "$outdir/P01. Full Course [abc1234].mp4"
+sleep 0.1
+# Next, simulate ffmpeg chapter splitting creating chapter files and removing parent video
+printf "\000\000\000\024ftypisom\000\000\002\000isom\000\000\000\020moov12345678" > "$outdir/P01 - C01. Introduction.mp4"
+printf "\000\000\000\024ftypisom\000\000\002\000isom\000\000\000\020moov12345678" > "$outdir/P01 - C02. Setup.mp4"
+rm -f "$outdir/P01. Full Course [abc1234].mp4"
+echo "split complete"
+`
+	if err := os.WriteFile(ytdlpMock, []byte(script), 0755); err != nil {
+		t.Fatal(err)
+	}
+	a := &App{cfg: Config{YTDLP: ytdlpMock}}
+	var uploaded []string
+	logs, files, err := a.runYouTubeStreamingUpload(context.Background(), []string{"--split-chapters", dir}, dir, nil, func(file string) error {
+		uploaded = append(uploaded, file)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("runYouTubeStreamingUpload returned error: %v", err)
+	}
+	if !strings.Contains(logs, "split complete") {
+		t.Fatalf("logs missing completion string: %s", logs)
+	}
+	for _, up := range uploaded {
+		if strings.Contains(up, "Full Course") {
+			t.Fatalf("parent un-split video %s should not have been uploaded during split chapters", up)
+		}
+	}
+	if len(uploaded) != 2 {
+		t.Fatalf("expected 2 split chapter files uploaded, got %v (files: %v)", uploaded, files)
 	}
 }
 
