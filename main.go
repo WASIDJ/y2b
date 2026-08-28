@@ -3270,6 +3270,14 @@ func (a *App) runYouTubeStreamingUpload(ctx context.Context, args []string, dir 
 	uploaded := make(map[string]bool)
 	var uploadedFiles []string
 
+	hasSplitChapters := false
+	for _, a := range args {
+		if a == "--split-chapters" {
+			hasSplitChapters = true
+			break
+		}
+	}
+
 	scanReady := func(force bool) error {
 		var firstErr error
 		files, _ := filepath.Glob(filepath.Join(dir, "*"))
@@ -3287,6 +3295,14 @@ func (a *App) runYouTubeStreamingUpload(ctx context.Context, args []string, dir 
 			}
 			if !isVideoFilePath(path) {
 				continue
+			}
+			// If chapter splitting is active, skip parent un-split video files during active streaming,
+			// because yt-dlp will postprocess them into individual chapters (e.g. - C01) and delete the parent.
+			if !force && hasSplitChapters {
+				baseName := filepath.Base(path)
+				if !strings.Contains(baseName, " - C") && !strings.Contains(baseName, " - P") {
+					continue
+				}
 			}
 			// Skip if yt-dlp temporary .part or .ytdl file exists
 			if _, err := os.Stat(path + ".part"); err == nil {
@@ -3306,6 +3322,10 @@ func (a *App) runYouTubeStreamingUpload(ctx context.Context, args []string, dir 
 				continue
 			}
 			if _, err := os.Stat(base + ".ytdl"); err == nil {
+				continue
+			}
+			// Verify media container integrity (ensure moov atom and complete headers)
+			if !validateMediaIntegrity(path) {
 				continue
 			}
 			info, err := os.Stat(path)
