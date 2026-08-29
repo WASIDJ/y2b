@@ -3182,7 +3182,11 @@ func (a *App) runMagnetStreamingUpload(ctx context.Context, args []string, dir s
 			}
 			if err := upload(path); err != nil {
 				firstErr = err
-				return filepath.SkipAll
+				if force {
+					return filepath.SkipAll
+				}
+				// During real-time streaming, don't abort aria2c downloading just because one piece had an upload error
+				return nil
 			}
 			uploaded[path] = true
 			uploadedFiles = append(uploadedFiles, path)
@@ -3230,10 +3234,7 @@ func (a *App) runMagnetStreamingUpload(ctx context.Context, args []string, dir s
 					return strings.TrimSpace(capture.String()), uploadedFiles, fmt.Errorf("磁盘空间不足 (可用空间仅 %.1f GB，安全门限 >= %.1f GB)，暂停下载以防写满磁盘", disk.FreeGB, a.cfg.MinFreeDiskGB)
 				}
 			}
-			if err := uploadReady(false); err != nil {
-				_ = c.Process.Kill()
-				return strings.TrimSpace(capture.String()), uploadedFiles, err
-			}
+			_ = uploadReady(false)
 		case <-ctx.Done():
 			_ = c.Process.Kill()
 			return strings.TrimSpace(capture.String()), uploadedFiles, ctx.Err()
@@ -3285,6 +3286,10 @@ func (a *App) runYouTubeStreamingUpload(ctx context.Context, args []string, dir 
 
 		for _, path := range files {
 			if uploaded[path] {
+				continue
+			}
+			// Ignore yt-dlp intermediate unmerged video/audio streams (e.g. *.f136.mp4, *.f140.m4a)
+			if isIntermediateStreamFilePath(path) {
 				continue
 			}
 			// When running in real-time streaming mode, ignore standalone audio streams (e.g. .m4a)
@@ -3506,6 +3511,13 @@ func (s *streamUploader) handleReadyVideo(file string) error {
 	return nil
 }
 
+var ytIntermediateStreamRe = regexp.MustCompile(`(?i)\.(f\d+(?:-\d+)?|temp)\.[a-zA-Z0-9]+$`)
+
+func isIntermediateStreamFilePath(path string) bool {
+	base := filepath.Base(path)
+	return ytIntermediateStreamRe.MatchString(base)
+}
+
 func isPureAudioFilePath(path string) bool {
 	switch strings.ToLower(filepath.Ext(path)) {
 	case ".m4a", ".aac", ".wav", ".flac", ".ogg", ".opus", ".mp3":
@@ -3516,7 +3528,7 @@ func isPureAudioFilePath(path string) bool {
 }
 
 func isVideoContainerFilePath(path string) bool {
-	return isVideoFilePath(path) && !isPureAudioFilePath(path)
+	return isVideoFilePath(path) && !isPureAudioFilePath(path) && !isIntermediateStreamFilePath(path)
 }
 
 func isVideoFilePath(path string) bool {
@@ -4285,10 +4297,15 @@ func (a *App) executeSingleBiliupUpload(ctx context.Context, q uploadReq, title,
 	cover = a.sanitizeBiliCover(ctx, cover, q.Progress)
 
 	// Multi-endpoint submission with smart auto-healing
-	// Prioritize b-cut-android and app to minimize web 406 rate limiting
+	// Prioritize configured endpoint (e.g. b-cut-android) and fallback across remaining endpoints
 	submitEndpoints := []string{"b-cut-android", "app", "web"}
 	if a.cfg.SubmitEndpoint != "" && a.cfg.SubmitEndpoint != "auto" {
 		submitEndpoints = []string{a.cfg.SubmitEndpoint}
+		for _, fallbackEp := range []string{"b-cut-android", "app", "web"} {
+			if fallbackEp != a.cfg.SubmitEndpoint {
+				submitEndpoints = append(submitEndpoints, fallbackEp)
+			}
+		}
 	}
 	var totalLogs string
 	var execErr error
