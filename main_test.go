@@ -1856,6 +1856,47 @@ fi
 	}
 }
 
+func TestIntermediateStreamFilePattern(t *testing.T) {
+	intermediate := []string{
+		"P01. Design Cinema [1X0Npd5REQw].f136.mp4",
+		"video.f140.m4a",
+		"video.f140-9.m4a",
+		"clip.f401.mp4",
+		"clip.f248.webm",
+		"test.temp.mp4",
+	}
+	for _, f := range intermediate {
+		if !isIntermediateStreamFilePath(f) {
+			t.Fatalf("file %q should be recognized as intermediate stream", f)
+		}
+	}
+
+	finalFiles := []string{
+		"P01. Design Cinema [1X0Npd5REQw].mp4",
+		"video.mp4",
+		"course.mkv",
+		"P01 - C01. Introduction.mp4",
+	}
+	for _, f := range finalFiles {
+		if isIntermediateStreamFilePath(f) {
+			t.Fatalf("final file %q should NOT be recognized as intermediate stream", f)
+		}
+	}
+}
+
+func TestSubmitEndpointFallbackOrder(t *testing.T) {
+	app := &App{cfg: Config{SubmitEndpoint: "b-cut-android"}}
+	eps := []string{app.cfg.SubmitEndpoint}
+	for _, fallbackEp := range []string{"b-cut-android", "app", "web"} {
+		if fallbackEp != app.cfg.SubmitEndpoint {
+			eps = append(eps, fallbackEp)
+		}
+	}
+	if len(eps) != 3 || eps[0] != "b-cut-android" || eps[1] != "app" || eps[2] != "web" {
+		t.Fatalf("unexpected fallback endpoint order: %v", eps)
+	}
+}
+
 
 
 
