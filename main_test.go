@@ -1897,6 +1897,35 @@ func TestSubmitEndpointFallbackOrder(t *testing.T) {
 	}
 }
 
+func TestBiliupLineConfigPassing(t *testing.T) {
+	bin, state := writeMockBiliup(t, `
+echo "$*" > "$MOCK_STATE"
+echo 'code: 0 BV1LineCheck123 投稿成功'
+`)
+	video := filepath.Join(t.TempDir(), "video.mp4")
+	if err := os.WriteFile(video, []byte("test"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	a := &App{cfg: Config{Biliup: bin, BiliCookies: "fake.json", BiliLine: "kodo"}}
+	oldState := os.Getenv("MOCK_STATE")
+	if err := os.Setenv("MOCK_STATE", state); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Setenv("MOCK_STATE", oldState)
+
+	out, _, err := a.executeBiliupUpload(context.Background(), uploadReq{File: video, Title: "Line Test"})
+	if err != nil {
+		t.Fatalf("upload failed: %v", err)
+	}
+	if out["bvid"] != "BV1LineCheck" {
+		t.Fatalf("unexpected bvid: %v", out["bvid"])
+	}
+	content, _ := os.ReadFile(state)
+	if !strings.Contains(string(content), "--line kodo") {
+		t.Fatalf("biliup arguments missing --line kodo: %s", string(content))
+	}
+}
+
 
 
 

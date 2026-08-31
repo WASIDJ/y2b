@@ -75,6 +75,7 @@ type Config struct {
 	MinFreeDiskGB    float64
 	MaxJobDiskGB     float64
 	SubmitEndpoint   string
+	BiliLine         string
 }
 
 type MonitoredChannel struct {
@@ -319,6 +320,7 @@ func loadConfig() Config {
 		}
 	}
 	submitEndpoint := env("Y2B_BILIUP_SUBMIT_ENDPOINT", "b-cut-android")
+	biliLine := env("Y2B_BILIUP_LINE", env("Y2B_BILI_LINE", ""))
 
 	return Config{
 		Addr:             env("Y2B_ADDR", "127.0.0.1:8765"),
@@ -348,6 +350,7 @@ func loadConfig() Config {
 		MinFreeDiskGB:    minFreeDiskGB,
 		MaxJobDiskGB:     maxJobDiskGB,
 		SubmitEndpoint:   submitEndpoint,
+		BiliLine:         biliLine,
 	}
 }
 
@@ -4352,6 +4355,9 @@ func (a *App) executeSingleBiliupUpload(ctx context.Context, q uploadReq, title,
 			}
 		}
 		args = append(args, "--limit", limit, "--submit", ep, "--extra-fields", `{"open_subtitle":true}`)
+		if a.cfg.BiliLine != "" && a.cfg.BiliLine != "auto" {
+			args = append(args, "--line", a.cfg.BiliLine)
+		}
 
 		epLogs, err := runCmdProgress(ctx, a.cfg.Biliup, args, q.Progress)
 		totalLogs += fmt.Sprintf("[%s 提交尝试 #%d]\n%s\n", ep, attempt, epLogs)
