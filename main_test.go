@@ -7,13 +7,14 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
-
 
 func TestAcquireSlotTimesOut(t *testing.T) {
 	slot := make(chan struct{}, 1)
@@ -427,8 +428,6 @@ func TestFailureCategoriesOnlyRetryTransientErrors(t *testing.T) {
 	}
 }
 
-
-
 func TestBiliupEndpointFallbackMock(t *testing.T) {
 	bin, state := writeMockBiliup(t, `
 n=0
@@ -789,6 +788,151 @@ func TestLoginRateLimiting(t *testing.T) {
 	a.loginHandler(w2, req2)
 	if w2.Code != 429 {
 		t.Fatalf("expected locked IP to be rejected with 429 even with correct password, got %d", w2.Code)
+	}
+}
+
+func TestLoginUsesHttpOnlyCookieWithoutReturningToken(t *testing.T) {
+	a := &App{cfg: Config{
+		AdminUser:      "admin",
+		AdminPass:      "correct-password",
+		SecretKey:      "secret-key-123456789012345678901234",
+		TrustedProxies: []netip.Prefix{netip.MustParsePrefix("127.0.0.1/32")},
+	}}
+	req := httptest.NewRequest("POST", "/api/login", strings.NewReader(`{"username":"admin","password":"correct-password"}`))
+	req.RemoteAddr = "127.0.0.1:1234"
+	req.Header.Set("X-Forwarded-Proto", "https")
+	w := httptest.NewRecorder()
+	a.loginHandler(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected successful login, got %d: %s", w.Code, w.Body.String())
+	}
+	var response map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if _, exposed := response["token"]; exposed {
+		t.Fatalf("login response exposed the session token: %s", w.Body.String())
+	}
+	cookies := w.Result().Cookies()
+	if len(cookies) != 1 || cookies[0].Name != "y2b_token" || !cookies[0].HttpOnly || !cookies[0].Secure {
+		t.Fatalf("unexpected session cookie: %+v", cookies)
+	}
+}
+
+func TestTrustedProxyControlsForwardedClientIdentity(t *testing.T) {
+	a := &App{cfg: Config{TrustedProxies: []netip.Prefix{netip.MustParsePrefix("127.0.0.1/32")}}}
+	untrusted := httptest.NewRequest("GET", "/", nil)
+	untrusted.RemoteAddr = "203.0.113.8:1234"
+	untrusted.Header.Set("X-Forwarded-For", "198.51.100.9")
+	if got := a.getClientIP(untrusted); got != "203.0.113.8" {
+		t.Fatalf("untrusted peer spoofed client IP: %q", got)
+	}
+
+	trusted := httptest.NewRequest("GET", "/", nil)
+	trusted.RemoteAddr = "127.0.0.1:1234"
+	trusted.Header.Set("X-Forwarded-For", "192.0.2.4, 198.51.100.7")
+	if got := a.getClientIP(trusted); got != "198.51.100.7" {
+		t.Fatalf("trusted proxy chain returned %q", got)
+	}
+}
+
+func TestBearerAuthenticationRequiresExplicitOptIn(t *testing.T) {
+	a := &App{cfg: Config{AdminUser: "admin", AdminPass: "configured", SecretKey: "secret-key-123456789012345678901234"}}
+	token := a.createToken("admin")
+	req := httptest.NewRequest("GET", "/api/jobs", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	if a.isAuthorized(req) {
+		t.Fatal("bearer authentication should be disabled by default")
+	}
+	a.cfg.AllowBearerAuth = true
+	if !a.isAuthorized(req) {
+		t.Fatal("bearer authentication should work after explicit opt-in")
+	}
+}
+
+func TestSnapshotsDoNotShareMutableState(t *testing.T) {
+	a := &App{
+		jobs: map[string]*Job{"job": {
+			ID: "job", Status: "running",
+			Input:    map[string]any{"tags": []string{"original"}},
+			Output:   map[string]any{"state": "first"},
+			Progress: &JobProgress{Percent: 10},
+		}},
+		order: []string{"job"},
+		channels: map[string]*MonitoredChannel{"channel": {
+			ID: "channel", SyncedIDs: map[string]bool{"video-1": true},
+		}},
+		channelOrder: []string{"channel"},
+	}
+	jobSnapshot := a.listJobs("", "")[0]
+	channelSnapshot := a.listChannels()[0]
+
+	a.jobs["job"].Input.(map[string]any)["tags"].([]string)[0] = "changed"
+	a.jobs["job"].Output.(map[string]any)["state"] = "changed"
+	a.jobs["job"].Progress.Percent = 99
+	a.channels["channel"].SyncedIDs["video-2"] = true
+
+	if jobSnapshot.Progress.Percent != 10 || jobSnapshot.Output.(map[string]any)["state"] != "first" {
+		t.Fatalf("job snapshot changed with live state: %+v", jobSnapshot)
+	}
+	tags := jobSnapshot.Input.(map[string]any)["tags"].([]any)
+	if tags[0] != "original" {
+		t.Fatalf("nested input was not cloned: %+v", tags)
+	}
+	if channelSnapshot.SyncedIDs["video-2"] {
+		t.Fatalf("channel snapshot shares SyncedIDs: %+v", channelSnapshot.SyncedIDs)
+	}
+}
+
+func TestConcurrentJobSnapshotsAndPersistence(t *testing.T) {
+	dir := t.TempDir()
+	a := &App{
+		cfg:   Config{DataDir: dir},
+		jobs:  map[string]*Job{"job": {ID: "job", Status: "running", Output: map[string]any{"iteration": 0}}},
+		order: []string{"job"},
+	}
+	var wg sync.WaitGroup
+	for worker := 0; worker < 8; worker++ {
+		wg.Add(1)
+		go func(worker int) {
+			defer wg.Done()
+			for iteration := 0; iteration < 40; iteration++ {
+				a.mu.Lock()
+				a.jobs["job"].Output = map[string]any{"worker": worker, "iteration": iteration}
+				a.jobs["job"].Progress = &JobProgress{Percent: float64(iteration)}
+				a.mu.Unlock()
+				a.saveJobs()
+				if _, err := json.Marshal(a.listJobs("", "")); err != nil {
+					t.Errorf("snapshot JSON failed: %v", err)
+					return
+				}
+			}
+		}(worker)
+	}
+	wg.Wait()
+	b, err := os.ReadFile(a.jobsFilePath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var jobs []map[string]any
+	if err := json.Unmarshal(b, &jobs); err != nil || len(jobs) != 1 {
+		t.Fatalf("invalid persisted jobs: jobs=%v err=%v body=%s", jobs, err, b)
+	}
+	leftovers, err := filepath.Glob(filepath.Join(dir, ".jobs.json.tmp-*"))
+	if err != nil || len(leftovers) != 0 {
+		t.Fatalf("temporary files leaked: %v err=%v", leftovers, err)
+	}
+}
+
+func TestHTTPServerUsesBoundedAPIWriteTimeout(t *testing.T) {
+	a := &App{cfg: Config{Addr: "127.0.0.1:0", APIWriteTimeout: 45 * time.Second}}
+	server := newHTTPServer(a)
+	if server.WriteTimeout != 45*time.Second {
+		t.Fatalf("unexpected API write timeout: %s", server.WriteTimeout)
+	}
+	a.cfg.APIWriteTimeout = 0
+	if fallback := newHTTPServer(a).WriteTimeout; fallback != 2*time.Minute {
+		t.Fatalf("unexpected fallback API write timeout: %s", fallback)
 	}
 }
 
@@ -1217,11 +1361,11 @@ func TestSystemDiagnosticsDiskFields(t *testing.T) {
 	dir := t.TempDir()
 	app := &App{
 		cfg: Config{
-			DataDir:        dir,
-			MinFreeDiskGB:  5.0,
-			MaxJobDiskGB:   40.0,
-			BiliCookies:    filepath.Join(dir, "cookies.json"),
-			ChannelsFile:   filepath.Join(dir, "channels.json"),
+			DataDir:       dir,
+			MinFreeDiskGB: 5.0,
+			MaxJobDiskGB:  40.0,
+			BiliCookies:   filepath.Join(dir, "cookies.json"),
+			ChannelsFile:  filepath.Join(dir, "channels.json"),
 		},
 		jobs:     map[string]*Job{},
 		channels: map[string]*MonitoredChannel{},
@@ -1935,14 +2079,3 @@ echo 'code: 0 BV1LineCheck123 投稿成功'
 		t.Fatalf("biliup arguments missing --line kodo: %s", string(content))
 	}
 }
-
-
-
-
-
-
-
-
-
-
-

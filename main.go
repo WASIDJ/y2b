@@ -19,6 +19,7 @@ import (
 	"math"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"os"
 	"os/exec"
@@ -45,7 +46,6 @@ var (
 	BuildTime       = "unknown"
 	serverStartTime = time.Now()
 )
-
 
 type Config struct {
 	Addr             string
@@ -76,6 +76,10 @@ type Config struct {
 	MaxJobDiskGB     float64
 	SubmitEndpoint   string
 	BiliLine         string
+	TrustedProxies   []netip.Prefix
+	AllowBearerAuth  bool
+	APIWriteTimeout  time.Duration
+	FileWriteTimeout time.Duration
 }
 
 type MonitoredChannel struct {
@@ -168,6 +172,7 @@ type App struct {
 	loginAttempts       map[string]*loginAttempt
 	mediaCacheMu        sync.Mutex
 	mediaCache          mediaScanCache
+	jobsSaveMu          sync.Mutex
 }
 
 func env(k, d string) string {
@@ -175,6 +180,40 @@ func env(k, d string) string {
 		return v
 	}
 	return d
+}
+
+func envBool(k string, d bool) bool {
+	raw := strings.TrimSpace(os.Getenv(k))
+	if raw == "" {
+		return d
+	}
+	v, err := strconv.ParseBool(raw)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[y2b] WARNING: invalid boolean %s=%q; using %t\n", k, raw, d)
+		return d
+	}
+	return v
+}
+
+func parseTrustedProxies(raw string) []netip.Prefix {
+	var prefixes []netip.Prefix
+	for _, item := range strings.Split(raw, ",") {
+		item = strings.TrimSpace(item)
+		if item == "" {
+			continue
+		}
+		prefix, err := netip.ParsePrefix(item)
+		if err != nil {
+			if addr, addrErr := netip.ParseAddr(item); addrErr == nil {
+				prefix = netip.PrefixFrom(addr.Unmap(), addr.BitLen())
+			} else {
+				fmt.Fprintf(os.Stderr, "[y2b] WARNING: ignoring invalid trusted proxy %q\n", item)
+				continue
+			}
+		}
+		prefixes = append(prefixes, prefix.Masked())
+	}
+	return prefixes
 }
 
 // loadOrCreateSecretKey reads the HMAC signing key from <dataDir>/.secret_key.
@@ -321,6 +360,19 @@ func loadConfig() Config {
 	}
 	submitEndpoint := env("Y2B_BILIUP_SUBMIT_ENDPOINT", "b-cut-android")
 	biliLine := env("Y2B_BILIUP_LINE", env("Y2B_BILI_LINE", ""))
+	trustedProxies := parseTrustedProxies(env("Y2B_TRUSTED_PROXIES", "127.0.0.1/32,::1/128"))
+	apiWriteTimeout := 2 * time.Minute
+	if raw := os.Getenv("Y2B_API_WRITE_TIMEOUT"); raw != "" {
+		if parsed, err := time.ParseDuration(raw); err == nil && parsed > 0 {
+			apiWriteTimeout = parsed
+		}
+	}
+	fileWriteTimeout := 6 * time.Hour
+	if raw := os.Getenv("Y2B_FILE_WRITE_TIMEOUT"); raw != "" {
+		if parsed, err := time.ParseDuration(raw); err == nil && parsed > 0 {
+			fileWriteTimeout = parsed
+		}
+	}
 
 	return Config{
 		Addr:             env("Y2B_ADDR", "127.0.0.1:8765"),
@@ -351,9 +403,12 @@ func loadConfig() Config {
 		MaxJobDiskGB:     maxJobDiskGB,
 		SubmitEndpoint:   submitEndpoint,
 		BiliLine:         biliLine,
+		TrustedProxies:   trustedProxies,
+		AllowBearerAuth:  envBool("Y2B_ALLOW_BEARER_AUTH", false),
+		APIWriteTimeout:  apiWriteTimeout,
+		FileWriteTimeout: fileWriteTimeout,
 	}
 }
-
 
 func id() string {
 	b := make([]byte, 8)
@@ -365,22 +420,66 @@ func (a *App) jobsFilePath() string {
 	return filepath.Join(a.cfg.DataDir, "jobs.json")
 }
 
+// replaceFile writes and fsyncs a uniquely named temporary file before the
+// atomic rename. Unique names keep unrelated writers from sharing a .tmp file.
+func replaceFile(path string, data []byte, perm os.FileMode) (err error) {
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, "."+filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer func() {
+		_ = tmp.Close()
+		if err != nil {
+			_ = os.Remove(tmpName)
+		}
+	}()
+	if err = tmp.Chmod(perm); err != nil {
+		return err
+	}
+	if _, err = tmp.Write(data); err != nil {
+		return err
+	}
+	if err = tmp.Sync(); err != nil {
+		return err
+	}
+	if err = tmp.Close(); err != nil {
+		return err
+	}
+	if err = os.Rename(tmpName, path); err != nil {
+		return err
+	}
+	if dirHandle, openErr := os.Open(dir); openErr == nil {
+		err = dirHandle.Sync()
+		_ = dirHandle.Close()
+	}
+	return err
+}
+
 // writeAtomic keeps the last known-good state available if the process or host
 // loses power while persisting a queue/configuration file.
 func writeAtomic(path string, data []byte, perm os.FileMode) error {
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, perm); err != nil {
-		return err
-	}
 	if old, err := os.ReadFile(path); err == nil && len(old) > 0 {
-		_ = os.WriteFile(path+".bak", old, perm)
+		if err := replaceFile(path+".bak", old, perm); err != nil {
+			return fmt.Errorf("write backup: %w", err)
+		}
+	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("read current state: %w", err)
 	}
-	return os.Rename(tmp, path)
+	if err := replaceFile(path, data, perm); err != nil {
+		return fmt.Errorf("replace state: %w", err)
+	}
+	return nil
 }
 
 func (a *App) saveJobs() {
+	// Serialize snapshot creation and replacement so an older caller can never
+	// overwrite a newer state after being delayed during disk I/O.
+	a.jobsSaveMu.Lock()
+	defer a.jobsSaveMu.Unlock()
+
 	a.mu.RLock()
-	defer a.mu.RUnlock()
 
 	type persistedJob struct {
 		ID              string       `json:"id"`
@@ -430,10 +529,14 @@ func (a *App) saveJobs() {
 			})
 		}
 	}
-
 	b, err := json.MarshalIndent(list, "", "  ")
-	if err == nil {
-		_ = writeAtomic(a.jobsFilePath(), b, 0640)
+	a.mu.RUnlock()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[y2b] failed to encode jobs state: %v\n", err)
+		return
+	}
+	if err := writeAtomic(a.jobsFilePath(), b, 0640); err != nil {
+		fmt.Fprintf(os.Stderr, "[y2b] failed to persist jobs state: %v\n", err)
 	}
 }
 
@@ -807,7 +910,6 @@ func (a *App) retryDelayFor(category string, retryNo int) time.Duration {
 	}
 	return base * time.Duration(1<<(retryNo-1))
 }
-
 
 // classifyFailure turns noisy external-tool output into a stable category that
 // the UI and the bounded recovery loop can act on.
@@ -1299,6 +1401,43 @@ func (a *App) acquireSlot(ctx context.Context, slot chan struct{}) error {
 	}
 }
 
+func cloneJSONValue(value any) any {
+	if value == nil {
+		return nil
+	}
+	b, err := json.Marshal(value)
+	if err != nil {
+		return nil
+	}
+	var cloned any
+	if err := json.Unmarshal(b, &cloned); err != nil {
+		return nil
+	}
+	return cloned
+}
+
+// snapshotJobLocked returns an API-safe copy that shares no mutable maps,
+// slices or pointers with the worker-owned job. The caller must hold a.mu.
+func snapshotJobLocked(j *Job, includeLogs bool) *Job {
+	if j == nil {
+		return nil
+	}
+	copy := *j
+	copy.Input = cloneJSONValue(j.Input)
+	copy.Output = cloneJSONValue(j.Output)
+	if j.Progress != nil {
+		progress := *j.Progress
+		copy.Progress = &progress
+	}
+	if !includeLogs {
+		copy.Logs = ""
+	}
+	copy.ctx = nil
+	copy.cancelFunc = nil
+	copy.retry = nil
+	return &copy
+}
+
 func (a *App) listJobs(status, kind string) []*Job {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
@@ -1316,9 +1455,7 @@ func (a *App) listJobs(status, kind string) []*Job {
 		}
 		// The queue view does not need live logs. Omitting them keeps a single
 		// polling response small even after many ffmpeg/aria2c jobs.
-		copy := *j
-		copy.Logs = ""
-		result = append(result, &copy)
+		result = append(result, snapshotJobLocked(j, false))
 	}
 	return result
 }
@@ -1756,14 +1893,14 @@ func (a *App) retryJobWithCount(jobID string, resetCount bool) (*Job, error) {
 	// a canceled worker from writing its final state into the retried attempt.
 	ctx, cancel := context.WithCancel(context.Background())
 	j := &Job{
-		ID:             id(),
-		Kind:           retryKind,
-		Status:         "queued",
-		Step:           "排队中",
-		Created:        time.Now(),
-		Input:          retryInput,
-		ctx:            ctx,
-		cancelFunc:     cancel,
+		ID:         id(),
+		Kind:       retryKind,
+		Status:     "queued",
+		Step:       "排队中",
+		Created:    time.Now(),
+		Input:      retryInput,
+		ctx:        ctx,
+		cancelFunc: cancel,
 		AutoRetryCount: func() int {
 			if resetCount {
 				return 0
@@ -4504,7 +4641,6 @@ finish:
 	return res, totalLogs, execErr
 }
 
-
 func (a *App) waitUploadCooldown(ctx context.Context) error {
 	for {
 		a.mu.RLock()
@@ -4889,7 +5025,6 @@ func freeTranslateCtx(ctx context.Context, text, targetLang string) (string, err
 	}
 	return strings.TrimSpace(sb.String()), nil
 }
-
 
 func extractSmartKeywords(title, defaultTags string) []string {
 	tagMap := make(map[string]bool)
@@ -5417,7 +5552,14 @@ func (a *App) listChannels() []*MonitoredChannel {
 	out := make([]*MonitoredChannel, 0, len(a.channelOrder))
 	for _, id := range a.channelOrder {
 		if ch := a.channels[id]; ch != nil {
-			out = append(out, ch)
+			copy := *ch
+			if ch.SyncedIDs != nil {
+				copy.SyncedIDs = make(map[string]bool, len(ch.SyncedIDs))
+				for syncedID, synced := range ch.SyncedIDs {
+					copy.SyncedIDs[syncedID] = synced
+				}
+			}
+			out = append(out, &copy)
 		}
 	}
 	return out
@@ -6103,20 +6245,20 @@ func (a *App) systemDiagnostics() map[string]any {
 		"time":              time.Now().Format(time.RFC3339),
 		"data_dir":          a.cfg.DataDir,
 		"total_jobs":        totalJobs,
-		"running_jobs":  runningJobs,
-		"ram":           ram,
-		"rom":           rom,
-		"disk_free_gb":     rom.FreeGB,
-		"disk_total_gb":    rom.TotalGB,
-		"min_free_disk_gb": a.cfg.MinFreeDiskGB,
-		"max_job_disk_gb":  a.cfg.MaxJobDiskGB,
+		"running_jobs":      runningJobs,
+		"ram":               ram,
+		"rom":               rom,
+		"disk_free_gb":      rom.FreeGB,
+		"disk_total_gb":     rom.TotalGB,
+		"min_free_disk_gb":  a.cfg.MinFreeDiskGB,
+		"max_job_disk_gb":   a.cfg.MaxJobDiskGB,
 		"disk_used_pct": func() float64 {
 			if rom.TotalGB > 0 {
 				return (rom.TotalGB - rom.FreeGB) / rom.TotalGB * 100
 			}
 			return 0
 		}(),
-		"disk_warning": rom.TotalGB > 0 && rom.FreeGB < a.cfg.MinFreeDiskGB,
+		"disk_warning":  rom.TotalGB > 0 && rom.FreeGB < a.cfg.MinFreeDiskGB,
 		"cpu":           cpu,
 		"network":       netInfo,
 		"traffic_stats": trafficStats,
@@ -6790,9 +6932,10 @@ func (a *App) isAuthorized(r *http.Request) bool {
 	if c, err := r.Cookie("y2b_token"); err == nil && c != nil && a.verifyToken(c.Value) {
 		return true
 	}
-	// Check Authorization header
+	// Bearer tokens expose the session to JavaScript and logs, so API clients
+	// must explicitly opt in. Browser sessions use the HttpOnly cookie above.
 	authHeader := r.Header.Get("Authorization")
-	if strings.HasPrefix(authHeader, "Bearer ") {
+	if a.cfg.AllowBearerAuth && strings.HasPrefix(authHeader, "Bearer ") {
 		token := strings.TrimPrefix(authHeader, "Bearer ")
 		if a.verifyToken(token) {
 			return true
@@ -6801,21 +6944,66 @@ func (a *App) isAuthorized(r *http.Request) bool {
 	return false
 }
 
-func getClientIP(r *http.Request) string {
-	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		parts := strings.Split(xff, ",")
-		if len(parts) > 0 && strings.TrimSpace(parts[0]) != "" {
-			return strings.TrimSpace(parts[0])
+func requestPeerIP(r *http.Request) (netip.Addr, bool) {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		host = strings.TrimSpace(r.RemoteAddr)
+	}
+	addr, err := netip.ParseAddr(host)
+	if err != nil {
+		return netip.Addr{}, false
+	}
+	return addr.Unmap(), true
+}
+
+func proxyIsTrusted(addr netip.Addr, prefixes []netip.Prefix) bool {
+	for _, prefix := range prefixes {
+		if prefix.Contains(addr) {
+			return true
 		}
 	}
-	if xri := r.Header.Get("X-Real-IP"); xri != "" {
-		return strings.TrimSpace(xri)
+	return false
+}
+
+func (a *App) getClientIP(r *http.Request) string {
+	peer, ok := requestPeerIP(r)
+	if !ok {
+		return r.RemoteAddr
 	}
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err == nil {
-		return host
+	if !proxyIsTrusted(peer, a.cfg.TrustedProxies) {
+		return peer.String()
 	}
-	return r.RemoteAddr
+
+	// Walk the proxy chain from the closest hop to the client and select the
+	// first untrusted address. This prevents clients from prepending a spoofed
+	// value when one or more trusted reverse proxies append their own hop.
+	parts := strings.Split(r.Header.Get("X-Forwarded-For"), ",")
+	for i := len(parts) - 1; i >= 0; i-- {
+		forwarded, err := netip.ParseAddr(strings.TrimSpace(parts[i]))
+		if err != nil {
+			continue
+		}
+		forwarded = forwarded.Unmap()
+		if !proxyIsTrusted(forwarded, a.cfg.TrustedProxies) || i == 0 {
+			return forwarded.String()
+		}
+	}
+	if realIP, err := netip.ParseAddr(strings.TrimSpace(r.Header.Get("X-Real-IP"))); err == nil {
+		return realIP.Unmap().String()
+	}
+	return peer.String()
+}
+
+func (a *App) requestIsHTTPS(r *http.Request) bool {
+	if r.TLS != nil {
+		return true
+	}
+	peer, ok := requestPeerIP(r)
+	if !ok || !proxyIsTrusted(peer, a.cfg.TrustedProxies) {
+		return false
+	}
+	proto := strings.TrimSpace(strings.Split(r.Header.Get("X-Forwarded-Proto"), ",")[0])
+	return strings.EqualFold(proto, "https")
 }
 
 type loginReq struct {
@@ -6829,7 +7017,7 @@ func (a *App) loginHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ip := getClientIP(r)
+	ip := a.getClientIP(r)
 	now := time.Now()
 
 	a.loginMu.Lock()
@@ -6886,12 +7074,11 @@ func (a *App) loginHandler(w http.ResponseWriter, r *http.Request) {
 		MaxAge:   30 * 86400,
 		HttpOnly: true,
 		SameSite: http.SameSiteLaxMode,
-		Secure:   r.TLS != nil || r.Header.Get("X-Forwarded-Proto") == "https",
+		Secure:   a.requestIsHTTPS(r),
 	})
 
 	jsonResp(w, 200, map[string]any{
 		"ok":       true,
-		"token":    token,
 		"username": req.Username,
 	})
 }
@@ -6983,6 +7170,14 @@ func (a *App) handler(w http.ResponseWriter, r *http.Request) {
 
 	// File Server & Streamer
 	if strings.HasPrefix(r.URL.Path, "/files/") {
+		// API responses inherit the server's short WriteTimeout. Large media
+		// downloads get their own bounded deadline instead of disabling timeout
+		// protection globally for every endpoint.
+		deadline := time.Time{}
+		if a.cfg.FileWriteTimeout > 0 {
+			deadline = time.Now().Add(a.cfg.FileWriteTimeout)
+		}
+		_ = http.NewResponseController(w).SetWriteDeadline(deadline)
 		rel := strings.TrimPrefix(r.URL.Path, "/files/")
 		root, _ := filepath.Abs(a.cfg.DataDir)
 		target, _ := filepath.Abs(filepath.Join(root, filepath.Clean(rel)))
@@ -7064,7 +7259,7 @@ func (a *App) handler(w http.ResponseWriter, r *http.Request) {
 
 		if r.Method == "GET" && len(parts) == 2 && parts[1] == "logs" {
 			a.mu.RLock()
-			j := a.jobs[id]
+			j := snapshotJobLocked(a.jobs[id], true)
 			a.mu.RUnlock()
 			if j == nil {
 				jsonResp(w, 404, map[string]string{"error": "job not found"})
@@ -7104,7 +7299,7 @@ func (a *App) handler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		a.mu.RLock()
-		j := a.jobs[id]
+		j := snapshotJobLocked(a.jobs[id], true)
 		a.mu.RUnlock()
 		if j == nil {
 			jsonResp(w, 404, map[string]string{"error": "job not found"})
@@ -7130,6 +7325,21 @@ func (a *App) handler(w http.ResponseWriter, r *http.Request) {
 		a.pipeline(w, r)
 	default:
 		jsonResp(w, 404, map[string]string{"error": "not found"})
+	}
+}
+
+func newHTTPServer(a *App) *http.Server {
+	writeTimeout := a.cfg.APIWriteTimeout
+	if writeTimeout <= 0 {
+		writeTimeout = 2 * time.Minute
+	}
+	return &http.Server{
+		Addr:              a.cfg.Addr,
+		Handler:           http.HandlerFunc(a.handler),
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       60 * time.Second,
+		WriteTimeout:      writeTimeout,
+		IdleTimeout:       120 * time.Second,
 	}
 }
 
@@ -7169,14 +7379,7 @@ func main() {
 	a.startNetworkSampler(context.Background())
 	a.startReviewWatcher(context.Background())
 
-	s := &http.Server{
-		Addr:              a.cfg.Addr,
-		Handler:           http.HandlerFunc(a.handler),
-		ReadHeaderTimeout: 10 * time.Second,
-		ReadTimeout:       60 * time.Second,
-		WriteTimeout:      0, // Disabled so streaming large video files via /files/ is not cut off
-		IdleTimeout:       120 * time.Second,
-	}
+	s := newHTTPServer(a)
 	fmt.Printf("y2b-go listening on %s (data: %s)\n", a.cfg.Addr, a.cfg.DataDir)
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
