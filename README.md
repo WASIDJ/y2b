@@ -111,6 +111,15 @@ DEEPSEEK_MODEL=deepseek-chat
 
 建议将 API key 放入 `/etc/y2b.env`，不要写入仓库。
 
+Web 安全与超时配置：
+
+- `Y2B_TRUSTED_PROXIES`：允许提供 `X-Forwarded-For` / `X-Forwarded-Proto` 的可信代理 CIDR，默认仅 `127.0.0.1/32,::1/128`
+- `Y2B_ALLOW_BEARER_AUTH`：是否允许通过 `Authorization: Bearer` 使用会话令牌，默认 `false`；浏览器控制台使用 HttpOnly cookie
+- `Y2B_API_WRITE_TIMEOUT`：API 响应写入上限，默认 `2m`
+- `Y2B_FILE_WRITE_TIMEOUT`：`/files/` 大文件流式响应的独立写入上限，默认 `6h`
+
+只有实际反向代理的地址应加入 `Y2B_TRUSTED_PROXIES`。直接暴露服务时不要信任公网网段，否则攻击者可能伪造客户端 IP 或 HTTPS 标记。
+
 ## systemd 部署
 
 ```sh
@@ -126,6 +135,7 @@ sudo systemctl enable --now y2b-go
 - 下载和投稿各自单槽位，避免 VPS OOM
 - 任务状态原子写入并保留备份
 - 收到 SIGTERM/SIGINT 时优雅退出
+- API 使用有界写超时；`/files/` 使用独立的长时限，避免慢客户端无限占用控制面连接
 
 ## API
 
@@ -168,6 +178,8 @@ sudo systemctl enable --now y2b-go
 - `data/`、日志、频道配置和构建二进制
 
 `.gitignore` 已默认排除上述内容。请不要将 cookie 或 API key 粘贴到 issue、commit 或公开仓库。
+
+登录成功后会话只写入 HttpOnly cookie，不会出现在 JSON 响应中。需要无浏览器 API 客户端时，可显式设置 `Y2B_ALLOW_BEARER_AUTH=true`，并确保令牌不会进入日志。
 
 ## 开发与验证
 
