@@ -1254,6 +1254,16 @@ func TestSystemDiagnosticsDiskFields(t *testing.T) {
 	if _, ok := diag["uptime_seconds"]; !ok {
 		t.Fatal("missing uptime_seconds in systemDiagnostics")
 	}
+	biliMap, ok := diag["bilibili"].(map[string]string)
+	if !ok || biliMap == nil {
+		t.Fatal("missing bilibili map in systemDiagnostics")
+	}
+	if _, ok := biliMap["submit_endpoint"]; !ok {
+		t.Fatal("missing submit_endpoint in bilibili diagnostics")
+	}
+	if _, ok := biliMap["upos_line"]; !ok {
+		t.Fatal("missing upos_line in bilibili diagnostics")
+	}
 }
 
 func TestIsActiveJobMedia(t *testing.T) {

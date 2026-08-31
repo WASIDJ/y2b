@@ -6127,8 +6127,10 @@ func (a *App) systemDiagnostics() map[string]any {
 			"llm":    a.cfg.DeepSeekModel,
 		},
 		"bilibili": map[string]string{
-			"mid":     biliMid,
-			"expires": biliExpires,
+			"mid":             biliMid,
+			"expires":         biliExpires,
+			"submit_endpoint": a.cfg.SubmitEndpoint,
+			"upos_line":       a.cfg.BiliLine,
 		},
 	}
 }
