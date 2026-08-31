@@ -1203,6 +1203,12 @@ func isActiveJobMedia(j *Job) bool {
 	if j.Status == "running" || j.Status == "queued" || j.Status == "pending" {
 		return true
 	}
+	// loadJobs marks work interrupted by a service restart as canceled before
+	// recoverInterruptedJobs recreates it. Keep its media during that recovery
+	// window so startup orphan cleanup cannot erase resumable downloads.
+	if j.Status == "canceled" && j.Error == "服务重启中断" {
+		return true
+	}
 	if j.Status == "done" {
 		// Keep media until submission review has passed
 		return j.ReviewState != "passed"

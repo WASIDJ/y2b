@@ -962,7 +962,8 @@ func TestCleanupOrphanedMedia(t *testing.T) {
 	a := &App{
 		cfg: Config{DataDir: dir},
 		jobs: map[string]*Job{
-			"active1": {ID: "active1", Status: "running"},
+			"active1":      {ID: "active1", Status: "running"},
+			"interrupted1": {ID: "interrupted1", Status: "canceled", Error: "服务重启中断"},
 		},
 	}
 
@@ -970,6 +971,9 @@ func TestCleanupOrphanedMedia(t *testing.T) {
 	activeDir := filepath.Join(dir, "magnet", "active1")
 	_ = os.MkdirAll(activeDir, 0750)
 	_ = os.WriteFile(filepath.Join(activeDir, "video.mp4"), []byte("active data"), 0600)
+	interruptedDir := filepath.Join(dir, "magnet", "interrupted1")
+	_ = os.MkdirAll(interruptedDir, 0750)
+	_ = os.WriteFile(filepath.Join(interruptedDir, "video.mp4"), []byte("resumable data"), 0600)
 
 	// 2. Orphan directory
 	orphanDir := filepath.Join(dir, "magnet", "orphan99")
@@ -988,6 +992,9 @@ func TestCleanupOrphanedMedia(t *testing.T) {
 	// Verify active dir was preserved
 	if _, err := os.Stat(activeDir); os.IsNotExist(err) {
 		t.Fatalf("expected active dir to be preserved, but was deleted: %v", err)
+	}
+	if _, err := os.Stat(interruptedDir); os.IsNotExist(err) {
+		t.Fatalf("expected restart-interrupted dir to be preserved, but was deleted: %v", err)
 	}
 }
 
@@ -1424,6 +1431,7 @@ func TestIsActiveJobMedia(t *testing.T) {
 		{"done job pending review", &Job{Status: "done", ReviewState: "pending"}, true},
 		{"done job passed review", &Job{Status: "done", ReviewState: "passed"}, false},
 		{"canceled job", &Job{Status: "canceled"}, false},
+		{"restart interrupted job", &Job{Status: "canceled", Error: "服务重启中断"}, true},
 		{"failed disk_full no retry", &Job{Status: "failed", FailureCategory: "disk_full"}, false},
 		{"failed dead_seed no retry", &Job{Status: "failed", FailureCategory: "dead_seed"}, false},
 		{"failed upload_rate_limit with pending retry", &Job{
