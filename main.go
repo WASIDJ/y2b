@@ -154,25 +154,26 @@ type mediaScanCache struct {
 }
 
 type App struct {
-	cfg                 Config
-	mu                  sync.RWMutex
-	jobs                map[string]*Job
-	order               []string
-	downloadSlots       chan struct{}
-	uploadSlots         chan struct{}
-	uploadCooldownUntil time.Time
-	cmu                 sync.RWMutex
-	channels            map[string]*MonitoredChannel
-	channelOrder        []string
-	smu                 sync.RWMutex
-	stats               AppStats
-	netStats            NetworkStats
-	reviewMu            sync.Mutex
-	loginMu             sync.Mutex
-	loginAttempts       map[string]*loginAttempt
-	mediaCacheMu        sync.Mutex
-	mediaCache          mediaScanCache
-	jobsSaveMu          sync.Mutex
+	cfg                  Config
+	mu                   sync.RWMutex
+	jobs                 map[string]*Job
+	order                []string
+	downloadSlots        chan struct{}
+	uploadSlots          chan struct{}
+	uploadCooldownUntil  time.Time
+	youtubeCooldownUntil time.Time
+	cmu                  sync.RWMutex
+	channels             map[string]*MonitoredChannel
+	channelOrder         []string
+	smu                  sync.RWMutex
+	stats                AppStats
+	netStats             NetworkStats
+	reviewMu             sync.Mutex
+	loginMu              sync.Mutex
+	loginAttempts        map[string]*loginAttempt
+	mediaCacheMu         sync.Mutex
+	mediaCache           mediaScanCache
+	jobsSaveMu           sync.Mutex
 }
 
 func env(k, d string) string {
@@ -320,11 +321,12 @@ func loadConfig() Config {
 		}
 	}
 	btListenPort := env("Y2B_BT_LISTEN_PORT", "51413")
-	// Zero means unlimited automatic retries. A transient Bilibili cooldown or
-	// a slow/dead torrent must not turn into a permanently abandoned job.
-	autoRetryMax := 0
-	if raw := os.Getenv("Y2B_AUTO_RETRY_MAX"); raw != "" {
-		if parsed, err := strconv.Atoi(raw); err == nil && parsed >= 0 && parsed <= 10 {
+	// Default to 5 automatic retries (supports Y2B_AUTO_RETRY_MAX and Y2B_MAX_RETRIES).
+	// A transient Bilibili cooldown or a slow torrent must not turn into a permanently abandoned job,
+	// but runaway bot loops must be bounded.
+	autoRetryMax := 5
+	if raw := env("Y2B_AUTO_RETRY_MAX", os.Getenv("Y2B_MAX_RETRIES")); raw != "" {
+		if parsed, err := strconv.Atoi(raw); err == nil && parsed >= 0 && parsed <= 20 {
 			autoRetryMax = parsed
 		}
 	}
@@ -473,6 +475,58 @@ func writeAtomic(path string, data []byte, perm os.FileMode) error {
 	return nil
 }
 
+// cleanupStaleTempFiles removes orphaned temporary files left by interrupted atomic replacements.
+func cleanupStaleTempFiles(dataDir string) {
+	if dataDir == "" {
+		return
+	}
+	entries, err := os.ReadDir(dataDir)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		if strings.Contains(name, ".tmp-") || strings.HasSuffix(name, ".tmp") {
+			path := filepath.Join(dataDir, name)
+			if info, err := e.Info(); err == nil {
+				if time.Since(info.ModTime()) > 5*time.Minute {
+					_ = os.Remove(path)
+				}
+			}
+		}
+	}
+}
+
+// rotateLogFileIfNeeded truncates runaway log files (like stream-gears download.log)
+// to retain only recent activity, avoiding infinite disk consumption.
+func rotateLogFileIfNeeded(path string, maxSize, retainSize int64) {
+	fi, err := os.Stat(path)
+	if err != nil || fi.Size() <= maxSize {
+		return
+	}
+	f, err := os.OpenFile(path, os.O_RDWR, 0640)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+
+	offset := fi.Size() - retainSize
+	if offset < 0 {
+		offset = 0
+	}
+	buf := make([]byte, retainSize)
+	n, err := f.ReadAt(buf, offset)
+	if err != nil && !errors.Is(err, io.EOF) {
+		return
+	}
+	_ = f.Truncate(0)
+	_, _ = f.Seek(0, 0)
+	_, _ = f.Write(buf[:n])
+}
+
 func (a *App) saveJobs() {
 	// Serialize snapshot creation and replacement so an older caller can never
 	// overwrite a newer state after being delayed during disk I/O.
@@ -540,31 +594,73 @@ func (a *App) saveJobs() {
 	}
 }
 
+// compactErrorOutput truncates command error strings so err.Error() remains concise
+// instead of duplicating up to 128KB of stdout/stderr into memory and jobs.json.
+func compactErrorOutput(output string) string {
+	output = strings.TrimSpace(output)
+	if len(output) <= 1024 {
+		return output
+	}
+	tail := output[len(output)-1024:]
+	if idx := strings.Index(tail, "\n"); idx != -1 && idx < 200 {
+		tail = tail[idx+1:]
+	}
+	return "... (日志截断) ...\n" + strings.TrimSpace(tail)
+}
+
 func (a *App) loadJobs() {
-	b, err := os.ReadFile(a.jobsFilePath())
+	path := a.jobsFilePath()
+	b, err := os.ReadFile(path)
 	var list []*Job
 	if err != nil || json.Unmarshal(b, &list) != nil {
-		if backup, backupErr := os.ReadFile(a.jobsFilePath() + ".bak"); backupErr == nil {
+		if backup, backupErr := os.ReadFile(path + ".bak"); backupErr == nil {
 			_ = json.Unmarshal(backup, &list)
 		}
 	}
 	if len(list) == 0 {
 		return
 	}
+
+	// Clean up stale temp files (*.tmp-*) and rotate download.log if needed
+	cleanupStaleTempFiles(a.cfg.DataDir)
+	rotateLogFileIfNeeded(filepath.Join(a.cfg.DataDir, "download.log"), 5<<20, 512<<10)
+
+	needsCompactSave := false
 	a.mu.Lock()
-	defer a.mu.Unlock()
+	defer func() {
+		a.mu.Unlock()
+		if needsCompactSave {
+			a.saveJobs()
+		}
+	}()
 	for _, j := range list {
 		if j == nil || j.ID == "" {
 			continue
+		}
+		// Compact oversized legacy error and log strings to conserve memory and disk
+		if len(j.Logs) > 64<<10 {
+			j.Logs = "... (历史日志截断) ...\n" + j.Logs[len(j.Logs)-(64<<10):]
+			needsCompactSave = true
+		}
+		if len(j.Error) > 2<<10 {
+			j.Error = compactErrorOutput(j.Error)
+			needsCompactSave = true
 		}
 		j.ctx, j.cancelFunc = context.WithCancel(context.Background())
 		if j.Status == "running" || j.Status == "queued" {
 			j.Status = "canceled"
 			j.Error = "服务重启中断"
 			j.Finished = time.Now()
+			needsCompactSave = true
 		} else if j.Status == "failed" {
 			category := classifyFailure(j.Error, j.Logs)
 			j.FailureCategory = category
+			if category == "upload_rate_limit" && j.NextRetryAt.After(a.uploadCooldownUntil) {
+				a.uploadCooldownUntil = j.NextRetryAt
+			}
+			if category == "youtube_bot_challenge" && j.NextRetryAt.After(a.youtubeCooldownUntil) {
+				a.youtubeCooldownUntil = j.NextRetryAt
+			}
 			if category == "missing_media" && j.Kind == "biliup" {
 				j.NextRetryAt = time.Time{}
 				var up uploadReq
@@ -578,24 +674,52 @@ func (a *App) loadJobs() {
 				if !validYouTube(src) && !validTorrentOrMagnet(src) {
 					j.Status = "canceled"
 					j.Step = "已取消 (媒体文件缺失且无原始下载链接)"
+					needsCompactSave = true
 				}
 			} else if category == "disk_full" {
 				j.NextRetryAt = time.Time{}
 				j.Step = "磁盘空间不足，等待手动清理后重试"
 			} else if category == "upload_rate_limit" {
-				j.Step = "等待B站限流/风控解除 (可人工验证或次日自动刷新)"
+				if autoRetryAllowed(a.cfg.AutoRetryMax, j.AutoRetryCount, category) {
+					j.Step = retryCooldownStep("B站账号", j.NextRetryAt)
+				} else {
+					j.NextRetryAt = time.Time{}
+					j.Step = "B站账号达到限流重试上限，请核验账号或更新 Cookie"
+					needsCompactSave = true
+				}
+			} else if category == "youtube_bot_challenge" {
+				if autoRetryAllowed(a.cfg.AutoRetryMax, j.AutoRetryCount, category) {
+					j.Step = retryCooldownStep("YouTube 会话", j.NextRetryAt)
+				} else {
+					j.NextRetryAt = time.Time{}
+					j.Step = "YouTube 会话人机验证重试上限，请更新 youtube_cookies.txt 后手动重试"
+					needsCompactSave = true
+				}
+			} else if !autoRetryAllowed(a.cfg.AutoRetryMax, j.AutoRetryCount, category) {
+				if !j.NextRetryAt.IsZero() {
+					j.NextRetryAt = time.Time{}
+					needsCompactSave = true
+				}
 			}
 		}
 		if j.Title == "" {
-			j.Title = extractJobTitle(j.Kind, j.Input)
+			j.Title = a.initialJobTitle(j.Kind, j.Input)
 			if outMap := outputMap(j.Output); outMap != nil {
 				if t, ok := outMap["title"].(string); ok && strings.TrimSpace(t) != "" {
 					j.Title = strings.TrimSpace(t)
 				}
 			}
 		}
+		if rawURL := inputURL(j.Input); validYouTube(rawURL) && (j.Title == "" || strings.HasPrefix(j.Title, "YouTube 视频") || strings.HasPrefix(j.Title, "YouTube 播放列表")) {
+			if downloaded := findDownloadedYouTubeTitle(a.cfg.DataDir, rawURL); downloaded != "" {
+				j.Title = downloaded
+			}
+		}
 		a.jobs[j.ID] = j
 		a.order = append(a.order, j.ID)
+	}
+	for _, j := range a.jobs {
+		a.enrichYouTubeJobTitle(j)
 	}
 }
 
@@ -714,6 +838,111 @@ func extractJobTitle(kind string, input any) string {
 	return ""
 }
 
+func inputURL(input any) string {
+	b, err := json.Marshal(input)
+	if err != nil {
+		return ""
+	}
+	var fields struct {
+		URL string `json:"url"`
+	}
+	if json.Unmarshal(b, &fields) != nil {
+		return ""
+	}
+	return strings.TrimSpace(fields.URL)
+}
+
+func youtubeVideoID(rawURL string) string {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return ""
+	}
+	if videoID := strings.TrimSpace(u.Query().Get("v")); videoID != "" {
+		return videoID
+	}
+	if strings.EqualFold(u.Hostname(), "youtu.be") {
+		return strings.Trim(strings.TrimSpace(u.Path), "/")
+	}
+	return ""
+}
+
+func findDownloadedYouTubeTitle(dataDir, rawURL string) string {
+	videoID := youtubeVideoID(rawURL)
+	if videoID == "" {
+		return ""
+	}
+	var title string
+	stop := errors.New("title found")
+	_ = filepath.Walk(filepath.Join(dataDir, "youtube"), func(path string, info os.FileInfo, err error) error {
+		if err != nil || info == nil || info.IsDir() || !isVideoFilePath(info.Name()) {
+			return nil
+		}
+		if strings.Contains(info.Name(), "["+videoID+"]") {
+			title = sourceTitleFromVideoPath(path)
+			return stop
+		}
+		return nil
+	})
+	return title
+}
+
+func (a *App) initialJobTitle(kind string, input any) string {
+	title := extractJobTitle(kind, input)
+	if rawURL := inputURL(input); validYouTube(rawURL) {
+		if downloaded := findDownloadedYouTubeTitle(a.cfg.DataDir, rawURL); downloaded != "" {
+			return downloaded
+		}
+	}
+	return title
+}
+
+func isYouTubePlaceholderTitle(title string) bool {
+	return title == "" || strings.HasPrefix(title, "YouTube 视频") || strings.HasPrefix(title, "YouTube 播放列表")
+}
+
+func fetchYouTubeOEmbedTitle(rawURL string) string {
+	client := &http.Client{Timeout: 12 * time.Second}
+	endpoint := "https://www.youtube.com/oembed?format=json&url=" + url.QueryEscape(rawURL)
+	resp, err := client.Get(endpoint)
+	if err != nil {
+		return ""
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return ""
+	}
+	var payload struct {
+		Title string `json:"title"`
+	}
+	if json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&payload) != nil {
+		return ""
+	}
+	return strings.TrimSpace(payload.Title)
+}
+
+func (a *App) enrichYouTubeJobTitle(j *Job) {
+	if j == nil || !isYouTubePlaceholderTitle(j.Title) {
+		return
+	}
+	rawURL := inputURL(j.Input)
+	if !validYouTube(rawURL) {
+		return
+	}
+	go func(jobID string) {
+		title := fetchYouTubeOEmbedTitle(rawURL)
+		if title == "" {
+			return
+		}
+		a.mu.Lock()
+		current := a.jobs[jobID]
+		if current != nil && isYouTubePlaceholderTitle(current.Title) {
+			current.Title = title
+		}
+		a.mu.Unlock()
+		a.saveJobs()
+	}(j.ID)
+}
+
 func extractMagnetDN(rawURL string) string {
 	if u, err := url.Parse(rawURL); err == nil {
 		if dn := u.Query().Get("dn"); dn != "" {
@@ -759,12 +988,33 @@ func extractYouTubeCleanTitle(rawURL string) string {
 	return "YouTube 视频"
 }
 
+func sourceTitleFromVideoPath(path string) string {
+	title := strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
+	// yt-dlp output templates suffix the source ID as " [video-id]".
+	if open := strings.LastIndex(title, " ["); open > 0 && strings.HasSuffix(title, "]") {
+		title = title[:open]
+	}
+	return strings.TrimSpace(title)
+}
+
+func (a *App) setYouTubeTitleFromVideo(j *Job, path string) {
+	title := sourceTitleFromVideoPath(path)
+	if title == "" {
+		return
+	}
+	a.mu.Lock()
+	if j.Title == "" || strings.HasPrefix(j.Title, "YouTube 视频") || strings.HasPrefix(j.Title, "YouTube 播放列表") {
+		j.Title = title
+	}
+	a.mu.Unlock()
+}
+
 func (a *App) add(kind string, input any) *Job {
 	ctx, cancel := context.WithCancel(context.Background())
 	j := &Job{
 		ID:         id(),
 		Kind:       kind,
-		Title:      extractJobTitle(kind, input),
+		Title:      a.initialJobTitle(kind, input),
 		Status:     "queued",
 		Step:       "排队中",
 		Created:    time.Now(),
@@ -777,6 +1027,7 @@ func (a *App) add(kind string, input any) *Job {
 	a.order = append(a.order, j.ID)
 	a.mu.Unlock()
 	a.saveJobs()
+	a.enrichYouTubeJobTitle(j)
 	return j
 }
 
@@ -805,6 +1056,13 @@ func (a *App) setProgress(j *Job, p JobProgress) {
 	a.mu.Unlock()
 }
 
+func retryCooldownStep(service string, retryAt time.Time) string {
+	if retryAt.IsZero() {
+		return service + "限流冷却中，等待自动重试"
+	}
+	return service + "限流冷却中，预计 " + retryAt.UTC().Format("15:04:05 UTC") + " 重试"
+}
+
 func (a *App) set(j *Job, status, err string, out any, logs string) {
 	shouldAutoRetry := false
 	var retryDelay time.Duration
@@ -821,7 +1079,7 @@ func (a *App) set(j *Job, status, err string, out any, logs string) {
 	}
 	if logs != "" {
 		if len(logs) > 64*1024 {
-			logs = logs[len(logs)-64*1024:] // Keep latest 64KB to avoid RAM growth
+			logs = "... (历史日志截断) ...\n" + logs[len(logs)-64*1024:] // Keep latest 64KB to avoid RAM growth
 		}
 		j.Logs = logs
 	}
@@ -833,11 +1091,19 @@ func (a *App) set(j *Job, status, err string, out any, logs string) {
 				a.uploadCooldownUntil = cooldownUntil
 			}
 		}
+		if j.FailureCategory == "youtube_bot_challenge" {
+			cooldownUntil := time.Now().Add(time.Hour)
+			if cooldownUntil.After(a.youtubeCooldownUntil) {
+				a.youtubeCooldownUntil = cooldownUntil
+			}
+		}
 		if autoRetryAllowed(a.cfg.AutoRetryMax, j.AutoRetryCount, j.FailureCategory) {
 			j.AutoRetryCount++
 			shouldAutoRetry = true
 			retryDelay = a.retryDelayFor(j.FailureCategory, j.AutoRetryCount)
 			j.NextRetryAt = time.Now().Add(retryDelay)
+		} else {
+			j.NextRetryAt = time.Time{}
 		}
 	}
 	if status == "running" {
@@ -860,7 +1126,17 @@ func (a *App) set(j *Job, status, err string, out any, logs string) {
 		j.Finished = time.Now()
 		switch j.FailureCategory {
 		case "upload_rate_limit":
-			j.Step = "等待B站限流/风控解除 (可人工验证或次日自动刷新)"
+			if autoRetryAllowed(a.cfg.AutoRetryMax, j.AutoRetryCount, j.FailureCategory) {
+				j.Step = retryCooldownStep("B站账号", j.NextRetryAt)
+			} else {
+				j.Step = "B站账号达到限流重试上限，请核验账号或更新 Cookie"
+			}
+		case "youtube_bot_challenge":
+			if autoRetryAllowed(a.cfg.AutoRetryMax, j.AutoRetryCount, j.FailureCategory) {
+				j.Step = retryCooldownStep("YouTube 会话", j.NextRetryAt)
+			} else {
+				j.Step = "YouTube 会话人机验证重试上限，请更新 youtube_cookies.txt 后手动重试"
+			}
 		case "disk_full":
 			j.Step = "磁盘空间不足，等待手动清理后重试"
 		case "auth_failed":
@@ -948,7 +1224,8 @@ func classifyFailure(err, logs string) string {
 		strings.Contains(s, "http error 429"),
 		strings.Contains(s, "too many requests"),
 		strings.Contains(s, "rate-limited by youtube"),
-		strings.Contains(s, "this content isn't available, try again later"):
+		strings.Contains(s, "this content isn't available, try again later"),
+		(strings.Contains(s, "youtube") || strings.Contains(s, "yt-dlp")) && (strings.Contains(s, "http error 403") || strings.Contains(s, "403: forbidden") || strings.Contains(s, "po_token") || strings.Contains(s, "po token") || strings.Contains(s, "sabr-only")):
 		return "youtube_bot_challenge"
 	case strings.Contains(s, "no such file or directory"),
 		strings.Contains(s, "os error 2"),
@@ -990,14 +1267,34 @@ func isAutoRetryableCategory(category string) bool {
 // requires manual verification (B站 account check, cookie refresh, etc.).
 const uploadRateLimitMaxRetries = 48
 
+// youtubeBotChallengeMaxRetries caps bot challenge retries (5 attempts spaced
+// out up to ~1 hour each) to prevent infinite loops when YouTube blocks the IP or session.
+const youtubeBotChallengeMaxRetries = 5
+
+// defaultGeneralMaxRetries is the fallback ceiling for other transient failures (e.g. queue_timeout).
+const defaultGeneralMaxRetries = 5
+
 func autoRetryAllowed(max, count int, category string) bool {
+	if !isAutoRetryableCategory(category) {
+		return false
+	}
 	// Rate limiting is NOT a permanent failure: keep task pending with periodic
 	// retries, but cap at uploadRateLimitMaxRetries to avoid infinite loops.
-	// After the cap the job stays failed and requires manual intervention.
 	if category == "upload_rate_limit" {
 		return count < uploadRateLimitMaxRetries
 	}
-	return (max <= 0 || count < max) && isAutoRetryableCategory(category)
+	if category == "youtube_bot_challenge" {
+		limit := youtubeBotChallengeMaxRetries
+		if max > 0 && max < limit {
+			limit = max
+		}
+		return count < limit
+	}
+	limit := defaultGeneralMaxRetries
+	if max > 0 {
+		limit = max
+	}
+	return count < limit
 }
 
 func (a *App) scheduleAutoRetry(j *Job, delay time.Duration) {
@@ -1072,14 +1369,20 @@ func (a *App) recoverTransientJobs() {
 // restart. Intentional user cancellations do not use this error marker.
 func (a *App) recoverInterruptedJobs() {
 	a.mu.RLock()
-	ids := make([]string, 0)
+	youtubeIDs := make([]string, 0)
+	otherIDs := make([]string, 0)
 	for _, oid := range a.order {
 		j := a.jobs[oid]
 		if j != nil && j.Status == "canceled" && j.Error == "服务重启中断" {
-			ids = append(ids, j.ID)
+			if jobUsesYouTube(j) {
+				youtubeIDs = append(youtubeIDs, j.ID)
+			} else {
+				otherIDs = append(otherIDs, j.ID)
+			}
 		}
 	}
 	a.mu.RUnlock()
+	ids := append(youtubeIDs, otherIDs...)
 	if len(ids) == 0 {
 		return
 	}
@@ -1293,6 +1596,8 @@ func (a *App) cleanupOrphanedMedia() int64 {
 			}
 		}
 	}
+	rotateLogFileIfNeeded(filepath.Join(a.cfg.DataDir, "download.log"), 5<<20, 512<<10)
+	cleanupStaleTempFiles(a.cfg.DataDir)
 	return freed
 }
 
@@ -1404,6 +1709,134 @@ func (a *App) acquireSlot(ctx context.Context, slot chan struct{}) error {
 		return ctx.Err()
 	case <-timer.C:
 		return fmt.Errorf("队列等待超时（超过 %s）", a.cfg.QueueWaitTimeout)
+	}
+}
+
+// jobUsesYouTube recognizes both direct jobs and restored pipeline jobs.
+func jobUsesYouTube(candidate *Job) bool {
+	if candidate == nil {
+		return false
+	}
+	if candidate.Kind == "youtube" {
+		return true
+	}
+	if candidate.Kind != "pipeline" {
+		return false
+	}
+	switch input := candidate.Input.(type) {
+	case pipelineReq:
+		return validYouTube(input.URL)
+	case map[string]any:
+		rawURL, _ := input["url"].(string)
+		return validYouTube(rawURL)
+	}
+	return false
+}
+
+func isMagnetSource(rawURL string) bool {
+	return !validYouTube(rawURL) && validTorrentOrMagnet(rawURL)
+}
+
+func (a *App) hasActiveYouTube(exceptID string, uploadReadyOnly bool) bool {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	for _, candidate := range a.jobs {
+		if candidate == nil || candidate.ID == exceptID || (candidate.Status != "queued" && candidate.Status != "running") {
+			continue
+		}
+		if !jobUsesYouTube(candidate) {
+			continue
+		}
+		if !uploadReadyOnly {
+			return true
+		}
+		step := strings.ToLower(candidate.Step)
+		if strings.Contains(step, "b站") || strings.Contains(step, "投稿") {
+			return true
+		}
+	}
+	return false
+}
+
+func (a *App) hasYouTubeUploadPriority(exceptID string) bool {
+	return a.hasActiveYouTube(exceptID, true)
+}
+
+// acquireDownloadSlot stops a queued BT task entering its streaming pipeline
+// while any YouTube work remains. Once a BT process has started it is allowed
+// to finish; forcibly preempting it can leave an incomplete Bilibili draft.
+func (a *App) acquireDownloadSlot(j *Job, magnet bool) error {
+	if !magnet {
+		if jobUsesYouTube(j) {
+			if err := a.waitYouTubeCooldown(j); err != nil {
+				return err
+			}
+		}
+		return a.acquireSlot(j.ctx, a.downloadSlots)
+	}
+	for {
+		if a.hasActiveYouTube(j.ID, false) {
+			a.setStep(j, "等待 YouTube 任务全部完成")
+			select {
+			case <-j.ctx.Done():
+				return j.ctx.Err()
+			case <-time.After(time.Second):
+			}
+			continue
+		}
+		if err := a.acquireSlot(j.ctx, a.downloadSlots); err != nil {
+			return err
+		}
+		if !a.hasActiveYouTube(j.ID, false) {
+			return nil
+		}
+		<-a.downloadSlots
+	}
+}
+
+func (a *App) waitYouTubeCooldown(j *Job) error {
+	for {
+		a.mu.RLock()
+		until := a.youtubeCooldownUntil
+		wait := time.Until(until)
+		a.mu.RUnlock()
+		if wait <= 0 {
+			return nil
+		}
+		a.setStep(j, "YouTube 会话限流冷却中，预计 "+until.UTC().Format("15:04:05 UTC")+" 恢复")
+		timer := time.NewTimer(wait)
+		select {
+		case <-j.ctx.Done():
+			timer.Stop()
+			return j.ctx.Err()
+		case <-timer.C:
+		}
+	}
+}
+
+// acquireUploadSlot gives ready YouTube uploads strict precedence over BT and
+// rechecks priority after taking the semaphore to close the hand-off race.
+func (a *App) acquireUploadSlot(j *Job, magnet bool) error {
+	if !magnet {
+		return a.acquireSlot(j.ctx, a.uploadSlots)
+	}
+	for {
+		if a.hasYouTubeUploadPriority(j.ID) {
+			a.setStep(j, "等待 YouTube 优先上传完成")
+			select {
+			case <-j.ctx.Done():
+				return j.ctx.Err()
+			case <-time.After(time.Second):
+			}
+			continue
+		}
+		if err := a.acquireSlot(j.ctx, a.uploadSlots); err != nil {
+			return err
+		}
+		if !a.hasYouTubeUploadPriority(j.ID) {
+			return nil
+		}
+		<-a.uploadSlots
 	}
 }
 
@@ -1901,6 +2334,7 @@ func (a *App) retryJobWithCount(jobID string, resetCount bool) (*Job, error) {
 	j := &Job{
 		ID:         id(),
 		Kind:       retryKind,
+		Title:      a.initialJobTitle(retryKind, retryInput),
 		Status:     "queued",
 		Step:       "排队中",
 		Created:    time.Now(),
@@ -1928,6 +2362,7 @@ func (a *App) retryJobWithCount(jobID string, resetCount bool) (*Job, error) {
 	a.jobs[j.ID] = j
 	a.mu.Unlock()
 	a.saveJobs()
+	a.enrichYouTubeJobTitle(j)
 	a.dispatchJob(j)
 	return j, nil
 }
@@ -1985,7 +2420,7 @@ func runCmdProgress(ctx context.Context, bin string, args []string, onLine func(
 	capture.flush()
 	output := strings.TrimSpace(capture.String())
 	if err != nil {
-		return output, fmt.Errorf("%s: %w: %s", bin, err, output)
+		return output, fmt.Errorf("%s: %w: %s", bin, err, compactErrorOutput(output))
 	}
 	return output, nil
 }
@@ -2086,6 +2521,7 @@ func parseETASeconds(raw string) int64 {
 
 var (
 	ytdlpProgressRE = regexp.MustCompile(`^download:\s*([^|]+)\|([^|]*)\|([^|]*)\|([^|]*)\|([^|]*)\|(.*)$`)
+	ytdlpTitleRE    = regexp.MustCompile(`^source-title:(.+)$`)
 	percentRE       = regexp.MustCompile(`([0-9]+(?:\.[0-9]+)?)%`)
 	ariaProgressRE  = regexp.MustCompile(`(?:^|\s)(\d+(?:\.\d+)?)%.*?DL:([^,\s]+(?:\s*[KMGT]i?B)?).*?ETA:([^\s,]+)`)
 	ffmpegTimeRE    = regexp.MustCompile(`(?:time|out_time)=([0-9:.]+)`)
@@ -2093,6 +2529,17 @@ var (
 
 func (a *App) progressLine(j *Job, phase, line string) {
 	p := JobProgress{Detail: phase}
+	if m := ytdlpTitleRE.FindStringSubmatch(strings.TrimSpace(line)); len(m) == 2 {
+		title := strings.TrimSpace(m[1])
+		if title != "" && !strings.EqualFold(title, "NA") {
+			a.mu.Lock()
+			if j.Title == "" || strings.HasPrefix(j.Title, "YouTube 视频") || strings.HasPrefix(j.Title, "YouTube 播放列表") {
+				j.Title = title
+			}
+			a.mu.Unlock()
+		}
+		return
+	}
 	if m := ytdlpProgressRE.FindStringSubmatch(strings.TrimSpace(line)); len(m) == 7 {
 		p.Percent, _ = strconv.ParseFloat(strings.TrimSpace(strings.TrimSuffix(m[1], "%")), 64)
 		p.Downloaded, _ = strconv.ParseInt(strings.TrimSpace(m[2]), 10, 64)
@@ -2100,6 +2547,16 @@ func (a *App) progressLine(j *Job, phase, line string) {
 		p.Speed = parseSpeedBytes(m[4])
 		p.ETASeconds = parseETASeconds(m[5])
 		p.Current = strings.TrimSpace(m[6])
+		// yt-dlp exposes the authoritative source title in every progress
+		// record. Replace the URL-derived placeholder as soon as it arrives so
+		// the queue shows the video's real name while it is downloading.
+		if p.Current != "" && !strings.EqualFold(p.Current, "NA") {
+			a.mu.Lock()
+			if j.Title == "" || strings.HasPrefix(j.Title, "YouTube 视频") || strings.HasPrefix(j.Title, "YouTube 播放列表") {
+				j.Title = p.Current
+			}
+			a.mu.Unlock()
+		}
 		if p.Total > 0 && p.Percent == 0 {
 			p.Percent = float64(p.Downloaded) * 100 / float64(p.Total)
 		}
@@ -2120,6 +2577,9 @@ func (a *App) progressLine(j *Job, phase, line string) {
 		p.Current = "处理到 " + m[1]
 	}
 	if strings.HasPrefix(strings.TrimSpace(line), "[ffmpeg]") {
+		p.Current = strings.TrimSpace(line)
+	}
+	if strings.HasPrefix(strings.TrimSpace(line), "[等待]") {
 		p.Current = strings.TrimSpace(line)
 	}
 	if p.Percent > 0 || p.Current != "" || strings.Contains(strings.ToLower(line), "speed=") {
@@ -2251,9 +2711,10 @@ func buildYTDLPArgs(rawURL, quality, subLangs, cookiePath string, isPlaylist, sp
 		"--no-cache-dir",
 		"--no-plugin-dirs",
 		"--newline",
+		"--print", "before_dl:source-title:%(title)s",
 		"--progress-template", "download:%(progress._percent_str)s|%(progress.downloaded_bytes)s|%(progress.total_bytes)s|%(progress.speed)s|%(progress.eta)s|%(info.title)s",
 		"--postprocessor-args", "ffmpeg:-threads 1",
-		"--extractor-args", "youtube:player_client=android,ios,web,tv_downgraded,default",
+		"--extractor-args", env("Y2B_YTDLP_EXTRACTOR_ARGS", "youtube:player_client=android,ios,web,tv_downgraded,default"),
 	}
 	if isPlaylist {
 		args = append(args, "--yes-playlist")
@@ -2363,7 +2824,7 @@ func (a *App) createYoutubeHandler(q youtubeReq) func(*Job) {
 
 			// Stage 1: Download stage (acquires downloadSlots)
 			func() {
-				if err := a.acquireSlot(nj.ctx, a.downloadSlots); err != nil {
+				if err := a.acquireDownloadSlot(nj, false); err != nil {
 					downloadErr = err
 					return
 				}
@@ -2431,6 +2892,7 @@ func (a *App) createYoutubeHandler(q youtubeReq) func(*Job) {
 
 				if len(targetUploadFiles) > 0 {
 					mainVideoFile = targetUploadFiles[0]
+					a.setYouTubeTitleFromVideo(nj, mainVideoFile)
 				}
 			}()
 
@@ -3577,8 +4039,11 @@ func (s *streamUploader) handleReadyVideo(file string) error {
 
 	nj := s.job
 	a := s.app
+	if validYouTube(s.q.URL) {
+		a.setYouTubeTitleFromVideo(nj, file)
+	}
 
-	if err := a.acquireSlot(nj.ctx, a.uploadSlots); err != nil {
+	if err := a.acquireUploadSlot(nj, isMagnetSource(s.q.URL)); err != nil {
 		return err
 	}
 	defer func() { <-a.uploadSlots }()
@@ -3858,7 +4323,7 @@ func (a *App) createMagnetHandler(q magnetReq) func(*Job) {
 
 			// Stage 1: Magnet Download (acquires downloadSlots)
 			func() {
-				if err := a.acquireSlot(nj.ctx, a.downloadSlots); err != nil {
+				if err := a.acquireDownloadSlot(nj, true); err != nil {
 					downloadErr = err
 					return
 				}
@@ -3971,7 +4436,7 @@ func (a *App) createMagnetHandler(q magnetReq) func(*Job) {
 				var uploadErr error
 
 				func() {
-					if err := a.acquireSlot(nj.ctx, a.uploadSlots); err != nil {
+					if err := a.acquireUploadSlot(nj, true); err != nil {
 						uploadErr = err
 						return
 					}
@@ -4118,6 +4583,10 @@ func parseBiliupOutput(logs string) BiliCodeResult {
 	reMsg := regexp.MustCompile(`message["']?\s*:\s*["']([^"']+)["']`)
 	if m := reMsg.FindStringSubmatch(logs); len(m) > 1 {
 		res.Message = m[1]
+	}
+	if strings.Contains(logs, "另一个使用该账号") && strings.Contains(logs, "限流恢复") {
+		res.Code = 601
+		res.Message = "同一B站账号已有上传会话处于限流恢复中"
 	}
 	if res.Code == 0 || res.BVID != "" || strings.Contains(logs, "投稿成功") {
 		res.Code = 0
@@ -4290,7 +4759,7 @@ func (a *App) prepareTranslatedPartFiles(ctx context.Context, files []string) ([
 }
 
 func (a *App) executeBiliupUpload(ctx context.Context, q uploadReq) (map[string]any, string, error) {
-	if err := a.waitUploadCooldown(ctx); err != nil {
+	if err := a.waitUploadCooldown(ctx, q.Progress); err != nil {
 		return nil, "", err
 	}
 	if a.cfg.UploadTimeout > 0 {
@@ -4647,13 +5116,17 @@ finish:
 	return res, totalLogs, execErr
 }
 
-func (a *App) waitUploadCooldown(ctx context.Context) error {
+func (a *App) waitUploadCooldown(ctx context.Context, progress func(string)) error {
 	for {
 		a.mu.RLock()
-		wait := time.Until(a.uploadCooldownUntil)
+		until := a.uploadCooldownUntil
+		wait := time.Until(until)
 		a.mu.RUnlock()
 		if wait <= 0 {
 			return nil
+		}
+		if progress != nil {
+			progress("[等待] B站账号限流冷却中，预计 " + until.UTC().Format("15:04:05 UTC") + " 恢复")
 		}
 		timer := time.NewTimer(wait)
 		select {
@@ -4724,7 +5197,7 @@ func (a *App) createPipelineHandler(q pipelineReq) func(*Job) {
 	return func(nj *Job) {
 		go func() {
 			isYT := validYouTube(q.URL)
-			isMag := strings.HasPrefix(q.URL, "magnet:") || validTorrentOrMagnet(q.URL)
+			isMag := isMagnetSource(q.URL)
 
 			if !isYT && !isMag {
 				a.set(nj, "failed", "unsupported URL (must be YouTube URL or Magnet URI)", nil, "")
@@ -4741,7 +5214,7 @@ func (a *App) createPipelineHandler(q pipelineReq) func(*Job) {
 
 			// Stage 1: Download stage (acquires downloadSlots)
 			func() {
-				if err := a.acquireSlot(nj.ctx, a.downloadSlots); err != nil {
+				if err := a.acquireDownloadSlot(nj, isMag); err != nil {
 					downloadErr = err
 					return
 				}
@@ -4902,6 +5375,9 @@ func (a *App) createPipelineHandler(q pipelineReq) func(*Job) {
 			a.recordDownload(downBytes)
 
 			mainVideoFile = targetUploadFiles[0]
+			if isYT {
+				a.setYouTubeTitleFromVideo(nj, mainVideoFile)
+			}
 
 			// Stage 2: Upload stage (acquires uploadSlots while downloadSlots is released!)
 			var uploadOut map[string]any
@@ -4909,7 +5385,7 @@ func (a *App) createPipelineHandler(q pipelineReq) func(*Job) {
 			var uploadErr error
 
 			func() {
-				if err := a.acquireSlot(nj.ctx, a.uploadSlots); err != nil {
+				if err := a.acquireUploadSlot(nj, isMag); err != nil {
 					uploadErr = err
 					return
 				}
@@ -7136,8 +7612,15 @@ func (a *App) handler(w http.ResponseWriter, r *http.Request) {
 		a.authStatusHandler(w, r)
 		return
 	}
-	if r.Method == "GET" && r.URL.Path == "/health" {
-		jsonResp(w, 200, map[string]any{"ok": true, "service": "y2b-go", "time": time.Now().UTC()})
+	if r.Method == "GET" && (r.URL.Path == "/health" || r.URL.Path == "/api/health") {
+		jsonResp(w, 200, map[string]any{
+			"ok":           true,
+			"service":      "y2b-go",
+			"version":      Version,
+			"build_commit": BuildCommit,
+			"build_time":   BuildTime,
+			"time":         time.Now().UTC(),
+		})
 		return
 	}
 
@@ -7151,7 +7634,7 @@ func (a *App) handler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Health & System Hardware (ROM/RAM/CPU/Network/Stats)
-	if r.Method == "GET" && r.URL.Path == "/api/system" {
+	if r.Method == "GET" && (r.URL.Path == "/api/system" || r.URL.Path == "/api/diagnostics") {
 		jsonResp(w, 200, a.systemDiagnostics())
 		return
 	}

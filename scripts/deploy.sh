@@ -25,7 +25,7 @@ sleep 1
 
 if sudo systemctl is-active --quiet y2b-go.service; then
     echo "Service y2b-go is running successfully."
-    curl -s http://127.0.0.1:8765/api/diagnostics | grep -o '"version":"[^"]*"' || true
+    curl -s http://127.0.0.1:8765/health | grep -o '"version":"[^"]*"' || true
 else
     echo "ERROR: Service failed to start! Checking journalctl logs..."
     journalctl -u y2b-go -n 20 --no-pager

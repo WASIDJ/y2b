@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -34,14 +35,49 @@ func TestProgressParsing(t *testing.T) {
 		t.Fatalf("unexpected eta: %d", got)
 	}
 	a := &App{}
-	j := &Job{ID: "progress-test", Status: "running"}
-	a.progressLine(j, "YouTube 下载", "download: 42.5%|4250|10000|2MiB/s|12|demo")
+	j := &Job{ID: "progress-test", Status: "running", Title: "YouTube 视频 (abc123)"}
+	a.progressLine(j, "YouTube 下载", "download: 42.5%|4250|10000|2MiB/s|12|原视频标题")
 	if j.Progress == nil || j.Progress.Percent != 42.5 || j.Progress.Downloaded != 4250 || j.Progress.Total != 10000 || j.Progress.ETASeconds != 12 {
 		t.Fatalf("yt-dlp progress was not parsed: %+v", j.Progress)
+	}
+	if j.Title != "原视频标题" {
+		t.Fatalf("job title = %q, want source video title", j.Title)
+	}
+	j.Title = "YouTube 视频 (def456)"
+	a.progressLine(j, "YouTube 下载", "source-title:另一个原视频标题")
+	if j.Title != "另一个原视频标题" {
+		t.Fatalf("job title from pre-download metadata = %q", j.Title)
 	}
 	a.progressLine(j, "BT 下载", "[#abc 42% 4MiB/10MiB(40%) CN:2 DL:2MiB ETA:12s]")
 	if j.Progress == nil || j.Progress.Percent != 42 {
 		t.Fatalf("aria2 progress was not parsed: %+v", j.Progress)
+	}
+	a.progressLine(j, "B站上传", "[等待] B站账号限流冷却中，预计 12:00:00 UTC 恢复")
+	if j.Progress == nil || !strings.Contains(j.Progress.Current, "限流冷却") {
+		t.Fatalf("cooldown progress was not exposed: %+v", j.Progress)
+	}
+}
+
+func TestSourceTitleFromVideoPath(t *testing.T) {
+	got := sourceTitleFromVideoPath("/tmp/B32 SGLang 深度优化：Radix 缓存与复杂任务的极致吞吐 [BslciLADUy0].mp4")
+	if got != "B32 SGLang 深度优化：Radix 缓存与复杂任务的极致吞吐" {
+		t.Fatalf("source title = %q", got)
+	}
+}
+
+func TestFindDownloadedYouTubeTitle(t *testing.T) {
+	dir := t.TempDir()
+	mediaDir := filepath.Join(dir, "youtube", "old-job")
+	if err := os.MkdirAll(mediaDir, 0750); err != nil {
+		t.Fatal(err)
+	}
+	video := filepath.Join(mediaDir, "真实原标题 [BslciLADUy0].mp4")
+	if err := os.WriteFile(video, []byte("video"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	got := findDownloadedYouTubeTitle(dir, "https://youtu.be/BslciLADUy0?feature=share")
+	if got != "真实原标题" {
+		t.Fatalf("downloaded title = %q", got)
 	}
 }
 
@@ -366,6 +402,13 @@ func TestBiliupJSONRateLimitIsClassified(t *testing.T) {
 	}
 	if got := classifyFailure("biliup exit status 1", got.RawLogs); got != "upload_rate_limit" {
 		t.Fatalf("failure category = %q, want upload_rate_limit", got)
+	}
+}
+
+func TestBiliupAccountBusyStopsEndpointStorm(t *testing.T) {
+	got := parseBiliupOutput("RuntimeError: 另一个使用该账号 (3537122753513874) 的上传进程正在等待限流恢复，请稍后重试")
+	if got.Code != 601 || biliRepairActionFor(got.Code) != biliRepairRateLimit {
+		t.Fatalf("account-busy result was not classified as rate limit: %+v", got)
 	}
 }
 
@@ -1230,6 +1273,39 @@ func TestBiliupSubmitEndpointConfig(t *testing.T) {
 	}
 }
 
+func TestYouTubeUploadPriorityDetection(t *testing.T) {
+	if isMagnetSource("https://www.youtube.com/watch?v=test") {
+		t.Fatal("YouTube HTTPS URL must never be classified as a magnet source")
+	}
+	if !isMagnetSource("magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567") {
+		t.Fatal("magnet URI must be classified as a magnet source")
+	}
+	a := &App{jobs: map[string]*Job{}}
+	a.jobs["yt"] = &Job{
+		ID:     "yt",
+		Kind:   "pipeline",
+		Status: "running",
+		Step:   "[2/2] B站自动化投稿",
+		Input:  pipelineReq{URL: "https://www.youtube.com/watch?v=test"},
+	}
+	a.jobs["bt"] = &Job{ID: "bt", Kind: "magnet", Status: "running"}
+	if !a.hasYouTubeUploadPriority("bt") {
+		t.Fatal("ready YouTube upload must take priority over BT")
+	}
+	a.jobs["yt"].Step = "[1/2] YouTube 视频解析与下载"
+	if a.hasYouTubeUploadPriority("bt") {
+		t.Fatal("download-only YouTube stage must not deadlock an active streaming BT job")
+	}
+	a.jobs["yt"].Step = "[1/2] YouTube 边下载边投稿"
+	if !a.hasYouTubeUploadPriority("bt") {
+		t.Fatal("streaming YouTube upload must take priority over BT")
+	}
+	a.jobs["yt"].Status = "done"
+	if a.hasYouTubeUploadPriority("bt") {
+		t.Fatal("completed YouTube job must not block BT")
+	}
+}
+
 func TestYouTubeRateLimitClassificationAndBackoff(t *testing.T) {
 	app := &App{
 		cfg: Config{
@@ -1315,7 +1391,7 @@ func TestLoadJobsReclassifiesDiskFullAndRateLimit(t *testing.T) {
 	if jRate.FailureCategory != "upload_rate_limit" {
 		t.Fatalf("expected upload_rate_limit, got %s", jRate.FailureCategory)
 	}
-	if jRate.Step != "等待B站限流/风控解除 (可人工验证或次日自动刷新)" {
+	if jRate.Step != "B站账号限流冷却中，等待自动重试" {
 		t.Fatalf("unexpected step: %s", jRate.Step)
 	}
 }
@@ -2087,3 +2163,102 @@ echo 'code: 0 BV1LineCheck123 投稿成功'
 		t.Fatalf("biliup arguments missing --line kodo: %s", string(content))
 	}
 }
+
+func TestCompactErrorOutput(t *testing.T) {
+	short := "simple error: exit status 1"
+	if got := compactErrorOutput(short); got != short {
+		t.Fatalf("short output changed: %q", got)
+	}
+
+	large := strings.Repeat("noisy log line\n", 500) + "FATAL: video format not found"
+	got := compactErrorOutput(large)
+	if len(got) > 1200 {
+		t.Fatalf("compacted error too large: len=%d", len(got))
+	}
+	if !strings.Contains(got, "FATAL: video format not found") {
+		t.Fatalf("expected error tail preserved, got: %s", got)
+	}
+	if !strings.Contains(got, "... (日志截断) ...") {
+		t.Fatalf("expected truncation prefix, got: %s", got)
+	}
+}
+
+func TestLogFileRotationAndTempCleanup(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "download.log")
+
+	// 1. Log file rotation
+	data := strings.Repeat("A", 2000) + "END_TAIL"
+	if err := os.WriteFile(logPath, []byte(data), 0640); err != nil {
+		t.Fatal(err)
+	}
+	rotateLogFileIfNeeded(logPath, 1000, 200)
+	rotated, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rotated) != 200 {
+		t.Fatalf("rotated size = %d, want 200", len(rotated))
+	}
+	if !strings.HasSuffix(string(rotated), "END_TAIL") {
+		t.Fatalf("expected tail preserved, got: %s", string(rotated))
+	}
+
+	// 2. Temp cleanup
+	staleTmp := filepath.Join(dir, ".jobs.json.tmp-12345")
+	if err := os.WriteFile(staleTmp, []byte("temp"), 0640); err != nil {
+		t.Fatal(err)
+	}
+	// Make it older than 10 minutes
+	oldTime := time.Now().Add(-15 * time.Minute)
+	if err := os.Chtimes(staleTmp, oldTime, oldTime); err != nil {
+		t.Fatal(err)
+	}
+	realFile := filepath.Join(dir, "real.json")
+	if err := os.WriteFile(realFile, []byte("real"), 0640); err != nil {
+		t.Fatal(err)
+	}
+
+	cleanupStaleTempFiles(dir)
+	if _, err := os.Stat(staleTmp); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("stale temp file was not removed")
+	}
+	if _, err := os.Stat(realFile); err != nil {
+		t.Fatal("real file should not be removed")
+	}
+}
+
+func TestYouTubeBotChallengeLimitsAndClassification(t *testing.T) {
+	// Classification of YouTube 403 / SABR / PO Token
+	err403 := "yt-dlp: exit status 1: WARNING: [youtube] ios client requires GVS PO Token. ERROR: unable to download video data: HTTP Error 403: Forbidden"
+	if got := classifyFailure(err403, ""); got != "youtube_bot_challenge" {
+		t.Fatalf("expected youtube_bot_challenge for 403/po-token, got %q", got)
+	}
+	sabrErr := "/usr/local/bin/yt-dlp: exit status 1: [youtube] Some android client formats skipped. YouTube may have enabled SABR-only streaming experiment"
+	if got := classifyFailure(sabrErr, ""); got != "youtube_bot_challenge" {
+		t.Fatalf("expected youtube_bot_challenge for sabr, got %q", got)
+	}
+
+	// Ceiling enforcement
+	if !autoRetryAllowed(0, 0, "youtube_bot_challenge") {
+		t.Fatal("initial youtube_bot_challenge should be retryable")
+	}
+	if !autoRetryAllowed(0, youtubeBotChallengeMaxRetries-1, "youtube_bot_challenge") {
+		t.Fatal("youtube_bot_challenge should be allowed before ceiling")
+	}
+	if autoRetryAllowed(0, youtubeBotChallengeMaxRetries, "youtube_bot_challenge") {
+		t.Fatal("youtube_bot_challenge must stop retrying at youtubeBotChallengeMaxRetries")
+	}
+	if autoRetryAllowed(0, 75, "youtube_bot_challenge") {
+		t.Fatal("youtube_bot_challenge must never allow 75 retries")
+	}
+
+	// General limits when AutoRetryMax is 0
+	if autoRetryAllowed(0, defaultGeneralMaxRetries, "queue_timeout") {
+		t.Fatal("queue_timeout must be bounded by defaultGeneralMaxRetries")
+	}
+	if !autoRetryAllowed(0, defaultGeneralMaxRetries-1, "queue_timeout") {
+		t.Fatal("queue_timeout before defaultGeneralMaxRetries should be allowed")
+	}
+}
+
