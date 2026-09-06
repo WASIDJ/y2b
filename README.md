@@ -89,6 +89,13 @@ BT 单任务提速参数：
 - 请在 VPS 安全组和本机防火墙同时放行该端口的 TCP/UDP；端口不可达时速度可能明显下降
 - 下载启用断点续传，死种或网络中断后可复用已经完成的分片
 
+## YouTube 验证与 PO Token 架构
+
+针对 YouTube 对数据中心/VPS IP 的频繁风控（如 `Sign in to confirm you're not a bot` 或 HTTP 403 异常），系统接入了自动化 Proof-of-Origin (POT) 方案：
+- **`bgutil-pot.service`**：本地常驻轻量级 PO Token 生成服务（监听 `127.0.0.1:4416`，内存严格限制在 160MB~220MB，systemd 自动拉起与自愈）。
+- **`bgutil-ytdlp-pot-provider` 插件**：已接入 `yt-dlp` 提取器扩展层，自动查询本地服务获取 GVS PO Token，配合 Deno JS 引擎完成 YouTube Signature 解密与签名。
+- **Netscape Cookie 挂载**：通过 `/srv/y2b/youtube_cookies.txt` 注入有效登录凭证（与 `cookies.json` 隔离，已被 `.gitignore` 保护）。
+
 ## 快速运行
 
 依赖：`yt-dlp`、`ffmpeg`、`aria2c` 和 `biliup`。

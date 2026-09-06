@@ -1,0 +1,23 @@
+[Unit]
+Description=bgutil PO Token Provider Server for yt-dlp
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/bgutil-pot/server
+ExecStart=/usr/bin/node build/main.js
+Restart=always
+RestartSec=5
+TimeoutStopSec=15
+Nice=10
+
+# Memory protection to ensure VPS stability
+MemoryAccounting=true
+MemoryHigh=160M
+MemoryMax=220M
+
+[Install]
+WantedBy=multi-user.target

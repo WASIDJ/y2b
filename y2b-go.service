@@ -1,7 +1,7 @@
 [Unit]
 Description=y2b Go media downloader/uploader
-After=network-online.target
-Wants=network-online.target
+After=network-online.target bgutil-pot.service
+Wants=network-online.target bgutil-pot.service
 StartLimitIntervalSec=60
 StartLimitBurst=10
 

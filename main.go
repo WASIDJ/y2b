@@ -2650,7 +2650,6 @@ func (a *App) chapterSplitDecision(ctx context.Context, rawURL, cookiePath strin
 		"--skip-download",
 		"--no-playlist",
 		"--no-warnings",
-		"--no-plugin-dirs",
 		rawURL,
 	}
 	if cookiePath != "" {
@@ -2709,7 +2708,6 @@ func buildYTDLPArgs(rawURL, quality, subLangs, cookiePath string, isPlaylist, sp
 		"--http-chunk-size", "10M",
 		"--concurrent-fragments", "1",
 		"--no-cache-dir",
-		"--no-plugin-dirs",
 		"--newline",
 		"--print", "before_dl:source-title:%(title)s",
 		"--progress-template", "download:%(progress._percent_str)s|%(progress.downloaded_bytes)s|%(progress.total_bytes)s|%(progress.speed)s|%(progress.eta)s|%(info.title)s",
@@ -6159,7 +6157,6 @@ func (a *App) syncChannel(ctx context.Context, ch *MonitoredChannel) (int, error
 		"--flat-playlist",
 		"--dump-single-json",
 		"--no-warnings",
-		"--no-plugin-dirs",
 		"--playlist-end", strconv.Itoa(maxFetch),
 		probeURL,
 	}

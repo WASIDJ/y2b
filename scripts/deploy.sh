@@ -19,7 +19,17 @@ if pgrep -f biliup >/dev/null 2>&1; then
     echo "WARNING: biliup process is actively running in background!"
 fi
 
-echo "=== [4/4] Restarting y2b-go.service ==="
+echo "=== [4/5] Syncing systemd units and starting bgutil-pot ==="
+if [ -f bgutil-pot.service ]; then
+    sudo cp bgutil-pot.service /etc/systemd/system/bgutil-pot.service
+fi
+if [ -f y2b-go.service ]; then
+    sudo cp y2b-go.service /etc/systemd/system/y2b-go.service
+fi
+sudo systemctl daemon-reload
+sudo systemctl enable --now bgutil-pot.service || true
+
+echo "=== [5/5] Restarting y2b-go.service ==="
 sudo systemctl restart y2b-go.service
 sleep 1
 
